@@ -86,11 +86,10 @@ CassandraPersistence.withSchema[F, State](
 )
 ```
 
-Each snapshot **persist** becomes an offset-guarded conditional write; a stale write is rejected with
-`CassandraSnapshots.SnapshotWriteConflict`. Deletes remain ordinary last-write-wins (offset-gated deletes
-are the separate safe-delete layer).
+Each snapshot write becomes an offset-guarded conditional write, and each delete an offset-carrying
+tombstone reaped by the `ttl`; a stale write is rejected with `CassandraSnapshots.SnapshotWriteConflict`.
 
-- **Cost** — every persist becomes a lightweight transaction (Paxos): several inter-replica
+- **Cost** — every write and delete becomes a lightweight transaction (Paxos): several inter-replica
   round-trips, a few times slower and more coordinator-CPU-intensive than a quorum write. A
   `persistEvery` wave flushes a partition's whole changed-key population, so the added load scales with
   that wave. Measure it against your write rate first.
@@ -100,7 +99,7 @@ are the separate safe-delete layer).
   the scassandra client's `query.serial-consistency = LOCAL_SERIAL` — the lightweight transaction's
   serial level is separate from `ConsistencyOverrides` and defaults to cross-DC `SERIAL`, so a
   conditional write otherwise pays a cross-datacenter round-trip.
-- **TTL** — set a `ttl` to bound Paxos-partition growth.
+- **TTL** — set a `ttl` to bound tombstone (and Paxos-partition) growth.
 - **Rollout** — no migration either direction (the condition reads the `offset` column every version
   already writes). A rolling deploy is safe; while the two modes coexist there is a clock-skew caveat
   (design doc), negligible with NTP-synced clocks.
@@ -181,12 +180,12 @@ You can plug in your own snapshot store: implement `SnapshotDatabase` and wire i
 **last-write-wins**, so it is exposed to the same stale-writer overwrite as last-write-wins Cassandra
 ([#732](https://github.com/evolution-gaming/kafka-flow/issues/732)).
 
-To protect it, its own `persist` must reject a write when the store already holds a newer offset — that
-conditional write is the fence (the buffer wiring does not provide it). Use an offset-carrying snapshot
-type (`KafkaSnapshot[S]` via `SnapshotDatabase.snapshotsOf`) so the fence has an offset to compare: the
-pre-existing `SnapshotFold` offset dedup then keeps the owner from re-persisting below its recovered
-high-water during the replay window, so a conditional store does not fence the owner against itself. See
-"The replay window" in the [Cassandra design doc](cassandra-single-writer-design.md) for why.
+To protect it, its own `persist`/`delete` must reject a write when the store already holds a newer
+offset — that conditional write is the fence (the buffer wiring does not provide it). Once writes are
+conditional, give the buffer an `offsetOf` so it does not fence the owner against itself during
+recovery: `SnapshotsOf.backedBy(db, offsetOf)` for an offset-carrying type, or a `KafkaSnapshot[S]`
+via `SnapshotDatabase.snapshotsOf`. See "The replay window" in the
+[Cassandra design doc](cassandra-single-writer-design.md) for why.
 
 ## Compression
 Kafka-flow has a built-in support for compressing application's state
