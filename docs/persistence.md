@@ -86,11 +86,10 @@ CassandraPersistence.withSchema[F, State](
 )
 ```
 
-Each snapshot **persist** becomes an offset-guarded conditional write; a stale write is rejected with
-`CassandraSnapshots.SnapshotWriteConflict`. Deletes remain ordinary last-write-wins (offset-gated deletes
-are out of scope for this mode).
+Each snapshot write becomes an offset-guarded conditional write, and each delete an offset-carrying
+tombstone reaped by the `ttl`; a stale write is rejected with `CassandraSnapshots.SnapshotWriteConflict`.
 
-- **Cost** — every persist becomes a lightweight transaction (Paxos): several inter-replica
+- **Cost** — every write and delete becomes a lightweight transaction (Paxos): several inter-replica
   round-trips, a few times slower and more coordinator-CPU-intensive than a quorum write. A
   `persistEvery` wave flushes a partition's whole changed-key population, so the added load scales with
   that wave. Measure it against your write rate first.
@@ -99,13 +98,8 @@ are out of scope for this mode).
   defaulted (an unset override uses the session default, often `LOCAL_ONE`). For single-DC also set
   the scassandra client's `query.serial-consistency = LOCAL_SERIAL` — the lightweight transaction's
   serial level is separate from `ConsistencyOverrides` and defaults to cross-DC `SERIAL`, so a
-  conditional write otherwise pays a cross-datacenter round-trip. A too-weak read level fails
-  **silently**: the write-side LWT still applies, but a non-quorum recovery read can miss the newest
-  snapshot and reintroduce #732 on the read side with no error — verify both overrides before rollout.
-- **TTL** — set a `ttl` to bound the live key set, and with it the per-key `system.paxos` state. (A
-  plain `delete` also leaves a Cassandra row tombstone reclaimed only after `gc_grace_seconds` — the
-  cluster default, not set here; not a tombstone-scan risk since keys are single-row partitions read by
-  point lookup, but it feeds compaction and repair under create/delete churn.)
+  conditional write otherwise pays a cross-datacenter round-trip.
+- **TTL** — set a `ttl` to bound tombstone (and Paxos-partition) growth.
 - **Rollout** — no migration either direction (the condition reads the `offset` column every version
   already writes). A rolling deploy is safe; while the two modes coexist there is a clock-skew caveat
   (design doc), negligible with NTP-synced clocks.
@@ -201,12 +195,15 @@ Limitations:
 
 You can plug in your own snapshot store: implement `SnapshotDatabase` and wire it through
 `SnapshotsOf.backedBy` into `PersistenceOf.snapshotsOnly`/`restoreEvents`. A custom store is
-**last-write-wins**, so it is exposed to the same stale-writer overwrite
-([#732](https://github.com/evolution-gaming/kafka-flow/issues/732)) unless its `persist` rejects a
-write when the store already holds a newer offset (taken from the snapshot) — that conditional write
-is the fence (the buffer wiring does not provide it). Note that the `delete(key)` method carries no
-offset, so a delete cannot be offset-gated through this interface; a custom store's delete stays
-unconditional.
+**last-write-wins**, so it is exposed to the same stale-writer overwrite as last-write-wins Cassandra
+([#732](https://github.com/evolution-gaming/kafka-flow/issues/732)).
+
+To protect it, its own `persist`/`delete` must reject a write when the store already holds a newer
+offset — that conditional write is the fence (the buffer wiring does not provide it). Once writes are
+conditional, give the buffer an `offsetOf` so it does not fence the owner against itself during
+recovery: `SnapshotsOf.backedBy(db, offsetOf)` for an offset-carrying type, or a `KafkaSnapshot[S]`
+via `SnapshotDatabase.snapshotsOf`. See "The replay window" in the
+[Cassandra design doc](cassandra-single-writer-design.md) for why.
 
 ## Compression
 Kafka-flow has a built-in support for compressing application's state
