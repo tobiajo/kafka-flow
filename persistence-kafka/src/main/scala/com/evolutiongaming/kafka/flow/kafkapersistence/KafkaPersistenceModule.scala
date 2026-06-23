@@ -338,7 +338,9 @@ object KafkaPersistenceModule {
       ).withMetricsK(metrics.snapshotDatabaseMetrics)
 
       PersistenceOf.snapshotsOnly[F, KafkaKey, S, ConsumerRecord[String, ByteVector]](
-        keysOf      = keysOf,
+        keysOf = keysOf,
+        // unfenced (no offsetOf): Kafka fences stale writers at the broker (consumer-generation transaction),
+        // not at the snapshot offset, so the snapshot-buffer fence has no job here. See kafka-single-writer-design.md.
         snapshotsOf = SnapshotsOf.backedBy[F, KafkaKey, S](snapshotDatabase)
       )
     }
