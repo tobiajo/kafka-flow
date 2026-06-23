@@ -141,9 +141,14 @@ monotonic `append` is belt-and-suspenders for the persist case. A **tick-delete*
 timer-driven and bypasses that filter, so only the monotonic buffer lets a legitimate tick-delete
 apply during replay.
 
-The fence is live only for the offset-carrying `KafkaSnapshot` / compare-and-set wiring; other stores
-pass `Offset.min` as the offset, making it inert (last-write-wins). It is surgical even when live:
-`max(currentOffset, highWater)` differs from `currentOffset` only inside this replay window.
+The buffer fence is selected by whether snapshots carry an offset, not by the write mode: the Cassandra
+path passes `Some(_.offset)` (via `SnapshotDatabase.snapshotsOf`) in *both* compare-and-set and
+last-write-wins modes, so the buffer stays monotonic and a delete presents the key's high-water offset;
+a store with no offset passes `None` and is unfenced (e.g. the Kafka backend, which fences at the broker
+instead). Presenting the high-water only *rejects* a stale writer where the store gates on it — i.e.
+compare-and-set mode; under last-write-wins it is still computed but the plain `DELETE`/`UPDATE` ignore
+it. Either way it is surgical: `max(currentOffset, highWater)` differs from `currentOffset` only inside
+this replay window.
 
 This fence and the tombstone above are independent and complementary: presenting the higher `highWater`
 for a delete makes the tombstone it writes *more* protective against a lower-offset revive, never less.
