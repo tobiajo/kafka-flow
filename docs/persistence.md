@@ -93,7 +93,8 @@ fencing is avoided).
   cost tracks the *number* of transactions, not byte volume. A partition's concurrent key flushes are
   group-committed, so a burst of N dirty keys costs about N / `maxWritesPerTransaction` (default 256,
   configurable via `TransactionalConfig`) round-trips on the poll path. On a realistic burst at the
-  default cap the measured overhead was within ~6% of the non-transactional producer (design doc).
+  default cap the per-write overhead is small — see the design doc's Measurements for the figures
+  and their caveats.
   Each partition also holds its own producer and transaction-coordinator state on the brokers.
   `maxWritesPerTransaction` mainly bounds a transaction's size and duration — a transaction is roughly
   the cap × snapshot size and must commit within `transaction.timeout.ms` — so lower it for large
