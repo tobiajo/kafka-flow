@@ -5,9 +5,7 @@ sidebar_label: Kafka single-writer design
 ---
 
 Design notes for the transactional snapshot mode of `kafka-flow-persistence-kafka`
-(`KafkaPersistenceModuleOf.cachingTransactional`). User-facing guarantees, costs and rollout
-guidance are in [Persistence](persistence.md#protecting-against-stale-snapshot-writes); this page
-records the mechanism and the measurements behind it.
+(`KafkaPersistenceModuleOf.cachingTransactional`) — the mechanism and the measurements behind it.
 
 ## Problem
 
@@ -67,9 +65,8 @@ This is corruption prevention, not exactly-once. Output produces go through the 
 producer, and the transaction wraps only the snapshot write and the offset commit, so they stay outside
 it — enrolling them would be full transactional output, an explicit non-goal (see Rejected alternatives).
 Output is therefore at-least-once: a replayed batch re-emits it, so the consuming side must tolerate
-duplicates (see [Persistence](persistence.md#protecting-against-stale-snapshot-writes) non-goals). The
-committed offset is the minimum held offset, always behind durable state, so it can never outrun the
-snapshots on disk even though offset and writes may land in different transactions.
+duplicates. The committed offset is the minimum held offset, always behind durable state, so it can
+never outrun the snapshots on disk even though offset and writes may land in different transactions.
 
 Key points:
 
