@@ -38,10 +38,9 @@ sequenceDiagram
 
 ## Mechanism: generation fencing
 
-Normally kafka-flow commits input offsets through the **consumer**: `TopicFlow` collects the
-per-partition offsets the flow scheduled and issues a `consumer.commit`. In this mode that commit is
-performed by the snapshot producer instead: the consumer commit path is left a no-op, and the offset
-moves **into the producer's transaction** via
+Normally the input offsets are committed through the **Kafka consumer** (the ordinary consumer-group
+offset commit). In this mode they are committed through the snapshot **producer** instead, with the
+consumer-side commit disabled — the offset moves **into the producer's transaction** via
 `sendOffsetsToTransaction(offsets, consumerGroupMetadata)`
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics)):
 the group coordinator validates the consumer **generation** and rejects a commit from a stale one
@@ -76,15 +75,15 @@ Key points:
 
 - **Every** transaction carries the partition's committable offset, so every write is gated. When the
   committed offset needs to advance but no snapshot writes are pending — a periodic commit tick, or a
-  revoke — `ScheduleCommit` forces an *offset-only* transaction so the offset still moves.
+  revoke — an *offset-only* transaction is forced so the offset still moves.
 - The offset-to-commit is **seeded with the assigned offset**, so even the first flush (before the
-  first commit tick) is gated. Committing `assignedAt` is a no-op.
+  first commit tick) is gated. Committing the assigned offset is a no-op.
 - Recovery is forced to `read_committed` so a fenced writer's aborted records are invisible.
 - The partition is never `consumer.commit`-ed in this mode; offsets only commit through the producer.
 
 Wiring needs the input topic and a reader of the driving consumer's group metadata
 (`Consumer.groupMetadata`, captured on each rebalance on the poll thread). A fence surfaces as
-`CommitFailedException` on the failing `persist` / `scheduleCommit`.
+`CommitFailedException` on the failing `persist` (or offset-only commit).
 
 ### No epoch fencing
 
@@ -115,7 +114,7 @@ knob: uncapped is ~7% faster (below), so estimated no need to raise it for speed
 ≈ cap × snapshot size; lower it for large snapshots.
 
 `persist` does not complete until its transaction commits, and the flush awaits each `persist`, so
-the source is back-pressured: the `pending` queue holds at most the keys flushing in one wave. If a
+the source is back-pressured: the in-flight queue holds at most the keys flushing in one wave. If a
 partition produces writes faster than `cap / transaction-time` drains, the symptom is rising flush
 latency and lag, not unbounded memory — the remedy is more partitions.
 
@@ -158,7 +157,7 @@ Reproduce: `KAFKA_FLOW_PERF=1 sbt "persistence-kafka-it-tests/testOnly *Transact
 
 ## Testing
 
-Integration tests (persistence-kafka-it-tests) run through the real PartitionFlow / eager-recovery /
+Integration tests (persistence-kafka-it-tests) run through the real eager-recovery /
 flush-on-revoke machinery: the reproduction asserts corruption with the plain shared producer; the
 prevention drives a stale owner with an *older consumer generation* and asserts the newer snapshot
 survives. The paired non-transactional reproduction (the plain shared producer, no offset binding)
