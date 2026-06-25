@@ -95,6 +95,9 @@ fencing is avoided).
   configurable via `TransactionalConfig`) round-trips on the poll path. On a realistic burst at the
   default cap the measured overhead was within ~6% of the non-transactional producer (design doc).
   Each partition also holds its own producer and transaction-coordinator state on the brokers.
+  `maxWritesPerTransaction` mainly bounds a transaction's size and duration — a transaction is roughly
+  the cap × snapshot size and must commit within `transaction.timeout.ms` — so lower it for large
+  snapshots rather than raising it for speed.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -107,6 +110,9 @@ Limitations:
 - A batch shares its transaction's outcome: if the transaction fails, every write in it fails.
 - An old owner can be fenced while flushing on revoke; its last state delta is then neither persisted
   nor committed, so the new owner replays those events — noise, not loss.
+- After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
+  `transaction.timeout.ms`; until then a `read_committed` reader — recovery of that partition, or a
+  downstream consumer of your output — can stall behind its last-stable-offset.
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
   a non-identity mapper is not supported here.
 
