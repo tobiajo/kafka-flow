@@ -110,9 +110,9 @@ into a single transaction and delivers the outcome to each waiter. No batching d
 immediately; a batch is whatever accumulated during the previous transaction's flight.
 
 `maxWritesPerTransaction` (default 256) bounds a transaction's duration below
-`transaction.timeout.ms` (default 1 min), past which the coordinator aborts it. It is not a
-throughput knob: uncapped is ~7% faster (below), so never raise it for speed. Transaction bytes ≈
-cap × snapshot size; lower it for large snapshots.
+`transaction.timeout.ms` (default 1 min), past which the coordinator aborts it. It is not a throughput
+knob: uncapped is ~7% faster (below), so estimated no need to raise it for speed. Transaction bytes
+≈ cap × snapshot size; lower it for large snapshots.
 
 `persist` does not complete until its transaction commits, and the flush awaits each `persist`, so
 the source is back-pressured: the `pending` queue holds at most the keys flushing in one wave. If a
