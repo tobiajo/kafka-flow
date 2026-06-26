@@ -83,6 +83,9 @@ consumer.use { consumer =>
 }
 ```
 
+`idempotence` and the per-partition `transactional.id` are set for you — don't configure them in
+`producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
+
 Snapshot writes and the input-offset commit run in one Kafka transaction per assigned partition; a
 write from a stale consumer generation is fenced by the broker (KIP-447) and surfaces as
 `CommitFailedException`. Recovery reads `read_committed`, so a fenced writer's aborted records are
@@ -98,7 +101,10 @@ fencing is avoided).
   Each partition also holds its own producer and transaction-coordinator state on the brokers.
   `maxWritesPerTransaction` mainly bounds a transaction's size and duration — a transaction is roughly
   the cap × snapshot size and must commit within `transaction.timeout.ms` — so lower it for large
-  snapshots rather than raising it for speed.
+  snapshots rather than raising it for speed. That timeout itself is a producer config (default 1 min):
+  a flush-transaction exceeding it is aborted, failing the flush, so very large or slow snapshots may
+  instead raise it — capped at the broker's `transaction.max.timeout.ms`, and a higher value lengthens
+  the post-crash stall (below).
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
