@@ -105,9 +105,10 @@ last-stable-offset.
 A producer allows one transaction at a time, while kafka-flow flushes a partition's keys in
 parallel — and after a restart most of the active key population flushes in one wave per
 `persistEvery`. Writes are therefore **group committed**: a write is queued, and the first writer to
-take the per-partition transaction lock drains what is queued at that moment — up to the cap below —
-into a single transaction and delivers the outcome to each waiter. No batching delay — a lone write commits
-immediately; a batch is whatever accumulated during the previous transaction's flight.
+take the per-partition transaction lock drains the queued writes at that moment — up to the cap below —
+into a single transaction (offset commits ride along without consuming the cap) and delivers the outcome
+to each waiter. No batching delay — a lone write commits immediately; a batch is whatever accumulated
+during the previous transaction's flight.
 
 `maxWritesPerTransaction` (default 256) caps the batch. Transactions are serial — the next cannot
 begin until the current commits — so a partition's sustained write rate ≈ cap / transaction time.
