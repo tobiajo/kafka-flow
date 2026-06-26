@@ -42,7 +42,8 @@ object KafkaSnapshotWriteDatabase {
     * @param assignedOffset
     *   seeds the offset-to-commit so even the first write is gated; committing it is a no-op.
     * @param maxWritesPerTransaction
-    *   bounds a transaction's duration below `transaction.timeout.ms`; bytes scale with this times the snapshot size.
+    *   bounds the per-partition, serialized transaction's duration below `transaction.timeout.ms`; bytes
+    *   scale with this times the snapshot size.
     */
   def transactional[F[_]: FromTry: Concurrent, S: ToBytes[F, *]](
     snapshotTopicPartition: TopicPartition,
@@ -58,7 +59,7 @@ object KafkaSnapshotWriteDatabase {
         .whenA(maxWritesPerTransaction < 1)
       transactionLock <- Semaphore[F](1)
       // writes are bounded by maxWritesPerTransaction per transaction; offset-only markers ride on a separate
-      // unbounded lane so they never consume a write slot (a periodic commit cadence must not cut write throughput)
+      // unbounded lane so they never consume a write slot (periodic offset commits must not cut write throughput)
       writes  <- Queue.unbounded[F, Pending[F, S]]
       markers <- Queue.unbounded[F, Pending[F, S]]
       // seed with the assigned offset so the first flush already carries an offset and is generation-gated
@@ -102,7 +103,7 @@ object KafkaSnapshotWriteDatabase {
       record => submit(writes, record.some)
 
     // offset-only marker: commits the offset even with no writes pending (e.g. on revoke). It rides the markers
-    // lane, not `writes`, so a periodic commit cadence never displaces writes from the per-transaction cap
+    // lane, not `writes`, so periodic offset commits never displace writes from the per-transaction cap
     val scheduleCommit: ScheduleCommit[F] =
       (offset: Offset) => offsetToCommit.set(offset) *> submit(markers, none)
 
