@@ -51,7 +51,7 @@ object KafkaPersistenceModule {
     *   the input topic kafka-flow consumes; its offsets are committed transactionally with the snapshot writes (same
     *   partition number as the snapshot partition - the mode forces the identity mapping)
     * @param maxWritesPerTransaction
-    *   upper bound of snapshot writes group committed in one transaction, see
+    *   upper bound of snapshot writes group committed in one per-partition, serialized transaction, see
     *   [[KafkaSnapshotWriteDatabase.transactional]]
     */
   final case class TransactionalConfig(
