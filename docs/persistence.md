@@ -92,11 +92,11 @@ write from a stale consumer generation is fenced by the broker (KIP-447) and sur
 never recovered. See the [design doc](kafka-single-writer-design.md) for the mechanism (and why epoch
 fencing is avoided).
 
-- **Cost** — each snapshot write is a Kafka transaction (a few ms on real brokers); cost tracks the
-  *number* of transactions, not bytes. Concurrent key flushes are group-committed, so a burst of N dirty
-  keys is ≈ N / `maxWritesPerTransaction` transactions (default 256) — at the default cap the overhead
-  is small (see the design doc's Measurements). Each partition also holds its own producer and
-  transaction-coordinator state on the brokers.
+- **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
+  tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
+  so a burst of N dirty keys is ≈ N / `maxWritesPerTransaction` transactions (default 256) — at the
+  default cap the overhead is small (see the design doc's Measurements). Each partition also holds its
+  own producer and transaction-coordinator state on the brokers.
 - **Tuning for large snapshots** — a transaction must commit within `transaction.timeout.ms` (a producer
   config, default 1 min, kept ≤ the broker's `transaction.max.timeout.ms`). If snapshots are large or
   brokers slow, lower `maxWritesPerTransaction` or raise the timeout — a higher timeout lengthens the
