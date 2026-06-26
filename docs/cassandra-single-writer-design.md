@@ -206,8 +206,16 @@ This design takes three things as given:
 
 ## Forward-looking
 
-[KIP-939 (participation in 2PC)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-939:+Support+Participation+in+2PC)
-could extend a Kafka generation fence to this Cassandra store: a transactional producer in an
-externally-coordinated two-phase commit could bind the Cassandra snapshot write to a generation-fenced
-Kafka input-offset commit, giving Cassandra per-partition ownership without the per-key compare-and-set.
-Not actionable now; see the Kafka design doc's forward-looking note.
+- **Safe-delete layer** (closes the [Delete](#delete) limitation) — a plain `DELETE` here is unfenced,
+  so a stale lower-offset writer can resurrect a just-deleted key. The stacked safe-delete layer fixes
+  this by writing an offset-carrying logical tombstone and gating deletes on the offset exactly as
+  persists are, keeping the row (and its guard) instead of removing it. The cost is a source-breaking
+  `SnapshotWriteDatabase.delete(key, offset)` signature change, which is why it is a separate layer
+  rather than folded in here.
+- **Per-partition ownership** — the equal-offset gap and per-key (rather than per-partition) granularity
+  could be closed by a composite `(offset, generation)` token (see Rejected alternatives) or, further out, by
+  [KIP-939 (participation in 2PC)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-939:+Support+Participation+in+2PC):
+  a transactional producer in an externally-coordinated two-phase commit could bind the Cassandra
+  snapshot write to a generation-fenced Kafka input-offset commit, giving Cassandra per-partition
+  ownership without the per-key compare-and-set. Not actionable now; see the Kafka design doc's
+  forward-looking note.
