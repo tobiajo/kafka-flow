@@ -71,9 +71,9 @@ without relying on clock synchronisation.
 
 In this persist-only mode a delete is an ordinary `DELETE` (last-write-wins): the `IF offset <= :offset`
 guard protects *persists*, not deletes. A lagging zombie can therefore still resurrect a just-deleted key
-at a lower offset. Gating deletes on an offset (an offset-carrying logical tombstone) is the separate
-**safe-delete** layer stacked on top of this one — it is intentionally out of scope here, because it
-forces a source-breaking `SnapshotWriteDatabase.delete(key, offset)` change.
+at a lower offset. Gating deletes on an offset (an offset-carrying logical tombstone) would close this,
+but is intentionally out of scope here: it forces a source-breaking `SnapshotWriteDatabase.delete(key,
+offset)` change. This mode protects persists only (see Forward-looking).
 
 ## The replay window
 
@@ -94,11 +94,11 @@ is a no-op, and no write below `X` is ever attempted. The compare-and-set guard 
 the legitimate owner during replay; the offset dedup that protects it is pre-existing and shared by every
 snapshot store, not specific to this mode.
 
-That covers the persist — the only offset-gated write in this layer. A timer-driven *tick-delete* would
+That covers the persist — the only offset-gated write in this mode. A timer-driven *tick-delete* would
 bypass the `SnapshotFold` offset filter, but a delete here is a plain last-write-wins `DELETE`
-(unfenced), so it too cannot self-fence. Once the safe-delete layer stacked on top gates deletes on an
-offset, the tick-delete reopens this window — dedup does not cover it — which is why that layer also
-keeps the in-memory snapshot buffer monotonic in offset.
+(unfenced), so it too cannot self-fence. (A future offset-gated delete would reopen this window for a
+tick-delete — dedup does not cover it — and would then also need the in-memory snapshot buffer kept
+monotonic in offset; that is out of scope here.)
 
 ## Equal-offset writes and determinism
 
@@ -158,8 +158,8 @@ Entry point: `CassandraSnapshots.withSchema(compareAndSet = true)` (or
 - **Conditional persist** — `CassandraSnapshots.persistCompareAndSet` issues the offset-gated `UPDATE`,
   falling back to `INSERT ... IF NOT EXISTS` (with a single retry) for a key's first write;
   `resolveConditional` classifies the result (`applied` / newer-stored-offset / row-absent).
-- **Plain delete** — `CassandraSnapshots.delete` is an unguarded last-write-wins `DELETE`; the
-  offset-carrying tombstone is the separate safe-delete layer.
+- **Plain delete** — `CassandraSnapshots.delete` is an unguarded last-write-wins `DELETE` (offset-gated
+  deletes are out of scope here; see Delete).
 - **Write mode** — `WriteMode.CompareAndSet` carries the extra `INSERT` statement, so it exists exactly
   when the database is in compare-and-set mode (`WriteMode.LastWriteWins` otherwise).
 
@@ -206,12 +206,11 @@ This design takes three things as given:
 
 ## Forward-looking
 
-- **Safe-delete layer** (closes the [Delete](#delete) limitation) — a plain `DELETE` here is unfenced,
-  so a stale lower-offset writer can resurrect a just-deleted key. The stacked safe-delete layer fixes
+- **Offset-gated deletes** (closes the [Delete](#delete) limitation) — a plain `DELETE` here is
+  unfenced, so a stale lower-offset writer can resurrect a just-deleted key. A future mode could close
   this by writing an offset-carrying logical tombstone and gating deletes on the offset exactly as
-  persists are, keeping the row (and its guard) instead of removing it. The cost is a source-breaking
-  `SnapshotWriteDatabase.delete(key, offset)` signature change, which is why it is a separate layer
-  rather than folded in here.
+  persists are, keeping the row (and its guard) instead of removing it. It is out of scope here because
+  it requires a source-breaking `SnapshotWriteDatabase.delete(key, offset)` signature change.
 - **Per-partition ownership** — the equal-offset gap and per-key (rather than per-partition) granularity
   could be closed by a composite `(offset, generation)` token (see Rejected alternatives) or, further out, by
   [KIP-939 (participation in 2PC)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-939:+Support+Participation+in+2PC):

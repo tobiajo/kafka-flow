@@ -112,7 +112,7 @@ class CassandraSnapshots[F[_]: Async, T](
   }
 
   // persist-only mode: a delete is an ordinary last-write-wins DELETE (the offset guard protects persists, not
-  // deletes). Gating deletes on an offset is the separate safe-delete layer.
+  // deletes). Gating deletes on an offset is out of scope here (it would need a delete(key, offset) signature).
   def delete(key: KafkaKey): F[Unit] = {
     val boundStatement = Statements.bindDelete(deleteStatement, key).withConsistencyLevel(consistencyOverrides.write)
     session.execute(boundStatement).void
@@ -163,7 +163,7 @@ object CassandraSnapshots {
     * @param compareAndSet
     *   if `true`, each snapshot *persist* is a Cassandra lightweight transaction asserting the stored offset is not
     *   greater than the new one, protecting from stale writers; a rejected write fails with [[SnapshotWriteConflict]].
-    *   Deletes remain ordinary last-write-wins (gating deletes on an offset is the separate safe-delete layer). See the
+    *   Deletes remain ordinary last-write-wins (gating deletes on an offset is out of scope for this mode). See the
     *   persistence docs' "Protecting against stale snapshot writes" for limitations and costs. Default `false`.
     * @param fromBytes
     *   deserializer function to convert array of bytes to the snapshot type T

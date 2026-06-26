@@ -88,7 +88,7 @@ CassandraPersistence.withSchema[F, State](
 
 Each snapshot **persist** becomes an offset-guarded conditional write; a stale write is rejected with
 `CassandraSnapshots.SnapshotWriteConflict`. Deletes remain ordinary last-write-wins (offset-gated deletes
-are the separate safe-delete layer).
+are out of scope for this mode).
 
 - **Cost** — every persist becomes a lightweight transaction (Paxos): several inter-replica
   round-trips, a few times slower and more coordinator-CPU-intensive than a quorum write. A
