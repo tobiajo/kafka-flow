@@ -23,7 +23,7 @@ sequenceDiagram
     participant ST as Snapshot topic<br/>(compacted)
     participant B as Owner B<br/>(new)
 
-    Note over A: folds input to offset 100;<br/>state buffered, not flushed
+    Note over A: folds input to offset 100,<br/>state buffered, not flushed
     Note over A,B: rebalance: partition revoked from A<br/>and assigned to B — but A<br/>has not observed it yet
     B->>ST: recover: read to end<br/>(no newer snapshot)
     B->>B: fold input to offset 150
