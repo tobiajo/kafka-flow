@@ -20,18 +20,18 @@ of seconds have been observed in production.
 ```mermaid
 sequenceDiagram
     participant A as Owner A<br/>(previous)
-    participant ST as Snapshot topic<br/>(compacted: last-write-wins)
+    participant ST as Snapshot topic<br/>(compacted)
     participant B as Owner B<br/>(new)
 
-    Note over A: folds input up to offset 100,<br/>state buffered, not yet flushed
-    Note over A,B: rebalance — partition revoked from A and assigned to B,<br/>but A has not observed it yet
-    B->>ST: recover: read to end (no newer snapshot)
-    B->>B: fold input up to offset 150
+    Note over A: folds input to offset 100;<br/>state buffered, not flushed
+    Note over A,B: rebalance: partition revoked from A<br/>and assigned to B — but A<br/>has not observed it yet
+    B->>ST: recover: read to end<br/>(no newer snapshot)
+    B->>B: fold input to offset 150
     B->>ST: write snapshot @150 ✓
     Note over B: commit input offset 150
-    A-->>ST: flush buffered snapshot @100<br/>(stale: A no longer owns the partition)
-    Note over ST: last write wins — @100 overwrites @150
-    Note over ST,B: next recovery resumes from committed offset 150<br/>but loads snapshot @100 — events 101 to 150 never replayed (lost)
+    A-->>ST: flush buffered snapshot @100<br/>(stale: A no longer owns it)
+    Note over ST: last write wins:<br/>@100 overwrites @150
+    Note over ST,B: next recovery resumes at offset 150<br/>but loads snapshot @100 —<br/>events 101 to 150 never replayed (lost)
 ```
 
 ## Mechanism: generation fencing
