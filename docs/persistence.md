@@ -92,19 +92,15 @@ write from a stale consumer generation is fenced by the broker (KIP-447) and sur
 never recovered. See the [design doc](kafka-single-writer-design.md) for the mechanism (and why epoch
 fencing is avoided).
 
-- **Cost** — every snapshot write goes through a Kafka transaction (a few ms against real brokers);
-  cost tracks the *number* of transactions, not byte volume. A partition's concurrent key flushes are
-  group-committed, so a burst of N dirty keys costs about N / `maxWritesPerTransaction` (default 256,
-  configurable via `TransactionalConfig`) round-trips on the poll path. On a realistic burst at the
-  default cap the per-write overhead is small — see the design doc's Measurements for the figures
-  and their caveats.
-  Each partition also holds its own producer and transaction-coordinator state on the brokers.
-  `maxWritesPerTransaction` mainly bounds a transaction's size and duration — a transaction is roughly
-  the cap × snapshot size and must commit within `transaction.timeout.ms` — so lower it for large
-  snapshots rather than raising it for speed. That timeout itself is a producer config (default 1 min):
-  a flush-transaction exceeding it is aborted, failing the flush, so very large or slow snapshots may
-  instead raise it — capped at the broker's `transaction.max.timeout.ms`, and a higher value lengthens
-  the post-crash stall (below).
+- **Cost** — each snapshot write is a Kafka transaction (a few ms on real brokers); cost tracks the
+  *number* of transactions, not bytes. Concurrent key flushes are group-committed, so a burst of N dirty
+  keys is ≈ N / `maxWritesPerTransaction` transactions (default 256) — at the default cap the overhead
+  is small (see the design doc's Measurements). Each partition also holds its own producer and
+  transaction-coordinator state on the brokers.
+- **Tuning for large snapshots** — a transaction must commit within `transaction.timeout.ms` (a producer
+  config, default 1 min, kept ≤ the broker's `transaction.max.timeout.ms`). If snapshots are large or
+  brokers slow, lower `maxWritesPerTransaction` or raise the timeout — a higher timeout lengthens the
+  post-crash stall (below).
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
