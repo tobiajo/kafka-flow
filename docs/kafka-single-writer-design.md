@@ -80,7 +80,7 @@ Key points:
 
 Wiring needs the input topic and a reader of the driving consumer's group metadata
 (`Consumer.groupMetadata`, captured on each rebalance on the poll thread). A fence surfaces as
-`CommitFailedException` on the failing `persist` (or offset-only commit).
+`CommitFailedException` on the failing snapshot write (or offset-only commit).
 
 ### No epoch fencing
 
@@ -108,12 +108,12 @@ immediately; a batch is whatever accumulated during the previous transaction's f
 `maxWritesPerTransaction` (default 256) bounds a transaction's duration below
 `transaction.timeout.ms` (default 1 min), past which the coordinator aborts it. It is not a throughput
 knob: uncapped measured ~7% faster (below), so estimated no need to raise it for speed. Transaction bytes
-≈ cap × snapshot size; lower it for large snapshots.
+≈ cap × snapshot size.
 
-`persist` does not complete until its transaction commits, and the flush awaits each `persist`, so
-the source is back-pressured: the in-flight queue holds at most the keys flushing in one wave. If a
-partition produces writes faster than `cap / transaction-time` drains, the symptom is rising flush
-latency and lag, not unbounded memory — the remedy is more partitions.
+A snapshot write does not complete until its transaction commits, and the flush awaits each write, so
+the source is back-pressured: the in-flight queue holds at most the keys flushing in one wave, bounding
+memory rather than letting it grow without limit. A partition that sustains writes faster than
+`cap / transaction-time` drains shows up as rising flush latency and lag.
 
 ## Implementation
 
