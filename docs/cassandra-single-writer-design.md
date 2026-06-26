@@ -5,10 +5,8 @@ sidebar_label: Cassandra single-writer design
 ---
 
 Design notes for the compare-and-set snapshot mode of `kafka-flow-persistence-cassandra`
-(`CassandraSnapshots.withSchema(compareAndSet = true)`). User-facing guarantees, costs and rollout
-guidance are in [Persistence](persistence.md#protecting-against-stale-snapshot-writes); this page
-records the mechanism and its subtleties. The Kafka backend solves the same problem differently — see
-[Kafka single-writer design](kafka-single-writer-design.md).
+(`CassandraSnapshots.withSchema(compareAndSet = true)`) — the mechanism and its subtleties. The Kafka
+backend solves the same problem differently — see [Kafka single-writer design](kafka-single-writer-design.md).
 
 ## Problem
 
@@ -53,10 +51,8 @@ UPDATE snapshots_v2 SET ... , offset = :offset WHERE <key> IF offset <= :offset
 The first write of a key finds no row, so the conditional `UPDATE` does not apply; it falls back to
 `INSERT ... IF NOT EXISTS`. If that loses a race to a concurrent insert, the conditional `UPDATE` is
 retried once, so the newest snapshot still wins a first-write race. A rejected write raises
-`SnapshotWriteConflict` (handled uniformly, see [Persistence](persistence.md#protecting-against-stale-snapshot-writes)).
-Result classification (`applied` / newer-stored-offset / row-absent) lives in `resolveConditional`; a
-not-applied result reports the stored `offset` when Cassandra returns it and treats its absence (or a
-null) as "row absent".
+`SnapshotWriteConflict`. A not-applied result reports the stored `offset` when Cassandra returns it and
+treats its absence (or a null) as "row absent".
 
 This first-write path is the one place a persist is **not** a single atomic compare-and-set — it is a
 compound of separate Paxos transactions with interleaving gaps. It is still safe by construction: both
@@ -154,10 +150,27 @@ write timestamp while a regular write uses a client-side one, so during a mixed 
 clock running ahead of the coordinators can let an old (plain-write) instance's snapshot shadow a newer
 conditional one. Negligible with NTP-synced clocks, and gone once every instance writes conditionally.
 
+## Implementation
+
+Entry point: `CassandraSnapshots.withSchema(compareAndSet = true)` (or
+`CassandraPersistence.withSchema(snapshotCompareAndSet = true)`). In the current code:
+
+- **Conditional persist** — `CassandraSnapshots.persistCompareAndSet` issues the offset-gated `UPDATE`,
+  falling back to `INSERT ... IF NOT EXISTS` (with a single retry) for a key's first write;
+  `resolveConditional` classifies the result (`applied` / newer-stored-offset / row-absent).
+- **Plain delete** — `CassandraSnapshots.delete` is an unguarded last-write-wins `DELETE`; the
+  offset-carrying tombstone is the separate safe-delete layer.
+- **Write mode** — `WriteMode.CompareAndSet` carries the extra `INSERT` statement, so it exists exactly
+  when the database is in compare-and-set mode (`WriteMode.LastWriteWins` otherwise).
+
 ## Testing
 
-- Through the real PartitionFlow / eager-recovery / flush-on-revoke machinery
-  (persistence-cassandra-it-tests) — the #732 reproduction asserts corruption under last-write-wins;
+- Store-level against real Cassandra (`SnapshotSpec`, persistence-cassandra-it-tests) — monotonic
+  persists applied (including an equal-offset re-persist), stale-write rejection, TTL on both the insert
+  and update paths, and concurrent first-writers racing on a fresh key (the highest offset wins, no
+  corruption — exercising the first-write retry path).
+- Through the real PartitionFlow / eager-recovery / flush-on-revoke machinery (`FlowSpec`,
+  persistence-cassandra-it-tests) — the #732 reproduction asserts corruption under last-write-wins;
   the prevention asserts the stale flush is rejected.
 
 ## Assumptions
