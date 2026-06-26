@@ -107,13 +107,23 @@ immediately; a batch is whatever accumulated during the previous transaction's f
 
 `maxWritesPerTransaction` (default 256) bounds a transaction's duration below
 `transaction.timeout.ms` (default 1 min), past which the coordinator aborts it. It is not a throughput
-knob: uncapped is ~7% faster (below), so estimated no need to raise it for speed. Transaction bytes
+knob: uncapped measured ~7% faster (below), so estimated no need to raise it for speed. Transaction bytes
 ≈ cap × snapshot size; lower it for large snapshots.
 
 `persist` does not complete until its transaction commits, and the flush awaits each `persist`, so
 the source is back-pressured: the in-flight queue holds at most the keys flushing in one wave. If a
 partition produces writes faster than `cap / transaction-time` drains, the symptom is rising flush
 latency and lag, not unbounded memory — the remedy is more partitions.
+
+## Implementation
+
+Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current code:
+
+- **Group-committed transactional writes** — `KafkaSnapshotWriteDatabase.transactional` (the
+  `GroupCommit` machinery); the per-partition transactional producer is built in `KafkaPersistenceModule`.
+- **Offset-only commit** (the forced offset advance when no writes are pending) — `ScheduleCommit`.
+- **Generation capture** on each rebalance — the `Consumer` wrapper, holding `groupMetadata` in a `Ref`
+  read off the poll thread.
 
 ## Measurements
 
