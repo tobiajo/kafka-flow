@@ -164,12 +164,12 @@ Reproduce: `KAFKA_FLOW_PERF=1 sbt "persistence-kafka-it-tests/testOnly *Transact
 
 ## Testing
 
-Integration tests (persistence-kafka-it-tests) run through the real eager-recovery / flush-on-revoke
-machinery. The reproduction shows corruption with the plain shared producer (no offset binding); the
+Integration tests (`TransactionalKafkaPersistenceSpec`, in persistence-kafka-it-tests) run through the
+real eager-recovery / flush-on-revoke machinery. The reproduction shows corruption with the plain shared producer (no offset binding); the
 prevention drives a stale owner with an *older consumer generation* and asserts the newer snapshot
 survives — isolating the offset binding as the cause, not incidental fencing. Other pins: first-flush
 gating (the seed), a fenced writer fails its next flush, an open transaction neither blocks nor leaks
-into recovery, concurrent-write safety. The group commit is exercised in isolation by a unit test with a
+into recovery, concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test with a
 recording in-memory producer (no broker).
 
 ## Rejected alternatives
