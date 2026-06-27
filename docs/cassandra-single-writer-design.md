@@ -39,7 +39,7 @@ and treats its absence (or a null) as "row absent".
 The guard is per **key**, the right granularity: #732 corruption is per key and keys are independent,
 so per-key monotonic durability is exactly what prevents it.
 
-## Scope: persist-only — and fencing a deletion without gating delete
+## Scope: persist-only — and what the full fence would cost
 
 ## Delete: offset-carrying tombstone
 
@@ -60,12 +60,12 @@ a read surfaces the null `value` as a `Stored.Tombstone` (no live value). The to
 the row also routes the delete through Paxos, avoiding the well-known hazard of mixing lightweight
 transactions and regular mutations on the same row.
 
-```sql
--- gating delete (the rejected route): a value-less logical tombstone
-UPDATE snapshots_v2 SET value = null,   offset = :offset WHERE <key> IF offset <= :offset
--- the equivalent that already works: persist an empty state
-UPDATE snapshots_v2 SET value = :empty, offset = :offset WHERE <key> IF offset <= :offset
-```
+**A breaking API.** Gating deletes means a delete must carry an offset: an offset-carrying logical
+*tombstone* (`SET value = null`, keeping the row and its `offset`) instead of a row removal, so a
+lower-offset writer is rejected rather than allowed to resurrect. But that offset has to reach the store
+through `SnapshotWriteDatabase.delete`, forcing a source/binary-breaking `delete(key, offset)` signature
+and offset plumbing through every delete path. Persist-only makes **no public API change** and needs no
+major-version bump.
 
 A delete and a re-persist are fenced on an offset that, just after recovery, can legitimately trail
 the key's own stored snapshot. The partition resumes from the committed offset `C` (the minimum offset
@@ -279,49 +279,6 @@ This design takes three things as given:
   not a default.
 - **Recovery-side reconciliation** (store the offset, recover from the lowest): does not prevent the
   stale overwrite (last-write-wins still corrupts), so strictly weaker than fencing the write.
-
-## Conditional deletes: the deferred design
-
-Fencing deletes (the *Forward-looking* item) was built and TLA+-modelled before being deferred. The
-shape, for whoever picks it up:
-
-**One offset-carrying cell.** Replace the `get` / `persist` / `delete(key)` trio with a single `Stored`
-ADT and a unified read/write:
-
-- `Stored.Live(snapshot, offset)` — a live snapshot;
-- `Stored.Tombstone(at: Offset)` — a deleted key: **value-less but offset-carrying** (the offset is
-  mandatory);
-- a never-written key is the outer `None` of `Option[Stored]`, so *absent*, *tombstone* and *live* are
-  three distinct states and a "no value, no offset" state is unrepresentable.
-
-`read` decodes a null `value` column back to `Tombstone(offset)`; `write` routes a `Live` to the persist
-`UPDATE` and a `Tombstone` to an offset-gated logical-tombstone write
-(`SET value = null, offset = :offset … IF offset <= :offset` — the row and its offset guard survive, on
-the Paxos path; the plain `DELETE` is used only in last-write-wins mode).
-
-**A monotonic buffer with a floor.** The per-key buffer holds one cell kept monotonic in offset: a
-`Live` below the high-water is dropped, and a `Tombstone` is lifted to `max(offset, high-water)` (a
-written tombstone is only ever made *more* protective). That floor is what fences a deleted key during
-the replay window — and the owner against itself. Equal offsets apply (`<=`), so an idempotent re-delete
-or the owner's own same-offset write is not rejected.
-
-**Why a floor is needed at all — and on two recovery paths.** A delete clears the journal, so afterwards
-the *only* record of the deletion offset `X` is the snapshot tombstone. But a value-less tombstone reads
-back as "no snapshot", so `SnapshotFold`'s offset dedup — which keys on the recovered snapshot's offset —
-has nothing to compare against. The floor must therefore be seeded **explicitly, on both recovery
-paths**: snapshot recovery seeds it from a recovered `Tombstone(X)`; events recovery runs the snapshot
-read purely for that floor side-effect before folding the journal. Without it, a partition resuming from
-a committed offset `C < X` re-derives below `X`, the offset-gated tombstone rejects the legitimate owner,
-and the flow livelocks (tear down → re-recover the floorless tombstone → repeat).
-
-**What the model proved.** In TLA+ the livelock is a *checked liveness negative control*: remove the
-monotone buffer or the tombstone floor and liveness (`RefLive`) is violated while safety still holds (a
-rejected write changes nothing, `X` never regresses) — a pure liveness failure, reached through a live
-snapshot in one configuration and through a deleted key in another. With both in place the spec refines
-the abstract single-writer store for safety **and** liveness. The deleted-key case needs its *own* floor
-fix precisely because the tombstone reads back as absent — which is also why persist-only is
-livelock-free: re-deriving below the high-water is the everyday persist case `SnapshotFold` already
-covers.
 
 ## Forward-looking
 

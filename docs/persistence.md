@@ -103,26 +103,10 @@ tombstone reaped by the `ttl`; a stale write is rejected with `CassandraSnapshot
 - **Rollout** — no migration either direction (the condition reads the `offset` column every version
   already writes). A rolling deploy is safe; while the two modes coexist there is a clock-skew caveat
   (design doc), negligible with NTP-synced clocks.
-- **Monitoring** — there is no conflict metric, and the persist-duration metric does not count a
-  rejected write, so a rejection surfaces only in logs: a periodic-flush conflict fails the flow (or,
-  with `ignorePersistErrors = true`, logs an `INFO` "Failed to persist state"); a flush-on-revoke
-  conflict logs a scache cache-release line. Alert on those; app-side, the rebalance/revocation rate is
-  the best proxy. LWT contention and CAS write-timeouts are visible only on the Cassandra cluster's own
-  metrics — kafka-flow surfaces neither. A small post-rebalance conflict count is healthy.
 
 Limitations:
-- **Deletes are not fenced.** A delete is a plain last-write-wins `DELETE`, issued when your fold
-  returns `None` for a key whose state was already persisted or recovered (a `None` fold for a
-  never-persisted key touches only the in-memory buffer). During a rebalance overlap a stale writer can
-  then erase a newer owner's snapshot, or resurrect a just-deleted key by writing at a lower offset —
-  #732 for that key. For any key that can be concurrently re-written, **avoid the `None` delete — fold
-  to an empty/"tombstone" state (`Some(empty)`) instead**: the deletion then rides the offset-gated
-  persist path and is protected like any other write, at the cost of the row living until its TTL (which
-  also moves the tombstone from an immediate `DELETE` to a TTL expiry). Plain `None` is safe only for
-  keys never concurrently re-persisted.
-- Offsets must be monotonic per key: after a backward consumer-group offset reset every persist
-  conflicts and the affected flows **stall** until reprocessing passes the stored offsets — to replay
-  from an earlier offset, `truncate` the snapshot table first (`CassandraSnapshots.truncate`).
+- Offsets must be monotonic per key: after a consumer-group offset reset, writes at lower offsets are
+  rejected until the stored snapshots are passed or truncated.
 - Writes at an *equal* offset are allowed (e.g. a timer-driven state change at the same offset), so a
   stale writer holding exactly the stored offset is not detected. It is safe: a same-offset write
   cannot drop committed events — it does not move the recovery point.
