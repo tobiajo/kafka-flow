@@ -9,7 +9,7 @@ import cats.syntax.all.*
 import com.evolutiongaming.catshelper.FromTry
 import com.evolutiongaming.kafka.flow.KafkaKey
 import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
-import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
+import com.evolutiongaming.kafka.flow.snapshot.{SnapshotWriteDatabase, Stored}
 import com.evolutiongaming.skafka.consumer.ConsumerGroupMetadata
 import com.evolutiongaming.skafka.producer.{Producer, ProducerRecord}
 import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, ToBytes, TopicPartition}
@@ -42,8 +42,8 @@ object KafkaSnapshotWriteDatabase {
     * @param assignedOffset
     *   seeds the offset-to-commit so even the first write is gated; committing it is a no-op.
     * @param maxWritesPerTransaction
-    *   bounds the per-partition, serialized transaction's duration below `transaction.timeout.ms`; bytes
-    *   scale with this times the snapshot size.
+    *   bounds the per-partition, serialized transaction's duration below `transaction.timeout.ms`; bytes scale with
+    *   this times the snapshot size.
     */
   def transactional[F[_]: FromTry: Concurrent, S: ToBytes[F, *]](
     snapshotTopicPartition: TopicPartition,
@@ -83,8 +83,8 @@ object KafkaSnapshotWriteDatabase {
 
   /** Group-commit machinery backing [[transactional]]. The producer allows one open transaction at a time, so
     * `transactionLock` serializes them and each holder group-commits up to `maxWritesPerTransaction` writes plus all
-    * queued offset-only markers in one transaction, binding the latest offset to gate it. Markers ride a separate
-    * lane so they never consume a write slot. The over-cap backlog, empty batches and cancellation are handled at the
+    * queued offset-only markers in one transaction, binding the latest offset to gate it. Markers ride a separate lane
+    * so they never consume a write slot. The over-cap backlog, empty batches and cancellation are handled at the
     * methods below; all paths are safe - an interrupted flush never advances the offset. See
     * `docs/kafka-single-writer-design.md`.
     */
@@ -192,10 +192,9 @@ object KafkaSnapshotWriteDatabase {
     partitionMapper: KafkaPersistencePartitionMapper,
     send: ProducerRecord[String, S] => F[Unit],
   ): SnapshotWriteDatabase[F, KafkaKey, S] = new SnapshotWriteDatabase[F, KafkaKey, S] {
-    override def persist(key: KafkaKey, snapshot: S): F[Unit] = produce(key, snapshot.some)
-
-    // the Kafka path fences deletes by the producer's transactional generation, so the offset guard is not needed here
-    override def delete(key: KafkaKey, offset: Offset): F[Unit] = produce(key, none)
+    // a present value persists the snapshot, an absent value is a tombstone (delete); the Kafka path fences by the
+    // producer's transactional generation, so `stored.offset` is not needed here
+    override def write(key: KafkaKey, stored: Stored[S]): F[Unit] = produce(key, stored.value)
 
     private def produce(key: KafkaKey, snapshot: Option[S]): F[Unit] = {
       val targetPartition = partitionMapper.getStatePartition(key.topicPartition.partition)
