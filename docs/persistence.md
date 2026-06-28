@@ -87,7 +87,9 @@ consumer.use { consumer =>
 `producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
 
 Snapshot writes and the input-offset commit run in one Kafka transaction per assigned partition; a
-write from a stale consumer generation is fenced by the broker (KIP-447) and surfaces as
+write from a stale consumer generation is fenced by the broker
+([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics))
+and surfaces as
 `CommitFailedException`. Recovery reads `read_committed`, so a fenced writer's aborted records are
 never recovered. See the [design doc](kafka-single-writer-design.md) for the mechanism (and why epoch
 fencing is avoided).
@@ -99,9 +101,8 @@ fencing is avoided).
   own producer and transaction-coordinator state on the brokers.
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
-  it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. Slow
-  brokers lengthen it regardless of batch, so raise the timeout, not lower the cap. A higher timeout
-  lengthens the post-crash stall (below).
+  it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
+  higher timeout lengthens the post-crash stall (below).
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -125,9 +126,11 @@ Limitations:
 You can plug in your own snapshot store: implement `SnapshotDatabase` and wire it through
 `SnapshotsOf.backedBy` into `PersistenceOf.snapshotsOnly`/`restoreEvents`. A custom store is
 **last-write-wins**, so it is exposed to the same stale-writer overwrite
-([#732](https://github.com/evolution-gaming/kafka-flow/issues/732)) unless its own `persist`/`delete`
-reject a write when the store already holds a newer offset — that conditional write is the fence (the
-buffer wiring does not provide it).
+([#732](https://github.com/evolution-gaming/kafka-flow/issues/732)) unless its `persist` rejects a
+write when the store already holds a newer offset (taken from the snapshot) — that conditional write
+is the fence (the buffer wiring does not provide it). Note that the `delete(key)` method carries no
+offset, so a delete cannot be offset-gated through this interface; a custom store's delete stays
+unconditional.
 
 ## Compression
 Kafka-flow has a built-in support for compressing application's state
