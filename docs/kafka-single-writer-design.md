@@ -48,13 +48,12 @@ Since that commit and the snapshot writes share a transaction, the rejection abo
 The generation — authoritative for partition ownership — gates both, so a stale owner can neither
 advance offsets nor overwrite a newer snapshot.
 
-Seen as a whole, the mechanism combines two ideas — a distributed lock and a transactional snapshot
+Seen as a whole, the mechanism combines two ideas — a distributed lock, and a transactional snapshot
 write + offset commit. Kafka's consumer group is the lock, and it already provides both an ownership
 *lease* and a [fencing token](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html):
-the partition assignment is the lease, and the **generation** (bumped on each rebalance, validated by
-the broker on every offset commit) is the token. What is missing by default is only the link: the
-snapshot write is not bound to that commit. Binding them in one transaction extends the token's fence to
-the write, so a paused, lease-lapsed owner's stale write is rejected, not trusted.
+the partition assignment is the lease, and the **generation** (bumped on each rebalance) is the token.
+What is missing by default is only the link: the snapshot write is not bound to the fenced offset
+commit. Binding them in one transaction is the link.
 
 ```mermaid
 sequenceDiagram
@@ -76,8 +75,7 @@ it — enrolling them would be full transactional output, an explicit non-goal (
 Output is therefore at-least-once: a replayed batch re-emits it, so the consuming side must tolerate
 duplicates. The **committable offset** — the minimum offset still held across the partition's keys — is
 never ahead of the persisted snapshots: an offset becomes committable only after its snapshot is
-persisted, and is committed in a later transaction. So the committed offset can never point past what is
-already persisted, and recovery never skips events.
+persisted, so recovery never skips events.
 
 Key points:
 
