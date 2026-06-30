@@ -214,11 +214,11 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
         consumerOf = consumerOf,
         producerOf = producerOf,
         config = KafkaPersistenceModule.TransactionalConfig(
-          consumerConfig        = consumerConfig,
-          producerConfig        = producerConfig,
-          transactionalIdPrefix = s"$group-$inputTopic",
-          snapshotTopic         = stateTopic,
-          inputTopic            = inputTopic,
+          consumerConfig = consumerConfig,
+          producerConfig = producerConfig,
+          // transactionalIdPrefix omitted: defaults to "$groupId-$inputTopic"
+          snapshotTopic = stateTopic,
+          inputTopic    = inputTopic,
         ),
         groupMetadata = IO.pure(gm.some),
       )
@@ -257,9 +257,10 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
             consumerOf = consumerOf,
             producerOf = producerOf,
             config = KafkaPersistenceModule.TransactionalConfig(
-              consumerConfig        = consumerConfig,
-              producerConfig        = producerConfig,
-              transactionalIdPrefix = s"$group-$inputTopic",
+              consumerConfig = consumerConfig,
+              producerConfig = producerConfig,
+              // explicit override still supported (e.g. to match a pre-granted TransactionalId ACL prefix)
+              transactionalIdPrefix = s"$group-$inputTopic".some,
               snapshotTopic         = stateTopic,
               inputTopic            = inputTopic,
             ),

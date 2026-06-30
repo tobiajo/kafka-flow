@@ -149,10 +149,11 @@ class StatefulProcessingWithKafkaSpec extends ForAllKafkaSuite {
             autoCommit      = false,
             autoOffsetReset = AutoOffsetReset.Earliest
           ),
-          producerConfig        = producerConfig,
-          transactionalIdPrefix = s"$testGroupId-$inputTopic",
-          snapshotTopic         = stateTopic,
-          inputTopic            = inputTopic,
+          producerConfig = producerConfig,
+          // transactionalIdPrefix omitted: defaults to "$groupId-$inputTopic" (here groupId is unset on the
+          // consumerConfig, so the "kafka-flow" fallback is used) - the id is only a label, fencing is by generation
+          snapshotTopic = stateTopic,
+          inputTopic    = inputTopic,
         ),
         groupMetadata = consumer.groupMetadata,
       )

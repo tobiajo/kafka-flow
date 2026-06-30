@@ -71,11 +71,12 @@ consumer.use { consumer =>
     consumerOf = consumerOf,
     producerOf = producerOf,
     config = KafkaPersistenceModule.TransactionalConfig(
-      consumerConfig        = snapshotConsumerConfig,
-      producerConfig        = snapshotProducerConfig,
-      transactionalIdPrefix = s"$groupId-$inputTopic",
-      snapshotTopic         = stateTopic,
-      inputTopic            = inputTopic,
+      consumerConfig = snapshotConsumerConfig,
+      producerConfig = snapshotProducerConfig,
+      snapshotTopic  = stateTopic,
+      inputTopic     = inputTopic,
+      // transactionalIdPrefix defaults to s"$groupId-$inputTopic"; set it (as `Some(...)`) only to
+      // match a pre-granted Kafka TransactionalId ACL prefix or for a custom observability label
     ),
     groupMetadata = consumer.groupMetadata, // the SAME consumer that drives the flow
   )
@@ -85,7 +86,9 @@ consumer.use { consumer =>
 
 `idempotence` and the per-partition `transactional.id` are set for you — don't configure them in
 `producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
-The id is regenerated per assignment, not stable per partition.
+The id is regenerated per assignment, not stable per partition. `transactionalIdPrefix` is just the
+label part of that id (fencing is by consumer generation, not the id); it defaults to
+`s"$groupId-$inputTopic"` and is optional.
 
 Snapshot writes and the input-offset commit run in one Kafka transaction per assigned partition; a
 write from a stale consumer generation is fenced by the broker
