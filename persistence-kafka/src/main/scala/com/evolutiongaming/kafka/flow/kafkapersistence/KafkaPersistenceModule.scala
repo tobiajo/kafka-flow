@@ -44,9 +44,11 @@ object KafkaPersistenceModule {
     *   `clientId` is suffixed with it
     * @param transactionalIdPrefix
     *   prefix for `transactional.id` (partition number and a unique per-producer suffix are appended). Fencing is by
-    *   consumer generation, not this id, so it is just a readable label and need not be stable across restarts. `None`
-    *   (the default) derives `s"$groupId-$inputTopic"` from the consumer group and input topic. Set it explicitly only
-    *   to match a pre-granted Kafka `TransactionalId` ACL prefix, or for a custom observability label.
+    *   consumer generation, not this id, so it is just a readable label and need not be stable across restarts. Set it
+    *   to match the Kafka `TransactionalId` ACL prefix granted to the app (and as a recognizable observability label);
+    *   `s"$groupId-$inputTopic"` is a good value. Required rather than derived: the group identity is not reliably
+    *   available here (the snapshot `consumerConfig` often carries no `groupId`), so a derived default would silently
+    *   degrade to a generic label exactly where an ACL-matching prefix matters.
     * @param snapshotTopic
     *   snapshot topic name (should be configured as a 'compacted' topic) to read/write snapshots
     * @param inputTopic
@@ -59,7 +61,7 @@ object KafkaPersistenceModule {
   final case class TransactionalConfig(
     consumerConfig: ConsumerConfig,
     producerConfig: ProducerConfig,
-    transactionalIdPrefix: Option[String] = None,
+    transactionalIdPrefix: String,
     snapshotTopic: Topic,
     inputTopic: Topic,
     maxWritesPerTransaction: Int = KafkaSnapshotWriteDatabase.DefaultMaxWritesPerTransaction,
@@ -209,21 +211,17 @@ object KafkaPersistenceModule {
     implicit toBytesState: ToBytes[F, S]
   ): Resource[F, KafkaSnapshotWriteDatabase.Transactional[F, S]] = {
     implicit val fromTry: FromTry[F] = FromTry.lift
-    import config.{consumerConfig, inputTopic, maxWritesPerTransaction, producerConfig, transactionalIdPrefix}
+    import config.{inputTopic, maxWritesPerTransaction, producerConfig, transactionalIdPrefix}
     import assignment.{assignedAt, groupMetadata, partition}
 
     // offsets are committed for the input partition with the same number as the assigned (snapshot) partition - the
     // mode forces the identity mapping
     val inputTopicPartition = TopicPartition(inputTopic, partition)
 
-    // just a readable label (fencing is by consumer generation, not this id), so default it to the consumer group and
-    // input topic; an explicit prefix is only needed to match a pre-granted TransactionalId ACL or a custom label
-    val prefix = transactionalIdPrefix.getOrElse(s"${consumerConfig.groupId.getOrElse("kafka-flow")}-$inputTopic")
-
     for {
       // unique per producer: fencing is by consumer generation, not this id, so a fresh id per assignment is fine
       shortId        <- Resource.eval(Async[F].delay(UUID.randomUUID().toString.take(8)))
-      transactionalId = s"$prefix-${partition.value}-$shortId"
+      transactionalId = s"$transactionalIdPrefix-${partition.value}-$shortId"
       transactionalProducerConfig = producerConfig.copy(
         transactionalId = transactionalId.some,
         idempotence     = true,
