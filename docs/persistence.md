@@ -98,17 +98,23 @@ are out of scope for this mode).
   Recovery reads at the regular (non-serial) level, so it sees the fenced write only when `R + W > N`; a
   too-weak read still lets the write-side LWT apply but can miss the newest snapshot, silently
   reintroducing #732 on the read side. Single-DC ownership (a key contended only within one DC, whatever
-  its replication footprint) also needs `query.serial-consistency = LOCAL_SERIAL` on
-  the scassandra client — the LWT's serial level is separate and defaults to cross-DC `SERIAL`, so a
-  conditional write otherwise pays a cross-DC round-trip.
-- **TTL** — set a `ttl` to bound the live key set; the TTL rides onto each key's Paxos state too
-  (`system.paxos`, written per key by every LWT), so it bounds that internal table's growth as well. (A
-  plain `delete` also leaves a Cassandra row tombstone reclaimed only after `gc_grace_seconds` — the
-  cluster default, not set here; not a tombstone-scan risk since keys are single-row partitions read by
-  point lookup, but it feeds compaction and repair under create/delete churn.)
+  its replication footprint) also needs `query.serial-consistency = LOCAL_SERIAL` in the scassandra
+  client config (`client.query.serial-consistency` when nested under kafka-flow's `CassandraConfig`) —
+  the LWT's serial level is separate from `ConsistencyOverrides`, not overridable per statement, and
+  defaults to cross-DC `SERIAL`, so a conditional write otherwise pays a cross-DC round-trip.
+- **TTL** — set a `ttl` to bound the live key set (the offset guard expires with the row — see
+  Limitations). The per-key Paxos state every LWT writes to the internal `system.paxos` table is *not*
+  covered by this `ttl`: Cassandra expires it on its own schedule — at least 3 hours, or the snapshots
+  table's `gc_grace_seconds` if higher (10 days at the default, which this module leaves unset) — so
+  under wide key churn `system.paxos` holds up to that window of distinct keys. (A plain `delete` also
+  leaves a row tombstone reclaimed only after the same `gc_grace_seconds`; not a tombstone-scan risk
+  since keys are single-row partitions read by point lookup, but both feed compaction and repair under
+  create/delete churn.)
 - **Rollout** — no migration either direction (the condition reads the `offset` column every version
-  already writes). A rolling deploy is safe; while the two modes coexist there is a clock-skew caveat,
-  negligible with NTP-synced clocks (application hosts and the Cassandra cluster on one source).
+  already writes). A rolling deploy is safe; while the two modes coexist a plain-write (old) instance
+  is not fenced — the same exposure you already have without the mode — and mixing plain writes with
+  LWTs on one row adds a clock-skew caveat (a plain write's timestamp competes with the LWT's Paxos
+  ballot), negligible with NTP-synced clocks. Both end once every instance writes conditionally.
 
 Limitations:
 - **Deletes are not fenced.** A delete is a plain last-write-wins `DELETE`, issued when your fold

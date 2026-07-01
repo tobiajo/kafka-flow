@@ -17,7 +17,25 @@ problem differently — see [Kafka single-writer design](kafka-single-writer-des
 previous owner that has not yet observed the revocation keeps flushing snapshots alongside the new
 owner, and the last-write-wins snapshots table lets a stale write overwrite a newer one — the next
 recovery then loads stale state and skips the events in between. The
-[Kafka design doc](kafka-single-writer-design.md) covers the failure in full.
+[Kafka design doc](kafka-single-writer-design.md) covers the failure in full; here it is against the
+snapshots table:
+
+```mermaid
+sequenceDiagram
+    participant A as Owner A<br/>(previous)
+    participant DB as Snapshots table<br/>(last-write-wins)
+    participant B as Owner B<br/>(new)
+
+    Note over A: folds input to offset 100,<br/>state buffered, not flushed
+    Note over A,B: rebalance: partition reassigned from A to B<br/>— but A has not observed the revocation yet
+    B->>DB: recover: read snapshot<br/>(none / older)
+    B->>B: fold input to offset 150
+    B->>DB: write snapshot @150 ✓
+    Note over B: commit through offset 150
+    A-->>DB: flush buffered snapshot @100<br/>(stale: A no longer owns it)
+    Note over DB: last write wins:<br/>@100 overwrites @150
+    Note over DB,B: next recovery folds from 151<br/>onto stale @100 — corruption
+```
 
 ## Mechanism: compare-and-set
 
@@ -32,16 +50,39 @@ concurrent writers to one key are ordered without relying on clock synchronisati
 UPDATE snapshots_v2 SET ... , offset = :offset WHERE <key> IF offset <= :offset
 ```
 
+```mermaid
+sequenceDiagram
+    participant A as Stale owner<br/>(previous)
+    participant C as Snapshots table<br/>(offset-gated)
+    participant B as New owner
+
+    B->>C: UPDATE ... offset = 150<br/>IF offset <= 150
+    C-->>B: [applied] = true
+    A->>C: UPDATE ... offset = 100<br/>IF offset <= 100
+    C-->>A: [applied] = false, offset = 150
+    Note over A: SnapshotWriteConflict —<br/>the stale write never lands
+```
+
 A key's first write finds no row, so the `UPDATE` does not apply and it falls back to
 `INSERT ... IF NOT EXISTS` (retried once via the `UPDATE` if it loses an insert race). This is the one
 non-atomic path — a compound of separate Paxos transactions — but it is safe by construction: both
-`UPDATE`s are offset-gated and the `INSERT` only writes an absent cell, so no interleaving overwrites a
+`UPDATE`s are offset-gated and the `INSERT` only writes an absent row, so no interleaving overwrites a
 newer snapshot. A rejected write raises `SnapshotWriteConflict` — including a spurious one if a delete
 slips between the first-write `INSERT` and its retry (an over-rejection, never corruption, cleared on
 the next flush).
 
 The guard is per **key**, the right granularity: #732 corruption is per key and keys are independent,
-so per-key monotonic durability is exactly what prevents it.
+so per-key monotonic durability is exactly what prevents it. It is also the granularity Cassandra can
+actually linearize: the snapshots table's partition key is the full
+`(application_id, group_id, topic, partition, key)` tuple, one row per Cassandra partition, and a
+lightweight transaction is linearizable only within one partition.
+
+**The fence guards the write path; recovery must still be able to see what it wrote.** Recovery reads
+at the ordinary (non-serial) consistency level, so the newest snapshot is guaranteed visible only when
+read and write quorums overlap (`R + W > N`). With a too-weak read level every write is still correctly
+fenced, yet recovery can miss the newest snapshot — #732 reintroduced on the read side. Consistency
+settings, serial consistency and TTL are operational concerns, covered on the
+[persistence page](persistence.md#compare-and-set-snapshot-writes-cassandra).
 
 ## Scope: persist-only
 
@@ -68,6 +109,46 @@ it cannot drop committed events (#732).
 Any two snapshots at the same offset fold the same records, differing at most in time-driven tick state,
 so deterministic, replayable folds are a precondition of the mode (as they already are of recovery
 generally).
+
+## Implementation
+
+Entry point: `CassandraSnapshots.withSchema(compareAndSet = true)` (or `withCustomSchema`); through
+the persistence module, `CassandraPersistence.withSchema`/`withSchemaF` with
+`snapshotCompareAndSet = true`. In the current code:
+
+- **Write mode** — `CassandraSnapshots.WriteMode`: `LastWriteWins` (the default, the pre-existing
+  unconditional `UPDATE`) or `CompareAndSet(insertStatement)`. The first-write
+  `INSERT ... IF NOT EXISTS` statement is prepared exactly when the mode is on, and the ADT carries
+  it, so the mode and its extra statement cannot drift apart.
+- **The gated persist** — `persistCompareAndSet`: the value is serialized and `created` stamped once,
+  reused across the compound; then `UPDATE ... IF offset <= :offset`, interpreted off the lightweight
+  transaction's result row. `[applied] = true` — done. `[applied] = false` with the stored `offset`
+  column present (Cassandra returns the conditioned columns of an existing row) —
+  `SnapshotWriteConflict(key, attemptedOffset, persistedOffset)`. `[applied] = false` with no `offset`
+  column — the row does not exist: `INSERT ... IF NOT EXISTS`, and on losing that race one `UPDATE`
+  retry; a row deleted between the `INSERT` and the retry surfaces as a conflict with
+  `persistedOffset = None` (the spurious over-rejection above).
+- **Unchanged surface** — `SnapshotDatabase` keeps its signatures; `get` and `delete` keep their
+  statements; with the flag off the prepared statements are exactly the previous ones. Off means off.
+
+## Testing
+
+Integration tests (persistence-cassandra-it-tests) run against a real Cassandra:
+
+- **Store-level** (`SnapshotSpec`): monotonic and equal-offset writes apply, the first write
+  exercising the `INSERT` path; a stale write is rejected with the attempted and stored offsets in the
+  error; the TTL lands on both the `INSERT` and the `UPDATE` path; and a concurrent first-write race —
+  parallel writers on a fresh key, all entering the non-atomic compound at once — ends at the highest
+  offset, the losers failing cleanly with `SnapshotWriteConflict`. The persist-only residual gap is
+  *pinned* as a test rather than left as prose: an unguarded `delete` lets a lower-offset write
+  resurrect the key; if a future mode gates deletes, that assertion flips.
+- **Flow-level** (`FlowSpec`): a #732 reproduction/prevention pair through the real machinery
+  (`PartitionFlow`, eager recovery, fold, buffered snapshots, flush-on-revoke), the ownership overlap
+  simulated by two `PartitionFlow`s over one partition — indistinguishable from a real overlap, where
+  the second flow starts while the first is still alive. With `compareAndSet = false` the stale
+  flush-on-revoke lands and recovery returns the stale snapshot (the corruption, documented as a
+  passing assertion); with `compareAndSet = true` the same stale flush is rejected — surfacing only as
+  scache's logged-and-swallowed release error — and the new owner's snapshot survives.
 
 ## Rejected alternatives
 
