@@ -101,7 +101,8 @@ are out of scope for this mode).
   its replication footprint) also needs `query.serial-consistency = LOCAL_SERIAL` on
   the scassandra client — the LWT's serial level is separate and defaults to cross-DC `SERIAL`, so a
   conditional write otherwise pays a cross-DC round-trip.
-- **TTL** — set a `ttl` to bound the live key set, and with it the per-key `system.paxos` state. (A
+- **TTL** — set a `ttl` to bound the live key set; the TTL rides onto each key's Paxos state too
+  (`system.paxos`, written per key by every LWT), so it bounds that internal table's growth as well. (A
   plain `delete` also leaves a Cassandra row tombstone reclaimed only after `gc_grace_seconds` — the
   cluster default, not set here; not a tombstone-scan risk since keys are single-row partitions read by
   point lookup, but it feeds compaction and repair under create/delete churn.)
