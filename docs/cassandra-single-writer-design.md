@@ -129,10 +129,17 @@ exceeds the rebalance/zombie overlap window (the usual case — a zombie outlivi
 realistic), but the monotonicity guarantee only holds within the TTL.
 
 Enabling on a running system needs no migration (the condition reads the `offset` column every version
-already writes). The one rolling-deploy caveat: a lightweight transaction uses a coordinator-generated
-write timestamp while a regular write uses a client-side one, so during a mixed deploy an application
-clock running ahead of the coordinators can let an old (plain-write) instance's snapshot shadow a newer
-conditional one. Negligible with NTP-synced clocks, and gone once every instance writes conditionally.
+already writes). The one rolling-deploy caveat: a lightweight transaction is timestamped by the Cassandra
+coordinator, a plain write by the application host — so while the two modes coexist, the tie-break between
+a stale plain write and a fresh conditional one turns on **coordinator-vs-application** clock skew. This is
+a *new* dependency, not the old #732 risk lingering: pre-CAS the comparison is app-vs-app (one NTP fleet),
+and full CAS is ballot-ordered and timestamp-independent (Paxos assigns the applied cell a monotonic
+ballot timestamp, so cell reconciliation agrees with commit order regardless of wall clocks). Only this
+mixed window depends on app↔coordinator skew. If the coordinators lag the app fleet, an old (plain-write)
+instance's stale snapshot can shadow a newer conditional one — narrowly *worse* than plain last-write-wins
+in that skew direction, since it can invert an ordering pre-CAS would have gotten right. Negligible with
+NTP-synced clocks (keep the app hosts and Cassandra coordinators on one source), and gone once every
+instance writes conditionally.
 
 ## Implementation
 
