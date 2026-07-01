@@ -108,7 +108,8 @@ are out of scope for this mode).
   point lookup, but it feeds compaction and repair under create/delete churn.)
 - **Rollout** — no migration either direction (the condition reads the `offset` column every version
   already writes). A rolling deploy is safe; while the two modes coexist there is a clock-skew caveat
-  (design doc), negligible with NTP-synced clocks.
+  (design doc), negligible with NTP-synced clocks (application hosts and the Cassandra cluster on one
+  source).
 
 Limitations:
 - **Deletes are not fenced.** A delete is a plain last-write-wins `DELETE`, issued when your fold
