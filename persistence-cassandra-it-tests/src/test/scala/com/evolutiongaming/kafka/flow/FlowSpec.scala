@@ -179,7 +179,6 @@ class FlowSpec extends CassandraSpec {
     appId: String,
     groupId: String,
     tp: TopicPartition,
-    fold: FoldOption[IO, KafkaSnapshot[String], ConsumerRecord[String, ByteVector]] = staleFlowFold,
   ): IO[(PartitionFlow[IO], IO[Unit])] = {
     val flow = for {
       timersOf      <- Resource.eval(TimersOf.memory[IO, KafkaKey])
@@ -198,7 +197,7 @@ class FlowSpec extends CassandraSpec {
           persistEvery  = 1.hour,
           flushOnRevoke = true,
         ),
-        fold     = fold,
+        fold     = staleFlowFold,
         tick     = TickOption.id[IO, KafkaSnapshot[String]],
         registry = EntityRegistry.empty[IO, KafkaKey, KafkaSnapshot[String]],
       )

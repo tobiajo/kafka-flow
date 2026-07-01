@@ -147,7 +147,7 @@ object CassandraSnapshots {
   ) extends RuntimeException(
         s"snapshot write conflict for key $key: attempted to write with offset $attemptedOffset " +
           s"while the store contains offset ${persistedOffset.fold("unknown")(_.toString)}, " +
-          "another writer is likely owning the key now"
+          "another writer likely owns the key now"
       )
       with NoStackTrace
 
@@ -266,7 +266,7 @@ object CassandraSnapshots {
       session: CassandraSession[F],
       tableName: String,
       ttl: Option[FiniteDuration],
-      compareAndSet: Boolean = false,
+      compareAndSet: Boolean,
     ): F[PreparedStatement] =
       session.prepare(
         s"""
