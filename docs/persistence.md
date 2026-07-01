@@ -92,7 +92,7 @@ are out of scope for this mode).
 - **Cost** — every persist becomes a lightweight transaction (Paxos): several inter-replica
   round-trips, a few times slower and more coordinator-CPU-intensive than a quorum write. A
   `persistEvery` wave flushes a partition's whole changed-key population, so the added load scales with
-  that wave. Measure it against your write rate first.
+  that wave.
 - **Consistency** — set `ConsistencyOverrides` read **and** write to a quorum (`QUORUM`, or
   `LOCAL_QUORUM` for single-DC): the fence's read side needs `R + W > N`, and these are **not**
   defaulted (an unset override uses the session default, often `LOCAL_ONE`). For single-DC also set
@@ -108,12 +108,6 @@ are out of scope for this mode).
 - **Rollout** — no migration either direction (the condition reads the `offset` column every version
   already writes). A rolling deploy is safe; while the two modes coexist there is a clock-skew caveat
   (design doc), negligible with NTP-synced clocks.
-- **Monitoring** — there is no conflict metric, and the persist-duration metric does not count a
-  rejected write, so a rejection surfaces only in logs: a periodic-flush conflict fails the flow (or,
-  with `ignorePersistErrors = true`, logs an `INFO` "Failed to persist state"); a flush-on-revoke
-  conflict logs a scache cache-release line. Alert on those; app-side, the rebalance/revocation rate is
-  the best proxy. LWT contention and CAS write-timeouts are visible only on the Cassandra cluster's own
-  metrics — kafka-flow surfaces neither. A small post-rebalance conflict count is healthy.
 
 Limitations:
 - **Deletes are not fenced.** A delete is a plain last-write-wins `DELETE`, issued when your fold
