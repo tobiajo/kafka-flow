@@ -43,9 +43,12 @@ so per-key monotonic durability is exactly what prevents it.
 ## Scope: persist-only — and fencing a deletion without gating delete
 
 This mode fences **persists** only. A delete is an ordinary last-write-wins `DELETE`; the
-`IF offset <= :offset` guard does not apply to it. The residual gap, for anyone who hard-deletes: a
-lagging zombie can resurrect a just-deleted key by inserting at a lower offset, and a later recovery then
-folds new events onto that revived base — #732 for that one key.
+`IF offset <= :offset` guard does not apply to it. The residual gap, for anyone who hard-deletes, is
+two-sided. A zombie's unguarded `DELETE` can **erase a newer owner's snapshot** — last-write-wins, so a
+stale delete landing after a fresh persist wins, and recovery then loads nothing where committed state
+should be. The mirror case: the `DELETE` removes the row — and with it the `offset` guard that lives in
+it — so a lagging zombie can then **resurrect a just-deleted key** by inserting at a lower offset, a
+later recovery folding new events onto that revived base. Either way, #732 for that one key.
 
 Fencing a deletion, though, needs no gated `delete`. The obvious way to gate one — a logical *tombstone*
 that keeps the row and its `offset` instead of removing it — is just a persisted null:
