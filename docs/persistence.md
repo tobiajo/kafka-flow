@@ -94,13 +94,12 @@ are out of scope for this mode).
   `persistEvery` wave flushes a partition's whole changed-key population, so the added load scales with
   that wave.
 - **Consistency** — set `ConsistencyOverrides` read **and** write to a quorum (`QUORUM`, or
-  `LOCAL_QUORUM` for single-DC): the fence's read side needs `R + W > N`, and these are **not**
-  defaulted (an unset override uses the session default, often `LOCAL_ONE`). For single-DC also set
-  the scassandra client's `query.serial-consistency = LOCAL_SERIAL` — the lightweight transaction's
-  serial level is separate from `ConsistencyOverrides` and defaults to cross-DC `SERIAL`, so a
-  conditional write otherwise pays a cross-datacenter round-trip. A too-weak read level fails
-  **silently**: the write-side LWT still applies, but a non-quorum recovery read can miss the newest
-  snapshot and reintroduce #732 on the read side with no error — verify both overrides before rollout.
+  `LOCAL_QUORUM` single-DC); they are **not** defaulted, and the usual `LOCAL_ONE` default is too weak.
+  Recovery reads at the regular (non-serial) level, so it sees the fenced write only when `R + W > N`; a
+  too-weak read still lets the write-side LWT apply but can miss the newest snapshot, silently
+  reintroducing #732 on the read side. Single-DC also needs `query.serial-consistency = LOCAL_SERIAL` on
+  the scassandra client — the LWT's serial level is separate and defaults to cross-DC `SERIAL`, so a
+  conditional write otherwise pays a cross-DC round-trip.
 - **TTL** — set a `ttl` to bound the live key set, and with it the per-key `system.paxos` state. (A
   plain `delete` also leaves a Cassandra row tombstone reclaimed only after `gc_grace_seconds` — the
   cluster default, not set here; not a tombstone-scan risk since keys are single-row partitions read by
