@@ -97,7 +97,8 @@ are out of scope for this mode).
   `LOCAL_QUORUM` single-DC); they are **not** defaulted, and the usual `LOCAL_ONE` default is too weak.
   Recovery reads at the regular (non-serial) level, so it sees the fenced write only when `R + W > N`; a
   too-weak read still lets the write-side LWT apply but can miss the newest snapshot, silently
-  reintroducing #732 on the read side. Single-DC also needs `query.serial-consistency = LOCAL_SERIAL` on
+  reintroducing #732 on the read side. Single-DC ownership (a key contended only within one DC, whatever
+  its replication footprint) also needs `query.serial-consistency = LOCAL_SERIAL` on
   the scassandra client — the LWT's serial level is separate and defaults to cross-DC `SERIAL`, so a
   conditional write otherwise pays a cross-DC round-trip.
 - **TTL** — set a `ttl` to bound the live key set, and with it the per-key `system.paxos` state. (A
