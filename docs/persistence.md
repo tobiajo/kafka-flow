@@ -55,9 +55,10 @@ The protections are **opt-in and off by default** — pick the one for your snap
 
 You do not catch the rejection yourself; it is handled the same way for both backends:
 
-- **Periodic flush** — the conflict fails the stale instance's flow. That is safe (it no longer owns
-  the partition), unless you set `persistPeriodically(ignorePersistErrors = true)`, in which case it
-  is logged and swallowed.
+- **Periodic flush** — the conflict fails the stale instance's flow, a harmless outcome since it no
+  longer owns the partition. Setting `persistPeriodically(ignorePersistErrors = true)` logs and
+  swallows it instead, so the flow keeps running — still safe either way: the fence already rejected
+  the write, and the flag only decides whether the stale flow tears down or keeps getting rejected.
 - **Flush-on-revoke** — the conflict surfaces as a cache-entry release error that scache logs and
   swallows (`scache: failed to release cache entry: ...`), so the partition hands off cleanly.
 
