@@ -50,7 +50,6 @@ The protections are **opt-in and off by default** — pick the one for your snap
 | **Enable**         | `compareAndSet = true`                       | `KafkaPersistenceModuleOf.cachingTransactional`              |
 | **Rejects with**   | `CassandraSnapshots.SnapshotWriteConflict`   | `CommitFailedException` (the fenced offset commit)           |
 | **Per-write cost** | a Cassandra lightweight transaction (Paxos)  | a Kafka transaction (concurrent writes are group-committed)  |
-| **Rolling deploy** | safe; routine deploys unaffected. The clock-skew caveat (below) applies only while enabling/disabling, when both write modes coexist — gone once every instance writes conditionally | safe; routine deploys unaffected. While enabling/disabling, full protection holds once every instance is transactional |
 
 ### What a rejected write looks like
 
