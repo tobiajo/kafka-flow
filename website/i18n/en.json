@@ -5,9 +5,17 @@
     "previous": "Previous",
     "tagline": "Reliable processing of Kafka Journal events",
     "docs": {
+      "cassandra-single-writer-design": {
+        "title": "Cassandra single-writer design: persist only",
+        "sidebar_label": "Cassandra single-writer design: persist only"
+      },
       "faq": {
         "title": "FAQ",
         "sidebar_label": "FAQ"
+      },
+      "kafka-single-writer-design": {
+        "title": "Kafka single-writer design",
+        "sidebar_label": "Kafka single-writer design"
       },
       "overview": {
         "title": "Overview",
@@ -32,7 +40,8 @@
       "Help": "Help"
     },
     "categories": {
-      "Kafka-Flow": "Kafka-Flow"
+      "Kafka-Flow": "Kafka-Flow",
+      "Design notes": "Design notes"
     }
   },
   "pages-strings": {
