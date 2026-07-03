@@ -152,7 +152,7 @@ class RemapKeySpec extends ForAllKafkaSuite {
   ): IO[TopicFlowOf[IO]] = {
     for {
       timersOf <- TimersOf.memory[IO, KafkaKey]
-      partitionFlowOf = kafkaEagerRecovery[IO, String](
+      topicFlowOf = kafkaEagerRecovery[IO, String](
         kafkaPersistenceModuleOf = persistenceModuleOf,
         applicationId            = appId,
         groupId                  = testGroupId,
@@ -179,7 +179,7 @@ class RemapKeySpec extends ForAllKafkaSuite {
         remapKey = remapKey.some,
         registry = EntityRegistry.empty[IO, KafkaKey, String]
       )
-    } yield TopicFlowOf(partitionFlowOf)
+    } yield topicFlowOf
   }
 
   private def foldLogic: FoldOption[IO, String, ConsumerRecord[String, ByteVector]] =

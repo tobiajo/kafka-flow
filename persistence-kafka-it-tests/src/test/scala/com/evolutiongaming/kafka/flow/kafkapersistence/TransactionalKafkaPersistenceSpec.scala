@@ -10,10 +10,12 @@ import com.evolutiongaming.kafka.flow.registry.EntityRegistry
 import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
 import com.evolutiongaming.kafka.flow.timer.{TimerFlowOf, TimersOf}
 import com.evolutiongaming.kafka.flow.{
+  AdditionalStatePersistOf,
+  EnhancedFold,
+  FlowMetrics,
   FoldOption,
   ForAllKafkaSuite,
   KafkaKey,
-  PartitionAssignment,
   PartitionFlow,
   PartitionFlowConfig,
   PartitionFlowOf,
@@ -96,22 +98,29 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       }
     }
 
+  // uses the package-private PartitionFlowOf assembly so tests can drive flows with a chosen generation
   private def flowOf(
     moduleOf: KafkaPersistenceModuleOf[IO, String],
     timerFlowOf: TimerFlowOf[IO],
+    groupMetadata: IO[Option[ConsumerGroupMetadata]],
     config: PartitionFlowConfig = PartitionFlowConfig(commitOnRevoke = true),
   ): IO[PartitionFlowOf[IO]] =
     TimersOf.memory[IO, KafkaKey].map { timersOf =>
-      kafkaEagerRecovery[IO, String](
+      eagerRecoveryPartitionFlowOf[IO, String](
         kafkaPersistenceModuleOf = moduleOf,
         applicationId            = appId,
         groupId                  = groupId,
         timersOf                 = timersOf,
         timerFlowOf              = timerFlowOf,
-        fold                     = fold,
+        fold                     = EnhancedFold.fromFold(fold),
         tick                     = TickOption.id[IO, String],
         partitionFlowConfig      = config,
+        metrics                  = FlowMetrics.empty[IO],
+        filter                   = None,
+        remapKey                 = None,
+        additionalPersistOf      = AdditionalStatePersistOf.empty[IO, String],
         registry                 = EntityRegistry.empty[IO, KafkaKey, String],
+        groupMetadata            = groupMetadata,
       )
     }
 
@@ -161,8 +170,8 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       moduleOf: KafkaPersistenceModuleOf[IO, String],
       groupMetadata: IO[Option[ConsumerGroupMetadata]],
     ): IO[(PartitionFlow[IO], IO[Unit])] =
-      flowOf(moduleOf, flushOnRevokeOnly).flatMap(
-        _.apply(PartitionAssignment(tp, Offset.min, groupMetadata), ScheduleCommit.empty[IO]).allocated
+      flowOf(moduleOf, flushOnRevokeOnly, groupMetadata).flatMap(
+        _.apply(tp, Offset.min, ScheduleCommit.empty[IO]).allocated
       )
 
     for {
@@ -277,13 +286,9 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
           flow <- flowOf(
             moduleOf,
             TimerFlowOf.persistPeriodically[IO](fireEvery = 0.seconds, persistEvery = 0.seconds),
-            PartitionFlowConfig(triggerTimersInterval     = 0.seconds),
-          ).flatMap(
-            _.apply(
-              PartitionAssignment(tp, Offset.min, gmRef.get.map(_.some)),
-              ScheduleCommit.empty[IO]
-            ).allocated
-          )
+            gmRef.get.map(_.some),
+            PartitionFlowConfig(triggerTimersInterval = 0.seconds),
+          ).flatMap(_.apply(tp, Offset.min, ScheduleCommit.empty[IO]).allocated)
           (flow_, release) = flow
           // persists fine while the generation is current
           _ <- flow_(inputRecords(inputTopic, key, List("e1", "e2", "e3")))

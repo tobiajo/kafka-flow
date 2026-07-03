@@ -1,15 +1,17 @@
 package com.evolutiongaming.kafka.flow
 
+import cats.Parallel
 import cats.effect.{Async, Resource}
 import cats.syntax.all.*
 import cats.{Eval, Foldable, Monad}
-import com.evolutiongaming.catshelper.LogOf
+import com.evolutiongaming.catshelper.{LogOf, Runtime}
 import com.evolutiongaming.kafka.flow.PartitionFlow.FilterRecord
 import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
 import com.evolutiongaming.kafka.flow.metrics.syntax.*
 import com.evolutiongaming.kafka.flow.registry.EntityRegistry
 import com.evolutiongaming.kafka.flow.timer.{TimerFlowOf, TimersOf}
-import com.evolutiongaming.skafka.consumer.ConsumerRecord
+import com.evolutiongaming.skafka.consumer.{ConsumerGroupMetadata, ConsumerRecord}
+import com.evolutiongaming.skafka.{Offset, TopicPartition}
 import com.evolutiongaming.sstream.{FoldWhile, Stream}
 import scodec.bits.ByteVector
 
@@ -21,9 +23,12 @@ package object kafkapersistence {
     def empty: BytesByKey = Map.empty
   }
 
-  /** Create a PartitionFlowOf with a snapshot-based persistence and recovery from a Kafka
+  /** Create a TopicFlowOf with a snapshot-based persistence and recovery from a Kafka
     * [[https://kafka.apache.org/documentation/#compaction compacted topic]]. State is restored eagerly on partition
     * assignment by reading the content of a snapshot topic to the end without committing offsets.
+    *
+    * The driving consumer's group metadata is bound where the TopicFlow is created - the only place that consumer is in
+    * scope - so the transactional module always fences with the generation of the consumer that drives the flow.
     *
     * Note that the snapshot topic should have the same number of partitions as the input topic since state recovery
     * will be performed based on a number of the assigned partition of the input topic (state for partition N of input
@@ -55,7 +60,7 @@ package object kafkapersistence {
     * @param remapKey
     *   optional function to remap keys before they are processed by `fold`
     */
-  def kafkaEagerRecovery[F[_]: Async: LogOf, S](
+  def kafkaEagerRecovery[F[_]: Async: Parallel: Runtime: LogOf, S](
     kafkaPersistenceModuleOf: KafkaPersistenceModuleOf[F, S],
     applicationId: String,
     groupId: String,
@@ -68,7 +73,7 @@ package object kafkapersistence {
     filter: Option[FilterRecord[F]] = None,
     remapKey: Option[RemapKey[F]]   = None,
     registry: EntityRegistry[F, KafkaKey, S]
-  ): PartitionFlowOf[F] =
+  ): TopicFlowOf[F] =
     kafkaEagerRecovery(
       kafkaPersistenceModuleOf = kafkaPersistenceModuleOf,
       applicationId            = applicationId,
@@ -85,9 +90,12 @@ package object kafkapersistence {
       registry                 = registry
     )
 
-  /** Create a PartitionFlowOf with a snapshot-based persistence and recovery from a Kafka
+  /** Create a TopicFlowOf with a snapshot-based persistence and recovery from a Kafka
     * [[https://kafka.apache.org/documentation/#compaction compacted topic]]. State is restored eagerly on partition
     * assignment by reading the content of a snapshot topic to the end without committing offsets.
+    *
+    * The driving consumer's group metadata is bound where the TopicFlow is created - the only place that consumer is in
+    * scope - so the transactional module always fences with the generation of the consumer that drives the flow.
     *
     * Note that the snapshot topic should have the same number of partitions as the input topic since state recovery
     * will be performed based on a number of the assigned partition of the input topic (state for partition N of input
@@ -123,7 +131,7 @@ package object kafkapersistence {
     *   a factory of `AdditionalStatePersist` that can either enable or disable additional state persisting. That part
     *   of functionality in `KeyFlowExtras` will work only if you pass a functional (non-empty) implementation here
     */
-  def kafkaEagerRecovery[F[_]: Async: LogOf, S](
+  def kafkaEagerRecovery[F[_]: Async: Parallel: Runtime: LogOf, S](
     kafkaPersistenceModuleOf: KafkaPersistenceModuleOf[F, S],
     applicationId: String,
     groupId: String,
@@ -137,16 +145,58 @@ package object kafkapersistence {
     remapKey: Option[RemapKey[F]],
     additionalPersistOf: AdditionalStatePersistOf[F, S],
     registry: EntityRegistry[F, KafkaKey, S]
+  ): TopicFlowOf[F] = { (consumer, topic) =>
+    TopicFlow.of(
+      consumer,
+      topic,
+      eagerRecoveryPartitionFlowOf(
+        kafkaPersistenceModuleOf = kafkaPersistenceModuleOf,
+        applicationId            = applicationId,
+        groupId                  = groupId,
+        timersOf                 = timersOf,
+        timerFlowOf              = timerFlowOf,
+        fold                     = fold,
+        tick                     = tick,
+        partitionFlowConfig      = partitionFlowConfig,
+        metrics                  = metrics,
+        filter                   = filter,
+        remapKey                 = remapKey,
+        additionalPersistOf      = additionalPersistOf,
+        registry                 = registry,
+        groupMetadata            = consumer.groupMetadata,
+      )
+    )
+  }
+
+  /** The PartitionFlowOf assembly behind [[kafkaEagerRecovery]], with the group-metadata reader injectable - the seam
+    * the integration tests use to drive flows with a chosen generation.
+    */
+  private[kafkapersistence] def eagerRecoveryPartitionFlowOf[F[_]: Async: LogOf, S](
+    kafkaPersistenceModuleOf: KafkaPersistenceModuleOf[F, S],
+    applicationId: String,
+    groupId: String,
+    timersOf: TimersOf[F, KafkaKey],
+    timerFlowOf: TimerFlowOf[F],
+    fold: EnhancedFold[F, S, ConsumerRecord[String, ByteVector]],
+    tick: TickOption[F, S],
+    partitionFlowConfig: PartitionFlowConfig,
+    metrics: FlowMetrics[F],
+    filter: Option[FilterRecord[F]],
+    remapKey: Option[RemapKey[F]],
+    additionalPersistOf: AdditionalStatePersistOf[F, S],
+    registry: EntityRegistry[F, KafkaKey, S],
+    groupMetadata: F[Option[ConsumerGroupMetadata]]
   ): PartitionFlowOf[F] =
     new PartitionFlowOf[F] {
       override def apply(
-        assignment: PartitionAssignment[F],
+        topicPartition: TopicPartition,
+        assignedAt: Offset,
         scheduleCommit: ScheduleCommit[F]
       ): Resource[F, PartitionFlow[F]] = {
         for {
           // TODO: per-partition persistence module with 'String -> ByteVector' cache or global persistence module with 'KafkaKey -> ByteVector' cache?
           // Latter would require initialization of PartitionFlowOf as a Resource
-          kafkaPersistenceModule <- kafkaPersistenceModuleOf.make(assignment)
+          kafkaPersistenceModule <- kafkaPersistenceModuleOf.make(topicPartition, assignedAt, groupMetadata)
           // transactional mode commits offsets through its own producer transaction; otherwise fall back to consumer commit
           effectiveScheduleCommit = kafkaPersistenceModule.scheduleCommit.getOrElse(scheduleCommit)
           partitionFlowOf = PartitionFlowOf.apply[F](
@@ -168,7 +218,7 @@ package object kafkapersistence {
             filter   = filter,
             remapKey = remapKey,
           )
-          partitionFlow <- partitionFlowOf(assignment, effectiveScheduleCommit)
+          partitionFlow <- partitionFlowOf(topicPartition, assignedAt, effectiveScheduleCommit)
         } yield partitionFlow
       }
     }
