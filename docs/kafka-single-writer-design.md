@@ -39,11 +39,13 @@ sequenceDiagram
 In the default (non-transactional) mode the input offsets are committed through the **Kafka consumer**
 (the ordinary consumer-group offset commit). In this mode they are committed through the snapshot
 **producer** instead, with the consumer-side commit disabled — the offset moves **into the producer's
-transaction** via
-`sendOffsetsToTransaction(offsets, consumerGroupMetadata)`
-([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics)):
-the group coordinator validates the consumer **generation** and rejects a commit from a stale one
-(`ILLEGAL_GENERATION`, surfaced to the client as `CommitFailedException`).
+transaction** via `sendOffsetsToTransaction(offsets, consumerGroupMetadata)`. This is the overload
+[KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics)
+added: it carries the consumer's **generation** into the commit, so the group coordinator can validate
+that generation and reject a stale one (`ILLEGAL_GENERATION`, surfaced to the client as
+`CommitFailedException`) — the older group-id-only call carried no generation and could not be fenced.
+(KIP-447's own aim is exactly-once processing across a consumer rebalance; this design borrows only its
+generation fence, not its transactional output, so it is *not* itself exactly-once — see below.)
 Since that commit and the snapshot writes share a transaction, the rejection aborts the writes too.
 The generation gates both, so a stale owner can neither advance offsets nor overwrite a newer snapshot.
 
@@ -98,8 +100,10 @@ Key points:
   the call itself drives the transaction and blocks on its outcome. That blocking is what lets a fence
   (`CommitFailedException`) propagate into the flow and crash a stale owner, rather than being lost on a
   fire-and-forget commit thread.
-- The fence is per **member + generation**, not per partition, so it cannot stop a still-valid member
-  from committing a partition it just lost. That is closed client-side: a revoked partition's flows are
+- The fence is per **member + generation**, not per partition: the coordinator gates a commit on the
+  committer's generation, not on which partitions it still owns, so a still-valid member — one still on
+  the current generation — clears the fence and cannot be stopped from committing a partition it just
+  lost. That is closed client-side: a revoked partition's flows are
   torn down before the consumer proceeds, awaited inside the synchronous revoke callback. The ordering is
   airtight because the broker does not reassign the partition until the client acknowledges the
   revocation, and the client cannot acknowledge until that callback — the teardown — returns: no new
@@ -111,14 +115,25 @@ from the partition assignment — not configured by hand — so they always matc
 the flow. A fence surfaces as `CommitFailedException` on the failing snapshot write (or offset-only
 commit).
 
-The tracked generation must follow every generation bump, not just a rebalance that changes this
-member's partitions — a rebalance can advance it while leaving this member's partitions unchanged,
-spuriously fencing the next flush of a retained partition.
+Refreshing after every poll — rather than tracking the generation only at partition assignment — fixes a
+specific failure. The case that bites is routine: under a cooperative assignor a co-tenant joins the
+group and this member keeps every partition it had, so the generation advances with no change to this
+member's assignment. Track it only at partition assignment and that bump is missed — the tracked value
+lags, and the next flush of a **retained** partition is fenced even though the member still owns it. The
+cost is a livelock, not a one-off: the fence tears the flow down, recovery re-reads the same snapshot,
+and with no assignment to re-observe the generation the re-flush fences again. It stays in the fail-safe
+direction throughout — a fenced commit writes nothing, so this is a liveness cost, never corruption. The
+refresh removes it by following every generation bump, including the one no partition change accompanies;
+why a *read* rather than a rebalance callback is required is the subject of Consumer rebalance protocols,
+below.
 
 One generation value is deliberately never trusted: the *unknown* one — a negative id paired with an
 empty member id — that the client reports before it has joined a group. That all-sentinel metadata is the
-coordinator's pre-KIP-447 compatibility input, for which generation validation is **skipped**, so a
-commit carrying it would land unfenced. Only a non-negative generation is ever bound into a transaction.
+coordinator's pre-KIP-447 compatibility input (it looks like a producer that predates the
+generation-carrying overload above and so supplies no generation), for which generation validation is
+**skipped**, so a commit carrying it would land unfenced. This is not a legacy-only path: the compatibility skip was
+deliberately restored in the KIP-848 coordinator (KAFKA-18060), so the guard is load-bearing under both
+rebalance protocols. Only a non-negative generation is ever bound into a transaction.
 
 ### No epoch fencing
 
@@ -146,16 +161,26 @@ by the post-poll read (above) and the broker-side fence is protocol-agnostic. Th
 is read rather than captured in a callback: under the consumer protocol the epoch advances on the
 background heartbeat thread, and a bump that leaves this member's partitions unchanged fires no rebalance
 callback at all (under the classic protocol it fires an empty callback the typed listener drops) — so only
-a read tracks it. No read fully closes the window between the read and the commit, so a spurious fence
-stays possible; that is a liveness cost, never a safety one.
+a read tracks it. Under the **classic** protocol that read is sufficient on its own: generation changes
+happen only inside `poll`, so the post-poll read observes each one before the flush that follows and the
+token reconverges every cycle — the missed-bump livelock cannot form, on any broker version. Under the
+**consumer** protocol the epoch also advances on the background thread *between* polls, so even a post-poll
+read can be stale by the time the commit reaches the broker; the read narrows that window but cannot fully
+close it, so a spurious fence stays possible — a liveness cost, never a safety one (a lagging token only
+fences).
 
-That spurious fence is what
+That residual fence is **consumer-protocol only**, and it is what
 [KIP-1251](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1251%3A+Assignment+epochs+for+consumer+groups),
 a broker-side coordinator change in Kafka 4.3.0, absorbs: it relaxes the offset-commit epoch check for a
-still-owned partition, so the lagging commit from a retained partition is accepted rather than rejected. The
-relevant version floor is therefore the broker's, not the client's — below 4.3.0 the fence is not absorbed
-and crashes the still-valid owner (a restart, whose reassignment is itself another rebalance): safe, but not
-stable. The revoke-time flush is a separate case, accepted from 4.0: the coordinator keeps the member on its
+still-owned partition, so a retained partition's lagging commit is accepted rather than rejected. This is
+why the consumer protocol carries a **broker** version floor the classic protocol does not — below 4.3.0 the
+residual fence is not absorbed and crashes the still-valid owner (a restart, whose reassignment is itself
+another rebalance): safe, but not stable — so brokers 4.3.0+ are recommended for `group.protocol=consumer`.
+KIP-1251 changes `ConsumerGroup`, the consumer-protocol coordinator, only; a classic-protocol group keeps
+exact-generation equality on every broker version and needs no floor, because the post-poll read already
+closes its window.
+
+The revoke-time flush is a separate case, accepted from 4.0: the coordinator keeps the member on its
 epoch until it acknowledges the revocation, and the flush runs before that acknowledgement — a flip from the
 classic cooperative assignor, where the member is already on the new generation and the flush is fenced.
 
@@ -255,9 +280,10 @@ concurrent-write safety. The group commit is exercised in isolation by `GroupCom
 with a recording in-memory producer (no broker).
 
 Beyond these tests, the fence's load-bearing properties — the generation binding, the offset seed, the
-bounded replay window, and the rejection of the producer-epoch alternative — are additionally
-model-checked in TLA+ (a companion formal-verification effort), each pinned by a negative control that
-breaks when the property is removed.
+bounded replay window, the necessity of the post-poll refresh (without it a missed generation bump turns
+into the retained-partition livelock above), that the refresh subsumes callback capture, and the
+rejection of the producer-epoch alternative — are additionally model-checked in TLA+ (a companion
+formal-verification effort), each pinned by a negative control that breaks when the property is removed.
 
 ## Rejected alternatives
 
@@ -276,8 +302,13 @@ breaks when the property is removed.
 - **Unbounded batches**: ~7% faster, but transaction duration scales unbounded against the coordinator
   timeout.
 - **Transactional output produces (full exactly-once)**: out of scope; output stays at-least-once.
-- **Capturing the generation in a rebalance callback** (instead of the post-poll read): not
-  protocol-portable and redundant.
+- **Capturing the generation in a rebalance callback** (instead of the post-poll read): capture can act
+  only on a callback the typed listener delivers, and the bump that matters delivers none. Under the
+  classic protocol it fires an `onPartitionsAssigned` with an empty delta that the typed listener drops;
+  under the consumer protocol (KIP-848) it fires no rebalance callback at all. A post-poll read observes
+  the new generation either way, so it subsumes callback capture and stays correct across protocols — the
+  two coincide only when every bump is accompanied by a callback the listener can act on, which an
+  ordinary assignment change is and these are not.
 
 ## Forward-looking
 
