@@ -121,23 +121,19 @@ never recovered.
 Limitations:
 - A batch shares its transaction's outcome: if the transaction fails, every write in it fails.
 - An old owner can be fenced while flushing on revoke; its last state delta is then neither persisted
-  nor committed, so the new owner replays those events — noise, not loss. With a **cooperative**
-  assignor this is every revocation, not an edge case: it revokes only after the rebalance completes
-  (still inside the poll, the member already on the new generation), so the revoke-time flush is always
-  fenced and `flushOnRevoke` does not shrink the replay window there.
+  nor committed, so the new owner replays those events — noise, not loss. Under the classic
+  **cooperative** assignor this is every revocation, not an edge case: the revoke-time flush is always
+  fenced, so `flushOnRevoke` does not shrink the replay window there (see the design doc for why).
 - After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
   `transaction.timeout.ms`; until then a `read_committed` reader — recovery of that partition, or a
   downstream consumer of your output — can stall behind its last-stable-offset.
-- The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
-  a non-identity mapper is not supported here.
-- The fence works under whichever protocol the driving consumer uses — both the **classic** and the
-  **consumer** group protocols (`group.protocol=classic|consumer`; the consumer protocol is
-  [KIP-848](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol)).
-  Under the consumer protocol, use **brokers 4.3.0+**: on 4.0–4.2
-  ([KIP-1251](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1251%3A+Assignment+epochs+for+consumer+groups)
-  absent) a still-valid owner can be
-  spuriously fenced during a rebalance, which crashes it — a restart, whose reassignment is itself another
-  rebalance. Safe (never corruption), but not stable below 4.3.0.
+- The mode always uses the identity `KafkaPersistencePartitionMapper` (one snapshot partition per input
+  partition); a non-identity mapper is not supported here.
+- The fence works under both the **classic** and the **consumer** group protocols
+  (`group.protocol=classic|consumer`). With `consumer`, use **brokers 4.3.0+** — below that a still-valid
+  owner can be spuriously fenced during a rebalance and crash-loop on the restart (safe, never corruption,
+  but not stable). See [Consumer rebalance protocols](kafka-single-writer-design.md#consumer-rebalance-protocols)
+  in the design doc.
 
 ### Custom snapshot storage
 

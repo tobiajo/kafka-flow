@@ -48,19 +48,21 @@ object Consumer {
         consumer.poll(timeout) <* refresh
 
       // read the generation after every poll, not from a rebalance callback: a bump that assigns this member
-      // nothing new fires no callback at all under the consumer protocol (KIP-848) and an empty one the typed
-      // listener drops under classic (https://github.com/evolution-gaming/skafka/issues/581), so only a read
-      // tracks it. The join round may span polls (KIP-266: poll(Duration) does not block on it), so the read
-      // converges on the poll after the round completes; the interim lag only self-fences. Revoked partitions
-      // were torn down inside the poll under the pre-rebalance generation, so every flow still alive is owned
-      // in the one just read.
+      // nothing new fires no callback at all under the consumer protocol (KIP-848), and under the classic
+      // cooperative assignor an empty one the typed listener drops
+      // (https://github.com/evolution-gaming/skafka/issues/581), so only a read tracks it. The join round may
+      // span polls (KIP-266: poll(Duration) does not block on it), so the read converges on the poll after the
+      // round completes; the interim lag only self-fences. Revoked partitions were torn down inside the poll
+      // under the pre-rebalance generation, so every flow still alive is owned in the one just read.
       private def refresh: F[Unit] =
         consumer.groupMetadata.flatMap(publish)
 
       // never publish an unknown (negative) generation: paired with an empty member id it is the coordinator's
       // pre-KIP-447 compatibility input, for which generation validation is SKIPPED - a commit carrying it would
-      // land unfenced. The client reports unknown only before the first join; after falling out of the group it
-      // keeps the last joined generation, so a fallen-out owner stays gated by the generation it held.
+      // land unfenced. The client reports the unknown sentinel both before its first join and again after it
+      // leaves or is fenced (it resets to NO_GENERATION on ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID /
+      // FENCED_INSTANCE_ID); dropping it keeps the Ref at the last real generation the member held, so a
+      // fallen-out owner stays gated by that generation - which the coordinator has since superseded, so it fences.
       private def publish(meta: ConsumerGroupMetadata): F[Unit] =
         groupMetadataRef.set(meta.some).whenA(meta.generationId >= 0)
 

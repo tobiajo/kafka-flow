@@ -145,10 +145,9 @@ object KafkaPersistenceModule {
     * commit the input offset. A stale consumer generation is rejected by the broker (KIP-447), aborting the
     * transaction, so a stale owner can neither advance offsets nor overwrite a newer snapshot. Recovery reads with
     * `read_committed`, and unlike `caching` the identity partition mapping is always used; output stays at-least-once.
-    * Works under whichever protocol the driving consumer uses — both the classic and the consumer group protocols
-    * (`group.protocol=classic|consumer`, the consumer protocol being KIP-848); use brokers 4.3.0+ for the consumer
-    * protocol. See the "Protecting against stale snapshot writes" persistence docs for guarantees, limitations, costs
-    * and rollout, and `docs/kafka-single-writer-design.md` for the mechanism.
+    * See the "Protecting against stale snapshot writes" persistence docs for guarantees, limitations, costs and
+    * rollout (including consumer rebalance protocols and broker version floor), and
+    * `docs/kafka-single-writer-design.md` for the mechanism.
     *
     * The `assignment` must describe the input partition of the SAME consumer that drives this flow (its `groupMetadata`
     * generation is what fences a stale owner); `assignedAt` seeds the offset-to-commit so even the first write is
