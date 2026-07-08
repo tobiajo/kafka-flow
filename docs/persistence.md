@@ -122,8 +122,8 @@ Limitations:
 - A batch shares its transaction's outcome: if the transaction fails, every write in it fails.
 - An old owner can be fenced while flushing on revoke; its last state delta is then neither persisted
   nor committed, so the new owner replays those events — noise, not loss. Under the classic
-  **cooperative** assignor this is every revocation, not an edge case: the revoke-time flush is always
-  fenced, so `flushOnRevoke` does not shrink the replay window there (see the design doc for why).
+  **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
+  `flushOnRevoke` does not shrink the replay window there (see the design doc for why).
 - After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
   `transaction.timeout.ms`; until then a `read_committed` reader — recovery of that partition, or a
   downstream consumer of your output — can stall behind its last-stable-offset.
