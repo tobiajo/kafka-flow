@@ -42,8 +42,7 @@ In the default (non-transactional) mode the input offsets are committed through 
 transaction** via `sendOffsetsToTransaction(offsets, consumerGroupMetadata)`
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics)):
 the metadata carries the consumer's **generation**, so the group coordinator validates it and rejects a
-stale one (`ILLEGAL_GENERATION`, surfaced to the client as `CommitFailedException`). (KIP-447 targets
-exactly-once; this design borrows only its generation fence, not its transactional output.)
+stale one (`ILLEGAL_GENERATION`, surfaced to the client as `CommitFailedException`).
 Since that commit and the snapshot writes share a transaction, the rejection aborts the writes too.
 The generation gates both, so a stale owner can neither advance offsets nor overwrite a newer snapshot.
 
