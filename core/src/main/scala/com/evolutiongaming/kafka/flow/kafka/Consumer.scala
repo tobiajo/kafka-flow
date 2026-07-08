@@ -24,8 +24,9 @@ trait Consumer[F[_]] {
 
   def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]): F[Unit]
 
-  /** Last consumer group metadata observed on a rebalance, used to fence a stale owner by generation when binding
-    * offset commits into a producer transaction (KIP-447). `None` until the consumer has joined a group.
+  /** Last consumer group metadata observed from the consumer (refreshed after each poll), used to fence a stale owner
+    * by generation when binding offset commits into a producer transaction (KIP-447). `None` until the consumer has
+    * joined a group.
     */
   def groupMetadata: F[Option[ConsumerGroupMetadata]]
 
@@ -37,37 +38,37 @@ object Consumer {
   def of[F[_]: Sync](
     consumer: KafkaConsumer[F, String, ByteVector]
   ): F[Consumer[F]] =
-    // capture the group metadata on assignment (on the poll thread, where it is safe to read) into a Ref so the
-    // transactional snapshot writer can read the current generation off-thread; None until the first assignment
-    Ref[F].of(none[ConsumerGroupMetadata]).map { groupMetadataRef =>
-      new Consumer[F] {
-        def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[F]): F[Unit] = {
-          val capturing = new RebalanceListener1WithConsumer[F] {
-            import com.evolutiongaming.skafka.consumer.RebalanceCallback.syntax.*
-            // capture before the listener: assignment establishes the generation the listener (recovery, then every
-            // later flush) is gated by, and on a freshly assigned consumer groupMetadata cannot fail
-            private def capture: RebalanceCallback[F, Unit] =
-              this.consumer.groupMetadata.flatMap(meta => groupMetadataRef.set(meta.some).lift)
-            def onPartitionsAssigned(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[F, Unit] =
-              capture *> listener.onPartitionsAssigned(partitions)
-            // revoke/lost just delegate: the generation is unchanged until the next assignment (which re-captures), and
-            // a capture failure here could suppress the wrapped listener's flush/commit-on-revoke
-            def onPartitionsRevoked(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[F, Unit] =
-              listener.onPartitionsRevoked(partitions)
-            def onPartitionsLost(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[F, Unit] =
-              listener.onPartitionsLost(partitions)
-          }
-          consumer.subscribe(topics, capturing)
-        }
+    for {
+      groupMetadataRef <- Ref[F].of(none[ConsumerGroupMetadata])
+    } yield new Consumer[F] {
+      def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[F]): F[Unit] =
+        consumer.subscribe(topics, listener)
 
-        def poll(timeout: FiniteDuration): F[ConsumerRecords[String, ByteVector]] =
-          consumer.poll(timeout)
+      def poll(timeout: FiniteDuration): F[ConsumerRecords[String, ByteVector]] =
+        consumer.poll(timeout) <* refresh
 
-        def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]): F[Unit] =
-          consumer.commit(offsets)
+      // read the generation after every poll, not from a rebalance callback: a bump that assigns this member
+      // nothing new fires no callback at all under the consumer protocol (KIP-848) and an empty one the typed
+      // listener drops under classic (https://github.com/evolution-gaming/skafka/issues/581), so only a read
+      // tracks it. The join round may span polls (KIP-266: poll(Duration) does not block on it), so the read
+      // converges on the poll after the round completes; the interim lag only self-fences. Revoked partitions
+      // were torn down inside the poll under the pre-rebalance generation, so every flow still alive is owned
+      // in the one just read.
+      private def refresh: F[Unit] =
+        consumer.groupMetadata.flatMap(publish)
 
-        def groupMetadata: F[Option[ConsumerGroupMetadata]] = groupMetadataRef.get
-      }
+      // never publish an unknown (negative) generation: paired with an empty member id it is the coordinator's
+      // pre-KIP-447 compatibility input, for which generation validation is SKIPPED - a commit carrying it would
+      // land unfenced. The client reports unknown only before the first join; after falling out of the group it
+      // keeps the last joined generation, so a fallen-out owner stays gated by the generation it held.
+      private def publish(meta: ConsumerGroupMetadata): F[Unit] =
+        groupMetadataRef.set(meta.some).whenA(meta.generationId >= 0)
+
+      def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]): F[Unit] =
+        consumer.commit(offsets)
+
+      def groupMetadata: F[Option[ConsumerGroupMetadata]] =
+        groupMetadataRef.get
     }
 
   /** Does not call Kafka, returns specified records on every poll */

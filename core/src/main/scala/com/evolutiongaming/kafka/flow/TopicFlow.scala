@@ -116,6 +116,9 @@ object TopicFlow {
         val topicPartitions = partitions map (TopicPartition(topic, _))
         val removeOffsets   = pendingCommits.remove(topicPartitions)
 
+        // `cache.remove(_).flatten` awaits each flow's teardown before returning; this runs in the
+        // revoke callback, before the next poll, so no flow survives for a partition the consumer no
+        // longer owns. Pinned by TopicFlowSpec's "remove awaits the flow teardown" test.
         removePartitions *> removeOffsets *> {
           Log[F].info(s"removed offsets without commit for: $topicPartitions")
         }

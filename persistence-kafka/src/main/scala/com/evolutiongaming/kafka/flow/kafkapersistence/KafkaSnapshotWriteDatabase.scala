@@ -168,8 +168,8 @@ object KafkaSnapshotWriteDatabase {
           case Some(meta) =>
             producer.sendOffsetsToTransaction(NonEmptyMap.of(inputTopicPartition -> OffsetAndMetadata(offset)), meta)
           case None =>
-            // invariant: the consumer joins (capturing metadata) before any flush, so None is unreachable; fail loud
-            // rather than commit ungated
+            // invariant: the consumer joins (a poll refreshes the metadata) before any flush, so None is unreachable;
+            // fail loud rather than commit ungated
             new IllegalStateException(
               s"cannot bind input offset $offset: the driving consumer has not joined a group " +
                 "(group metadata is None); transactional snapshot mode requires the flow's own consumer"
