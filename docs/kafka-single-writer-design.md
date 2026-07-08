@@ -39,13 +39,11 @@ sequenceDiagram
 In the default (non-transactional) mode the input offsets are committed through the **Kafka consumer**
 (the ordinary consumer-group offset commit). In this mode they are committed through the snapshot
 **producer** instead, with the consumer-side commit disabled — the offset moves **into the producer's
-transaction** via `sendOffsetsToTransaction(offsets, consumerGroupMetadata)`. This is the overload
-[KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics)
-added: it carries the consumer's **generation** into the commit, so the group coordinator can validate
-that generation and reject a stale one (`ILLEGAL_GENERATION`, surfaced to the client as
-`CommitFailedException`) — the older group-id-only call carried no generation, so the offset commit
-could not be generation-fenced. (KIP-447 targets exactly-once; this design borrows only its generation
-fence, not its transactional output.)
+transaction** via `sendOffsetsToTransaction(offsets, consumerGroupMetadata)`
+([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics)):
+the metadata carries the consumer's **generation**, so the group coordinator validates it and rejects a
+stale one (`ILLEGAL_GENERATION`, surfaced to the client as `CommitFailedException`). (KIP-447 targets
+exactly-once; this design borrows only its generation fence, not its transactional output.)
 Since that commit and the snapshot writes share a transaction, the rejection aborts the writes too.
 The generation gates both, so a stale owner can neither advance offsets nor overwrite a newer snapshot.
 
