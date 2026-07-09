@@ -157,7 +157,8 @@ classic protocol's **cooperative** assignor it fires an `onPartitionsAssigned` w
 the typed listener drops
 ([skafka#581](https://github.com/evolution-gaming/skafka/issues/581)); only the classic **eager** assignor
 re-delivers the full assignment a callback could see — and relying on that would not port to the other
-two. The post-poll read observes it under all three.
+two. The post-poll read observes it under all three: classic eager, classic cooperative, and the
+consumer protocol.
 
 Under the **classic** protocol that read is sufficient on its own: generation *advances* land in the
 group metadata only inside `poll` (a background fence or leave does not touch it — the client keeps
@@ -179,10 +180,12 @@ residual fence is not absorbed and crashes the still-valid owner: safe, but not 
 The classic protocol is unaffected: KIP-1251 changes the consumer-protocol coordinator only, and the
 classic exact-generation check needs no floor.
 
-The revoke-time flush is a separate case, accepted from 4.0: the coordinator keeps the member on its
-epoch until it acknowledges the revocation, and the flush runs before that acknowledgement — so it lands.
-Under the classic **cooperative** assignor there is no such guarantee: the member is already on the new
-generation by revoke time, so the flush — which commits the generation from the prior poll — is fenced.
+The revoke-time flush is a separate case, and the one place the three differ in outcome. Classic
+**eager** revokes before the member rejoins, so the flush commits under the still-valid generation and
+lands. The **consumer** protocol reaches the same outcome differently: the coordinator keeps the member
+on its epoch until it acknowledges the revocation, and the flush runs before that acknowledgement. Only
+classic **cooperative** fences it: the member is already on the new generation by revoke time, so the
+flush — carrying the generation from the prior poll — is rejected (safe; the new owner replays).
 
 ## Write path: group-committed transactions
 
