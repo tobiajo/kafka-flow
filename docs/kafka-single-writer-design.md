@@ -110,17 +110,6 @@ from the partition assignment — not configured by hand — so they always matc
 the flow. A fence surfaces as `CommitFailedException` on the failing snapshot write (or offset-only
 commit).
 
-Refreshing after every poll — rather than tracking the generation only at partition assignment — fixes a
-routine failure: under a cooperative assignor a co-tenant joins the
-group and this member keeps every partition it had, so the generation advances with no change to this
-member's assignment. Track it only at partition assignment and that bump is missed — the tracked value
-lags, and the next flush of a **retained** partition is fenced even though the member still owns it. The
-cost is a livelock, not a one-off: the fence tears the flow down, recovery re-reads the same snapshot,
-and with no assignment to re-observe the generation the re-flush fences again. It stays in the fail-safe
-direction throughout — a fenced commit writes nothing, so this is a liveness cost, never corruption. The
-refresh removes it by following every generation bump, even one with no assignment change (why a *read*,
-not a callback — see Consumer rebalance protocols, below).
-
 One generation value is never trusted: the *unknown* one — a negative id paired with an empty member
 id — which the client reports both before it first joins a group and again after it leaves or is fenced
 (it resets to the unknown sentinel on `ILLEGAL_GENERATION` / `UNKNOWN_MEMBER_ID` / `FENCED_INSTANCE_ID`).
@@ -167,9 +156,10 @@ other two.) A post-poll read observes the bump either way.
 
 Under the **classic** protocol that read is sufficient on its own: generation *advances* happen only
 inside `poll` (the heartbeat thread can only *reset* the live generation to the unknown sentinel, which
-the guard drops), so the post-poll read observes each advance before the flush that follows and the
-generation reconverges every cycle — the missed-bump livelock cannot form, on any broker version. Under
-the **consumer** protocol the epoch also advances on the background thread *between* polls, so even a
+the guard drops), so the post-poll read observes each advance before the flush that follows. Without it a
+missed bump would spuriously fence a **retained** partition and keep re-fencing it after each recovery —
+a livelock the read forecloses, on any broker version. Under the **consumer** protocol the epoch also
+advances on the background thread *between* polls, so even a
 post-poll read can be stale by the time the commit reaches the broker; the read narrows that window but
 cannot fully close it, so a spurious fence stays possible — a liveness cost, never a safety one (a lagging
 token only fences).
