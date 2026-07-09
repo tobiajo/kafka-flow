@@ -132,7 +132,7 @@ Limitations:
   partition); a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols
   (`group.protocol=classic|consumer`). With `consumer`, use **brokers 4.3.0+** — below that a still-valid
-  owner can be spuriously fenced during a rebalance and crash-loop on the restart (safe, never corruption,
+  owner can be spuriously fenced during a rebalance and crash (safe, never corruption,
   but not stable). See [Consumer rebalance protocols](kafka-single-writer-design.md#consumer-rebalance-protocols)
   in the design doc.
 

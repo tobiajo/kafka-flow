@@ -109,11 +109,10 @@ the flow. A fence surfaces as `CommitFailedException` on the failing snapshot wr
 commit).
 
 A generation captured once at assignment would miss a routine case: a rebalance can advance the
-generation while leaving this member's partitions unchanged. The capture would then lag, and the next
-flush of a **retained** partition would be fenced though the member still owns it — re-fencing after
-every recovery (nothing re-triggers the capture), a livelock rather than a one-off. That is a liveness
-cost, never corruption (a fenced commit writes nothing). Refreshing after every poll avoids it: a
-post-poll read follows the silent bump a rebalance callback does not.
+generation while leaving this member's partitions unchanged. The capture would go stale, and the
+retained partition's next transactional commit would be spuriously fenced though the member still owns
+it — crashing a still-valid owner: safe (a fenced commit writes nothing), but not stable. Refreshing
+after every poll avoids it: a post-poll read follows the silent bump a rebalance callback does not.
 
 One generation value is never trusted: the *unknown* one — a negative id with an empty member id — which
 the client reports before its first join and again whenever it leaves or is fenced. That all-sentinel
@@ -158,8 +157,8 @@ two. The post-poll read observes it under all three.
 
 Under the **classic** protocol that read is sufficient on its own: generation *advances* happen only
 inside `poll` (the heartbeat thread can only *reset* the live generation to the unknown sentinel, which
-the guard drops), so the post-poll read observes each advance before the flush that follows and the
-generation reconverges every cycle — the missed-bump livelock cannot form, on any broker version. Under
+the guard drops), so the post-poll read observes each advance before the flush that follows — a silent bump cannot
+spuriously fence a retained partition, on any broker version. Under
 the **consumer** protocol the epoch also advances on the background thread *between* polls, so even a
 post-poll read can be stale by the time the commit reaches the broker; the read narrows that window but
 cannot fully close it, so a spurious fence stays possible — a liveness cost, never a safety one (a lagging
@@ -170,8 +169,8 @@ That residual fence is **consumer-protocol only**, and it is what
 a broker-side coordinator change in Kafka 4.3.0, absorbs: it relaxes the offset-commit epoch check for a
 still-owned partition, so a retained partition's lagging commit is accepted rather than rejected. This is
 why the consumer protocol carries a **broker** version floor the classic protocol does not — below 4.3.0 the
-residual fence is not absorbed and crashes the still-valid owner (a restart, whose reassignment is itself
-another rebalance): safe, but not stable — so brokers 4.3.0+ are recommended for `group.protocol=consumer`.
+residual fence is not absorbed and crashes the still-valid owner: safe, but not stable — so brokers
+4.3.0+ are recommended for `group.protocol=consumer`.
 The classic protocol is unaffected: KIP-1251 changes the consumer-protocol coordinator only, and the
 classic exact-generation check needs no floor.
 
