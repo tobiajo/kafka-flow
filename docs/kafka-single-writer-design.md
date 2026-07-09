@@ -120,7 +120,7 @@ negative generation is treated as pre-KIP-447 input, for which generation valida
 would land unfenced. (The current coordinator keeps the skip for the newer consumer protocol too,
 narrowed to the unknown `−1` — KAFKA-18060 — so the guard is not legacy-only, and every skipped shape
 stays inside the guarded range.) In practice the only negative the client reports is the unknown pre-join
-value: after falling out of the group it does not reset to the sentinel but keeps the last generation it
+value: after falling out of the group it does not reset back to unknown but keeps the last generation it
 joined, so a fallen-out owner stays fenced by its own stale token. Dropping the pre-join value leaves the
 tracked metadata empty until the first join completes, and a flush in that window — unreachable on the
 flow path — fails loudly rather than committing ungated.
