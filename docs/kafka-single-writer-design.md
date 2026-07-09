@@ -114,12 +114,15 @@ retained partition's next transactional commit would be spuriously fenced though
 it — crashing a still-valid owner: safe (a fenced commit writes nothing), but not stable. Refreshing
 after every poll avoids it: a post-poll read follows the silent bump a rebalance callback does not.
 
-One generation value is never trusted: the *unknown* one — a negative id with an empty member id — which
-the client reports before its first join and again whenever it leaves or is fenced. That all-sentinel
-metadata is the coordinator's pre-KIP-447 compatibility input, for which generation validation is
-**skipped** — a commit carrying it would land unfenced. The `generationId >= 0` guard drops it, so the
-tracked value stays at the last real generation the member held and a fallen-out owner stays fenced. The
-skip was carried into the current group coordinator (KAFKA-18060), so the guard is not legacy-only.
+The `generationId >= 0` guard rejects any negative id, not one specific value. A negative id is never a
+real generation the member joined — it is always a sentinel: the *unknown* value the client reports before
+its first join, or a leave/fence marker. That first case is what makes the guard necessary: the unknown
+value with an empty member id is the coordinator's pre-KIP-447 compatibility input, for which generation
+validation is **skipped**, so a commit carrying it would land unfenced. Rejecting it keeps the tracked
+value at the last real generation the member joined. The guard matters only pre-join: after a leave or
+fence the client does not reset to the sentinel — it keeps the last generation it joined, so a fallen-out
+owner stays fenced by its own stale token. The skip survives in the current group coordinator
+(KAFKA-18060), so the guard is not legacy-only.
 
 ### No epoch fencing
 
