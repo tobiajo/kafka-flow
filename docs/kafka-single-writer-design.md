@@ -82,9 +82,7 @@ Key points:
   from the snapshot-flush interval `persistEvery`) or on revoke; a snapshot write never advances it, it
   just re-commits the current value to stay gated. That advance is committed in a transaction — batching
   in any snapshot writes queued at that moment, or committing the offset alone (an *offset-only*
-  transaction) when there are none. The revoke-time commit is best-effort — whether it lands or is fenced
-  depends on the rebalance protocol (see Consumer rebalance protocols); a fenced one is safe, the new
-  owner just replays.
+  transaction) when there are none.
 - The offset-to-commit is **seeded with the assigned offset**, so even the first snapshot flush (before
   the first commit tick) carries an offset and is gated.
 - Recovery is forced to `read_committed` so a fenced writer's aborted records are invisible.
@@ -111,15 +109,13 @@ the flow. A fence surfaces as `CommitFailedException` on the failing snapshot wr
 commit).
 
 Refreshing after every poll — rather than tracking the generation only at partition assignment — fixes a
-routine failure: under a cooperative assignor a co-tenant joins the
-group and this member keeps every partition it had, so the generation advances with no change to this
-member's assignment. Track it only at partition assignment and that bump is missed — the tracked value
-lags, and the next flush of a **retained** partition is fenced even though the member still owns it. The
-cost is a livelock, not a one-off: the fence tears the flow down, recovery re-reads the same snapshot,
-and with no assignment to re-observe the generation the re-flush fences again. It stays in the fail-safe
-direction throughout — a fenced commit writes nothing, so this is a liveness cost, never corruption. The
-refresh removes it by following every generation bump, even one with no assignment change (why a *read*,
-not a callback — see Consumer rebalance protocols, below).
+routine failure: a rebalance can advance the generation while leaving this member's partitions unchanged
+(a co-tenant joins the group; this member keeps everything it had). Captured only at assignment, that
+silent bump is missed — the tracked value lags, and the next flush of a **retained** partition is fenced
+even though the member still owns it. The cost is a livelock, not a one-off: the fence tears the flow
+down, recovery re-reads the same snapshot, and with no fresh assignment to re-observe the generation the
+re-flush fences again — a liveness cost, never corruption (a fenced commit writes nothing). A post-poll
+read follows every bump, silent ones included, which a rebalance callback cannot.
 
 One generation value is never trusted: the *unknown* one — a negative id paired with an empty member
 id — which the client reports both before it first joins a group and again after it leaves or is fenced
@@ -152,18 +148,17 @@ The per-member fencing token is the **generation** under the classic protocol an
 under the consumer protocol
 ([KIP-848](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol),
 GA in Kafka 4.0, selected by `group.protocol=consumer`); they play the same role, and below *generation*
-stands for both. (KIP-1251, below, adds a separate per-partition *assignment epoch*.) The
-fence works under both protocols because it never depends on a rebalance callback: the
-generation is tracked by the post-poll read (above) and the broker-side fence is protocol-agnostic.
+stands for both. (KIP-1251, below, adds a separate per-partition *assignment epoch*.) The fence works
+under both because it never depends on a rebalance callback — the generation is tracked by the post-poll
+read (above), and the broker-side fence is protocol-agnostic.
 
-This is *why* the generation is **read** rather than captured in a callback. The bump that matters — one
-that advances the generation while leaving this member's partitions unchanged — reaches no callback the
-typed listener can act on: under the consumer protocol it advances on the background heartbeat thread and
-fires no rebalance callback at all; under the classic protocol's **cooperative** assignor it fires an
-`onPartitionsAssigned` with an empty delta that the typed listener drops
-([skafka#581](https://github.com/evolution-gaming/skafka/issues/581)). (Only the classic **eager**
-assignor re-delivers the full assignment a callback could see — but relying on that would not port to the
-other two.) A post-poll read observes the bump either way.
+Why a callback would miss the silent bump (above) is protocol-specific: under the consumer protocol the
+epoch advances on the background heartbeat thread and fires no rebalance callback at all; under the
+classic protocol's **cooperative** assignor it fires an `onPartitionsAssigned` with an empty delta that
+the typed listener drops
+([skafka#581](https://github.com/evolution-gaming/skafka/issues/581)); only the classic **eager** assignor
+re-delivers the full assignment a callback could see — and relying on that would not port to the other
+two. The post-poll read observes it under all three.
 
 Under the **classic** protocol that read is sufficient on its own: generation *advances* happen only
 inside `poll` (the heartbeat thread can only *reset* the live generation to the unknown sentinel, which
