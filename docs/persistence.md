@@ -104,19 +104,13 @@ never recovered.
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
   so a burst of N dirty keys is ≈ N / `maxWritesPerTransaction` transactions (default 256) — at the
-  default cap the overhead is small (see the design doc's Measurements). The broker-side footprint — a
-  producer with its connections and transaction-coordinator state per assigned partition — scales with
-  the partition count, not throughput. The `transactional.id` is regenerated each assignment, so under
-  heavy partition churn monitor and tune `transactional.id.expiration.ms` (the coordinator holds each id
-  until then). See the design doc's Cost at scale.
+  default cap the overhead is small (see the design doc's Measurements). Each partition also holds its
+  own producer and transaction-coordinator state on the brokers, so the footprint scales with the
+  partition count; under heavy reassignment, tune `transactional.id.expiration.ms`.
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
   it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
   higher timeout lengthens the post-crash stall (below).
-- **Tuning for the poll loop** — the flush runs on the consumer poll loop and awaits each transaction,
-  so a large post-assignment wave delays the next `poll`; keep it well under `max.poll.interval.ms`
-  (lower `maxWritesPerTransaction` or raise the interval), or the stalled poll is read as a dead consumer
-  and triggers a rebalance. Small at the default cap (see the design doc).
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).

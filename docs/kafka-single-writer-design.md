@@ -204,13 +204,6 @@ A snapshot write does not complete until its transaction commits, and the flush 
 the source is back-pressured: outstanding writes are bounded by the flush concurrency (one per live key
 in the wave), not by internal buffering.
 
-The flush runs on the poll loop — record processing and flushing happen between `consumer.poll` calls on
-the same fiber, so awaiting each transaction delays the next poll. That is the cost paired with the
-synchronous-commit benefit: a large post-assignment wave stalls the loop, and a stall past
-`max.poll.interval.ms` is read as a dead consumer and triggers a rebalance. It bites only with a very
-large wave or a very low cap — ~300 ms for 2000 keys at the default cap (far under the interval),
-multi-second at `maxWritesPerTransaction = 1` (Measurements below).
-
 ## Implementation
 
 Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current code:
@@ -268,24 +261,6 @@ an order of magnitude slower — multi-second poll-path stalls at realistic key 
 
 Reproduce: `KAFKA_FLOW_PERF=1 sbt "persistence-kafka-it-tests/testOnly *TransactionalWriteThroughputSpec"`
 (the suite is excluded from the default run).
-
-## Cost at scale
-
-Throughput scales with write volume (above); the broker-side footprint scales with the **partition
-count** — the adoption trade-off for a deployment with many partitions.
-
-- **A transactional producer per assigned partition**, built per assignment in `KafkaPersistenceModule`.
-  Its connections, client-side memory and coordinator-side transaction state grow with the number of
-  assigned partitions, not with throughput — within a partition one producer serves any write rate.
-- **`transactional.id` churn.** The id is regenerated every assignment (`{prefix}-{partition}-{uuid8}`,
-  a fresh UUID per allocation), so partition churn leaves a trail of ids lingering on the coordinator
-  until `transactional.id.expiration.ms` — monitor and tune it under heavy reassignment, not just accept
-  it.
-- **A per-partition transaction floor.** Offset commits ride the `commitOffsetsInterval` tick and every
-  commit is its own transaction, so under sustained input (the committable offset advancing each tick)
-  there is a floor of ~one transaction per partition per interval independent of write volume — an
-  *offset-only* transaction when no snapshot write is pending. A fully idle partition does not advance
-  its offset, schedules no commit, and costs nothing.
 
 ## Testing
 
