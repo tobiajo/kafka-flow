@@ -114,15 +114,16 @@ retained partition's next transactional commit would be spuriously fenced though
 it — crashing a still-valid owner: safe (a fenced commit writes nothing), but not stable. Refreshing
 after every poll avoids it: a post-poll read follows the silent bump a rebalance callback does not.
 
-The `generationId >= 0` guard rejects any negative id, not one specific value. A negative id is never a
-real generation the member joined — it is always a sentinel: the *unknown* value the client reports before
-its first join, or a leave/fence marker. That first case is what makes the guard necessary: the unknown
-value with an empty member id is the coordinator's pre-KIP-447 compatibility input, for which generation
-validation is **skipped**, so a commit carrying it would land unfenced. Rejecting it keeps the tracked
-value at the last real generation the member joined. The guard matters only pre-join: after a leave or
-fence the client does not reset to the sentinel — it keeps the last generation it joined, so a fallen-out
-owner stays fenced by its own stale token. The skip survives in the current group coordinator
-(KAFKA-18060), so the guard is not legacy-only.
+The `generationId >= 0` guard rejects any negative id, not one specific value — matching the
+coordinator's gate, which is also a range: a transactional commit with an empty member id and *any*
+negative generation is treated as pre-KIP-447 input, for which generation validation is **skipped** — it
+would land unfenced. (The current coordinator keeps the skip for the newer consumer protocol too,
+narrowed to the unknown `−1` — KAFKA-18060 — so the guard is not legacy-only, and every skipped shape
+stays inside the guarded range.) In practice the only negative the client reports is the unknown pre-join
+value: after falling out of the group it does not reset to the sentinel but keeps the last generation it
+joined, so a fallen-out owner stays fenced by its own stale token. Dropping the pre-join value leaves the
+tracked metadata empty until the first join completes, and a flush in that window — unreachable on the
+flow path — fails loudly rather than committing ungated.
 
 ### No epoch fencing
 
@@ -158,10 +159,11 @@ the typed listener drops
 re-delivers the full assignment a callback could see — and relying on that would not port to the other
 two. The post-poll read observes it under all three.
 
-Under the **classic** protocol that read is sufficient on its own: generation *advances* happen only
-inside `poll` (the heartbeat thread can only *reset* the live generation to the unknown sentinel, which
-the guard drops), so the post-poll read observes each advance before the flush that follows — a silent bump cannot
-spuriously fence a retained partition, on any broker version. Under
+Under the **classic** protocol that read is sufficient on its own: generation *advances* land in the
+group metadata only inside `poll` (a background fence or leave does not touch it — the client keeps
+reporting the last joined generation, which can only self-fence), so the post-poll read observes each
+advance before the flush that follows — a silent bump cannot spuriously fence a retained partition, on
+any broker version. Under
 the **consumer** protocol the epoch also advances on the background thread *between* polls, so even a
 post-poll read can be stale by the time the commit reaches the broker; the read narrows that window but
 cannot fully close it, so a spurious fence stays possible — a liveness cost, never a safety one (a lagging

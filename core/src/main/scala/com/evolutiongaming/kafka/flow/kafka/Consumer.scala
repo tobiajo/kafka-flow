@@ -59,10 +59,8 @@ object Consumer {
 
       // never publish an unknown (negative) generation: paired with an empty member id it is the coordinator's
       // pre-KIP-447 compatibility input, for which generation validation is SKIPPED - a commit carrying it would
-      // land unfenced. The client reports the unknown sentinel both before its first join and again after it
-      // leaves or is fenced (it resets to NO_GENERATION on ILLEGAL_GENERATION / UNKNOWN_MEMBER_ID /
-      // FENCED_INSTANCE_ID); dropping it keeps the Ref at the last real generation the member held, so a
-      // fallen-out owner stays gated by that generation - which the coordinator has since superseded, so it fences.
+      // land unfenced. The client reports unknown only before the first join; after falling out of the group it
+      // keeps the last joined generation, so a fallen-out owner stays gated by the generation it held.
       private def publish(meta: ConsumerGroupMetadata): F[Unit] =
         groupMetadataRef.set(meta.some).whenA(meta.generationId >= 0)
 
