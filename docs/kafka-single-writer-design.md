@@ -108,23 +108,19 @@ from the partition assignment — not configured by hand — so they always matc
 the flow. A fence surfaces as `CommitFailedException` on the failing snapshot write (or offset-only
 commit).
 
-Refreshing after every poll — rather than tracking the generation only at partition assignment — fixes a
-routine failure: a rebalance can advance the generation while leaving this member's partitions unchanged
-(a co-tenant joins the group; this member keeps everything it had). Captured only at assignment, that
-silent bump is missed — the tracked value lags, and the next flush of a **retained** partition is fenced
-even though the member still owns it. The cost is a livelock, not a one-off: the fence tears the flow
-down, recovery re-reads the same snapshot, and with no fresh assignment to re-observe the generation the
-re-flush fences again — a liveness cost, never corruption (a fenced commit writes nothing). A post-poll
-read follows every bump, silent ones included, which a rebalance callback cannot.
+A generation captured once at assignment would miss a routine case: a rebalance can advance the
+generation while leaving this member's partitions unchanged. The capture would then lag, and the next
+flush of a **retained** partition would be fenced though the member still owns it — re-fencing after
+every recovery (nothing re-triggers the capture), a livelock rather than a one-off. That is a liveness
+cost, never corruption (a fenced commit writes nothing). Refreshing after every poll avoids it: a
+post-poll read follows the silent bump a rebalance callback does not.
 
-One generation value is never trusted: the *unknown* one — a negative id paired with an empty member
-id — which the client reports both before it first joins a group and again after it leaves or is fenced
-(it resets to the unknown sentinel on `ILLEGAL_GENERATION` / `UNKNOWN_MEMBER_ID` / `FENCED_INSTANCE_ID`).
-That all-sentinel metadata is the coordinator's pre-KIP-447 compatibility input, for which generation
-validation is **skipped**, so a commit carrying it would land unfenced. The `generationId >= 0` guard
-drops it in every case, so the tracked value stays at the last real generation the member held; a
-fallen-out owner then commits under that superseded generation and is fenced. The skip was restored in
-the KIP-848 coordinator (KAFKA-18060), so the guard is needed under both protocols.
+One generation value is never trusted: the *unknown* one — a negative id with an empty member id — which
+the client reports before its first join and again whenever it leaves or is fenced. That all-sentinel
+metadata is the coordinator's pre-KIP-447 compatibility input, for which generation validation is
+**skipped** — a commit carrying it would land unfenced. The `generationId >= 0` guard drops it, so the
+tracked value stays at the last real generation the member held and a fallen-out owner stays fenced. The
+skip was carried into the current group coordinator (KAFKA-18060), so the guard is not legacy-only.
 
 ### No epoch fencing
 
