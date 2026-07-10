@@ -23,6 +23,9 @@ object KafkaPartitionPersistence {
 
   private case class MissingOffsetError(topicPartition: TopicPartition) extends NoStackTrace
 
+  // ~5s of pinned 10ms polls between "waiting" log lines
+  private val logEveryIterations = 500L
+
   private[kafkapersistence] def readPartition[F[_]: Monad: Log](
     consumer: SkafkaConsumer[F, String, ByteVector],
     snapshotPartition: TopicPartition,
@@ -30,23 +33,29 @@ object KafkaPartitionPersistence {
   ): F[BytesByKey] =
     Log[F].info(s"Snapshot topic read started up to offset $targetOffset") *>
       FlatMap[F]
-        .tailRecM[BytesByKey, BytesByKey](BytesByKey.empty) { acc =>
-          consumer
-            .position(snapshotPartition)
-            .flatMap {
-              case offset if offset >= targetOffset =>
-                acc.asRight[BytesByKey].pure[F]
-              case _ =>
-                consumer
-                  .poll(10.millis) // TODO: make poll timeout configurable
-                  .map(
-                    _.values
-                      .values
-                      .flatMap(_.toIterable)
-                      .foldLeft(acc)(processRecord)
-                      .asLeft
-                  )
-            }
+        .tailRecM[(BytesByKey, Long), BytesByKey]((BytesByKey.empty, 0L)) {
+          case (acc, iteration) =>
+            consumer
+              .position(snapshotPartition)
+              .flatMap {
+                case offset if offset >= targetOffset =>
+                  acc.asRight[(BytesByKey, Long)].pure[F]
+                case offset =>
+                  // an open transaction below the target parks the position at the last-stable-offset until
+                  // the broker resolves it; log while waiting so a pinned read is distinguishable from a hang
+                  Log[F]
+                    .info(
+                      s"Snapshot topic read waiting at offset $offset for target $targetOffset " +
+                        "(an open transaction pins the read until the broker resolves it)"
+                    )
+                    .whenA(iteration > 0 && iteration % logEveryIterations == 0) *>
+                    consumer
+                      .poll(10.millis) // TODO: make poll timeout configurable
+                      .map { records =>
+                        val read = records.values.values.flatMap(_.toIterable).foldLeft(acc)(processRecord)
+                        (read, iteration + 1).asLeft
+                      }
+              }
         }
 
   private[kafkapersistence] def processRecord(
@@ -67,48 +76,54 @@ object KafkaPartitionPersistence {
     val snapshotsPartition         = TopicPartition(topic = snapshotTopic, partition = partition)
     val snapshotPartitionSingleton = data.NonEmptySet.of(snapshotsPartition)
 
-    def suffixed(config: ConsumerConfig, suffix: String): ConsumerConfig =
-      config.copy(
+    def suffixed(suffix: String): ConsumerConfig =
+      consumerConfig.copy(
         autoOffsetReset = Earliest,
-        common          = config.common.copy(clientId = config.common.clientId.map(cid => s"$cid-$suffix"))
+        common = consumerConfig.common.copy(clientId = consumerConfig.common.clientId.map(cid => s"$cid-$suffix"))
       )
 
-    // The read target is the high watermark, taken with read_uncommitted. This consumer's own end offset
-    // under read_committed is the last-stable-offset, which an open transaction (e.g. of a hard-crashed
-    // previous owner, for up to its transaction.timeout.ms) pins BELOW records committed after it - a read
-    // bounded by it completes silently missing those committed snapshots. Bounding by the high watermark
-    // makes the read wait such transactions out instead: the read_committed position cannot pass the
-    // last-stable-offset until the broker resolves them, so the read completes only once everything below
-    // the target is decided. For a read_uncommitted config the two bounds coincide.
-    val highWatermark: F[Offset] =
-      consumerOf
-        .apply[String, ByteVector](
-          suffixed(consumerConfig, s"snapshot-$partition-hw").copy(isolationLevel = IsolationLevel.ReadUncommitted)
-        )
-        .use { consumer =>
-          consumer.endOffsets(snapshotPartitionSingleton).flatMap { endOffsets =>
-            BracketThrowable[F].fromOption(
-              endOffsets.get(snapshotsPartition),
-              MissingOffsetError(snapshotsPartition)
-            )
-          }
-        }
-
-    consumerOf
-      .apply[String, ByteVector](suffixed(consumerConfig, s"snapshot-$partition"))
-      .use { consumer =>
-        for {
-          _            <- consumer.assign(snapshotPartitionSingleton)
-          targetOffset <- highWatermark
-          bytesByKey <- readPartition(
-            consumer,
-            snapshotsPartition,
-            targetOffset
-          )
-          _ <- Log[F].info(
-            s"Snapshot topic $snapshotTopic partition $partition read complete at offset $targetOffset, ${bytesByKey.size} keys read"
-          )
-        } yield bytesByKey
+    def endOffset(consumer: SkafkaConsumer[F, String, ByteVector]): F[Offset] =
+      consumer.endOffsets(snapshotPartitionSingleton).flatMap { endOffsets =>
+        BracketThrowable[F].fromOption(endOffsets.get(snapshotsPartition), MissingOffsetError(snapshotsPartition))
       }
+
+    // The read target must be the high watermark. Under read_committed this consumer's own end offset is
+    // the last-stable-offset, which an open transaction (e.g. of a hard-crashed previous owner, for up to
+    // its transaction.timeout.ms plus the broker's abort-scan interval, default 10s) pins BELOW records
+    // committed after it - a read bounded by it completes silently missing those committed snapshots. So
+    // for a read_committed config the target is captured up front by a short-lived read_uncommitted
+    // consumer, which makes the read wait such transactions out: the read_committed position cannot pass
+    // the last-stable-offset until the broker resolves them, so the read completes only once everything
+    // below the target is decided. Under read_uncommitted the consumer's own end offset already is the
+    // high watermark, so no extra capture is needed.
+    val capturedHighWatermark: F[Option[Offset]] =
+      if (consumerConfig.isolationLevel == IsolationLevel.ReadCommitted)
+        consumerOf
+          .apply[String, ByteVector](
+            suffixed(s"snapshot-$partition-hw").copy(isolationLevel = IsolationLevel.ReadUncommitted)
+          )
+          .use(endOffset)
+          .map(_.some)
+      else
+        none[Offset].pure[F]
+
+    capturedHighWatermark.flatMap { captured =>
+      consumerOf
+        .apply[String, ByteVector](suffixed(s"snapshot-$partition"))
+        .use { consumer =>
+          for {
+            _            <- consumer.assign(snapshotPartitionSingleton)
+            targetOffset <- captured.fold(endOffset(consumer))(_.pure[F])
+            bytesByKey <- readPartition(
+              consumer,
+              snapshotsPartition,
+              targetOffset
+            )
+            _ <- Log[F].info(
+              s"Snapshot topic $snapshotTopic partition $partition read complete at offset $targetOffset, ${bytesByKey.size} keys read"
+            )
+          } yield bytesByKey
+        }
+    }
   }
 }
