@@ -4,7 +4,12 @@ import cats.effect.unsafe.implicits.global
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.LogOf
-import com.evolutiongaming.skafka.consumer.{Consumer as SkafkaConsumer, ConsumerConfig, ConsumerGroupMetadata, ConsumerOf}
+import com.evolutiongaming.skafka.consumer.{
+  Consumer as SkafkaConsumer,
+  ConsumerConfig,
+  ConsumerGroupMetadata,
+  ConsumerOf
+}
 import com.evolutiongaming.skafka.producer.{Producer, ProducerConfig, ProducerOf}
 import com.evolutiongaming.skafka.{CommonConfig, FromBytes, Offset, Partition}
 import munit.FunSuite
