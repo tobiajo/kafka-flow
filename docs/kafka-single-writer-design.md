@@ -139,17 +139,23 @@ flow path — fails loudly rather than committing ungated.
 
 Generation fencing is the sole mechanism; there is deliberately no producer-epoch fencing. Each
 producer gets a unique `transactional.id` (`"{prefix}-{partition}-{uuid8}"`), so old and new owners
-never share one. A *stable* per-partition id would add cross-owner epoch fencing, which is both
-redundant and harmful: with a shared id each `initTransactions` bumps the epoch and fences the
-previous holder, so whichever owner inits *latest* wins — a race unrelated to who actually owns the
-partition. A slow stale owner that inits late therefore wins the epoch: the epoch fence stops nothing
-it should — only the generation fence still catches the stale write — while fencing the true owner. A
-pure availability loss with no safety gain.
+never share one. The alternative — a *stable* per-partition id, the Kafka Streams model — would add
+cross-owner epoch fencing: each `initTransactions` bumps the epoch, fencing the previous holder and
+aborting any transaction it left open. Rejected on three grounds: it catches nothing the generation
+fence does not already catch, so it would be a second fencing mechanism in the safety argument with no
+safety gain; a stable id must be unique per application, topic and partition across everything sharing
+the cluster — a collision means cross-application fencing, where unique ids are collision-proof by
+construction; and its one real operational benefit, aborting a hard-crashed owner's dangling
+transaction at takeover, is a read-side concern here (recovery must bound itself against the
+last-stable-offset pin, below) — a takeover abort can never clear a pinning transaction from any
+*other* producer anyway. There is also a rare corner where the epoch order inverts ownership — a stale
+owner whose `initTransactions` stalls across an immediate follow-up rebalance fences the true owner,
+costing one crash of a valid owner; self-healing, but free to avoid — though the rejection does not
+rest on it.
 
 The cost of unique ids — transaction-coordinator state expiring via `transactional.id.expiration.ms` —
-is accepted. A hard-crashed owner's in-flight transaction is, for the same reason, not fenced on the
-spot (a stable id would abort it through the new owner's `initTransactions`); the coordinator reclaims
-it only after `transaction.timeout.ms`, which bounds how long its open transaction pins the snapshot
+is accepted. A hard-crashed owner's in-flight transaction is thus not aborted at takeover; the
+coordinator reclaims it only after `transaction.timeout.ms`, which bounds how long it pins the snapshot
 topic's last-stable-offset — the horizon `read_committed` readers of that topic (recovery included)
 cannot see past.
 
@@ -301,9 +307,10 @@ last joined generation — including that `0` is admitted, the range check rathe
 
 - **Transactional snapshot read + snapshot write**: fence a stale writer with a compare-and-set on the
   stored offset. Kafka has no conditional produce primitive, so it cannot be atomic.
-- **Producer-epoch fencing (stable `transactional.id`)**: epoch order can diverge from ownership
-  order, so it does not fully close [#732](https://github.com/evolution-gaming/kafka-flow/issues/732)
-  and can false-positive-fence the true owner (above).
+- **Producer-epoch fencing (stable `transactional.id`)**: redundant — it catches nothing the
+  generation fence does not — while adding cross-application id-collision discipline and a rare
+  ownership-inverting init race; its takeover-abort benefit is a read-side concern and would not cover
+  foreign pinning transactions (see No epoch fencing).
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
   reassignment, and safe *dynamic* assignment is the point of this design. (Static *membership*
