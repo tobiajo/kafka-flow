@@ -11,7 +11,6 @@ import com.evolutiongaming.skafka.consumer.{
   ConsumerConfig,
   ConsumerOf,
   ConsumerRecord,
-  IsolationLevel,
   WithSize
 }
 import scodec.bits.ByteVector
@@ -23,10 +22,11 @@ object KafkaPartitionPersistence {
 
   private case class MissingOffsetError(topicPartition: TopicPartition) extends NoStackTrace
 
-  /** The recovery read made no progress for longer than any open transaction may live, so waiting cannot fix it: the
-    * likely cause is a high watermark that regressed below the captured target - log truncation after an unclean leader
-    * election, i.e. the cluster lost acknowledged snapshot records. Failing loudly beats both hanging forever and
-    * silently recovering possibly incomplete state.
+  /** The recovery read made no progress for far longer than any transient hiccup explains, so waiting cannot fix it:
+    * every record below the target is decided and fetchable (the target is the read's own `read_committed` end offset
+    *   - the last stable offset), so the likely cause is a log end that regressed below the captured target - log
+    *     truncation after an unclean leader election, i.e. the cluster lost acknowledged snapshot records. Failing
+    *     loudly beats both hanging forever and silently recovering possibly incomplete state.
     */
   final case class RecoveryReadStalledError(
     topicPartition: TopicPartition,
@@ -34,19 +34,21 @@ object KafkaPartitionPersistence {
     targetOffset: Offset,
   ) extends RuntimeException(
         s"recovery read of $topicPartition made no progress at offset $position, short of target $targetOffset, " +
-          "for longer than transaction.max.timeout.ms allows any transaction to stay open; the high watermark has " +
-          "likely regressed below the captured target (log truncation after an unclean leader election) - failing " +
-          "rather than hanging or silently recovering possibly incomplete state"
+          "far beyond any transient broker hiccup; the log end has likely regressed below the captured target " +
+          "(log truncation after an unclean leader election) - failing rather than hanging or silently recovering " +
+          "possibly incomplete state"
       )
       with NoStackTrace
 
   // each stalled poll takes at least the 10ms poll timeout, so this many consecutive no-progress polls is
-  // at least ~16 minutes - longer than the broker-enforced ceiling on any open transaction
-  // (transaction.max.timeout.ms, default 15 minutes). A read still stalled after that is not waiting on a
-  // transaction. A slow-but-progressing read never comes near this: the count resets on every advance.
+  // at least ~16 minutes. Nothing legitimate holds the read below its target that long: the target is the
+  // last stable offset, so every record below it is decided and fetchable - only a prolonged broker outage
+  // or a truncated log (see RecoveryReadStalledError) looks like this. A slow-but-progressing read never
+  // comes near it: the count resets on every advance.
   private[kafkapersistence] val maxStalledPolls = 96000L
 
-  // ~5s of pinned 10ms polls between "waiting" log lines
+  // ~5s of empty 10ms polls between "no progress" log lines: a single empty poll is normal at this poll
+  // rate, a run of them is worth a line so a stuck recovery is visible long before the tripwire
   private val logEveryStalledPolls = 500L
 
   private[kafkapersistence] def readPartition[F[_]: MonadThrow: Log](
@@ -65,20 +67,14 @@ object KafkaPartitionPersistence {
                   acc.asRight[(BytesByKey, Option[Offset], Long)].pure[F]
                 case offset =>
                   val stalled = if (lastPosition.contains(offset)) stalledPolls + 1 else 0L
-                  // an open transaction below the target parks the position at the last-stable-offset until
-                  // the broker resolves it; log while waiting so a pinned read is distinguishable from a hang
-                  val logWaiting = Log[F]
-                    .info(
-                      s"Snapshot topic read waiting at offset $offset for target $targetOffset " +
-                        "(an open transaction pins the read until the broker resolves it)"
-                    )
+                  val logStalled = Log[F]
+                    .info(s"Snapshot topic read making no progress at offset $offset, target $targetOffset")
                     .whenA(stalled > 0 && stalled % logEveryStalledPolls == 0)
-                  // no transaction may stay open this long: waiting cannot fix it - fail loudly (see the
-                  // error's scaladoc)
+                  // waiting cannot fix a stall this long - fail loudly (see the error's scaladoc)
                   val failStalled = RecoveryReadStalledError(snapshotPartition, offset, targetOffset)
                     .raiseError[F, Unit]
                     .whenA(stalled >= maxStalledPolls)
-                  failStalled *> logWaiting *>
+                  failStalled *> logStalled *>
                     consumer
                       .poll(10.millis) // TODO: make poll timeout configurable
                       .map { records =>
@@ -106,54 +102,42 @@ object KafkaPartitionPersistence {
     val snapshotsPartition         = TopicPartition(topic = snapshotTopic, partition = partition)
     val snapshotPartitionSingleton = data.NonEmptySet.of(snapshotsPartition)
 
-    def suffixed(suffix: String): ConsumerConfig =
-      consumerConfig.copy(
-        autoOffsetReset = Earliest,
-        common = consumerConfig.common.copy(clientId = consumerConfig.common.clientId.map(cid => s"$cid-$suffix"))
+    consumerOf
+      .apply[String, ByteVector](
+        consumerConfig.copy(
+          autoOffsetReset = Earliest,
+          common = consumerConfig
+            .common
+            .copy(clientId = consumerConfig.common.clientId.map(cid => s"$cid-snapshot-$partition"))
+        )
       )
-
-    def endOffset(consumer: SkafkaConsumer[F, String, ByteVector]): F[Offset] =
-      consumer.endOffsets(snapshotPartitionSingleton).flatMap { endOffsets =>
-        BracketThrowable[F].fromOption(endOffsets.get(snapshotsPartition), MissingOffsetError(snapshotsPartition))
-      }
-
-    // The read target must be the high watermark. Under read_committed this consumer's own end offset is
-    // the last-stable-offset, which an open transaction (e.g. of a hard-crashed previous owner, for up to
-    // its transaction.timeout.ms plus the broker's abort-scan interval, default 10s) pins BELOW records
-    // committed after it - a read bounded by it completes silently missing those committed snapshots. So
-    // for a read_committed config the target is captured up front by a short-lived read_uncommitted
-    // consumer, which makes the read wait such transactions out: the read_committed position cannot pass
-    // the last-stable-offset until the broker resolves them, so the read completes only once everything
-    // below the target is decided. Under read_uncommitted the consumer's own end offset already is the
-    // high watermark, so no extra capture is needed.
-    val capturedHighWatermark: F[Option[Offset]] =
-      if (consumerConfig.isolationLevel == IsolationLevel.ReadCommitted)
-        consumerOf
-          .apply[String, ByteVector](
-            suffixed(s"snapshot-$partition-hw").copy(isolationLevel = IsolationLevel.ReadUncommitted)
+      .use { consumer =>
+        for {
+          _ <- consumer.assign(snapshotPartitionSingleton)
+          // The read target is this consumer's own end offset. Under read_committed that is the last stable
+          // offset - the horizon below which every transaction is decided - which sits below the log end
+          // exactly while a transaction is open. That cannot hide a committed snapshot here: the topic is
+          // written by a single producer lineage (the stable per-partition transactional.id), and a producer
+          // must initTransactions - aborting its predecessor's open transaction - before it can write, so no
+          // committed record ever sits above an open transaction. What this bound does not defend against is
+          // a foreign producer's transaction on the snapshot topic, a deployment the docs exclude (sharing a
+          // snapshot topic mixes state on recovery regardless of any read bound). Contrast Kafka Streams,
+          // which must bound its restore at the high watermark instead (KAFKA-10167): its per-process
+          // transactional ids leave a crashed instance's transaction unabortable, pinning the last stable
+          // offset below committed records until the broker times it out - the stable per-partition id is
+          // what spares this read that wait. See docs/kafka-single-writer-design.md.
+          targetOffset <- consumer.endOffsets(snapshotPartitionSingleton).flatMap { endOffsets =>
+            BracketThrowable[F].fromOption(endOffsets.get(snapshotsPartition), MissingOffsetError(snapshotsPartition))
+          }
+          bytesByKey <- readPartition(
+            consumer,
+            snapshotsPartition,
+            targetOffset
           )
-          .use(endOffset)
-          .map(_.some)
-      else
-        none[Offset].pure[F]
-
-    capturedHighWatermark.flatMap { captured =>
-      consumerOf
-        .apply[String, ByteVector](suffixed(s"snapshot-$partition"))
-        .use { consumer =>
-          for {
-            _            <- consumer.assign(snapshotPartitionSingleton)
-            targetOffset <- captured.fold(endOffset(consumer))(_.pure[F])
-            bytesByKey <- readPartition(
-              consumer,
-              snapshotsPartition,
-              targetOffset
-            )
-            _ <- Log[F].info(
-              s"Snapshot topic $snapshotTopic partition $partition read complete at offset $targetOffset, ${bytesByKey.size} keys read"
-            )
-          } yield bytesByKey
-        }
-    }
+          _ <- Log[F].info(
+            s"Snapshot topic $snapshotTopic partition $partition read complete at offset $targetOffset, ${bytesByKey.size} keys read"
+          )
+        } yield bytesByKey
+      }
   }
 }

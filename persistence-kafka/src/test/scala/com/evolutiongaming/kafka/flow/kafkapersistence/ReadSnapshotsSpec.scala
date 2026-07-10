@@ -40,42 +40,36 @@ class ReadSnapshotsSpec extends FunSuite {
       value            = ByteVector.encodeUtf8(key).toOption.map(WithSize(_)),
     )
 
-  test("a read_committed read drains to the read_uncommitted end offset, not its own") {
-    // The read consumer's own endOffsets is the last-stable-offset: an open transaction pins it below
-    // committed records written after it (here: LSO = 1, records up to the high watermark 3). The read
-    // must take its target from a read_uncommitted view and keep polling past its own end offset - a
-    // target from the read consumer would stop after one record, silently missing the rest.
-    val lso           = 1L
-    val highWatermark = 3L
-    val records       = List(record(0, "k0"), record(1, "k1"), record(2, "k2"))
+  test("the read drains to the consumer's end offset and returns every record below it") {
+    // the target is the read consumer's own endOffsets - complete because the stable per-partition
+    // transactional.id keeps any open transaction above every committed record (see readSnapshots)
+    val records = List(record(0, "k0"), record(1, "k1"), record(2, "k2"))
 
     val test = for {
-      position    <- Ref.of[IO, Long](0L)
-      readConsumer = consumer(endOffset = lso, positionRef = position, records = records)
-      hwConsumer   = consumer(endOffset = highWatermark, positionRef = position, records = Nil)
+      positionRef <- Ref.of[IO, Long](0L)
       stored <- KafkaPartitionPersistence.readSnapshots[IO](
-        consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
+        consumerOf     = consumerOf(consumer(endOffset = 3L, positionRef = positionRef, records = records)),
         consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
         snapshotTopic  = topic,
         partition      = partition,
       )
-    } yield assertEquals(stored.keys.toList.sorted, List("k0", "k1", "k2"), "the read must drain past its own LSO")
+    } yield assertEquals(stored.keys.toList.sorted, List("k0", "k1", "k2"))
 
     test.unsafeRunSync()
   }
 
-  test("a read stalled longer than any transaction may live fails loudly instead of hanging") {
+  test("a read stalled far beyond any transient hiccup fails loudly instead of hanging") {
     // The target (3) was captured before a hypothetical log truncation; the log now ends at 1, so the
-    // position parks there and can never reach the target. Waiting cannot fix that - no transaction may
-    // stay open past transaction.max.timeout.ms - so the read must fail with the distinctive error rather
+    // position parks there and can never reach the target. Waiting cannot fix that - everything below
+    // the target is decided and fetchable - so the read must fail with the distinctive error rather
     // than hang forever or complete with possibly incomplete state.
     val test = for {
-      position    <- Ref.of[IO, Long](0L)
-      readConsumer = consumer(endOffset = 1L, positionRef = position, records = List(record(0, "k0")))
-      hwConsumer   = consumer(endOffset = 3L, positionRef = position, records = Nil)
+      positionRef <- Ref.of[IO, Long](0L)
       result <- KafkaPartitionPersistence
         .readSnapshots[IO](
-          consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
+          consumerOf = consumerOf(
+            consumer(endOffset = 3L, positionRef = positionRef, records = List(record(0, "k0")))
+          ),
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
           snapshotTopic  = topic,
           partition      = partition,
@@ -91,24 +85,14 @@ class ReadSnapshotsSpec extends FunSuite {
     test.unsafeRunSync()
   }
 
-  // dispatches by isolation level: the read consumer for read_committed, the HW consumer for read_uncommitted
-  private def consumerOf(
-    readConsumer: SkafkaConsumer[IO, String, ByteVector],
-    hwConsumer: SkafkaConsumer[IO, String, ByteVector],
-  ): ConsumerOf[IO] = new ConsumerOf[IO] {
+  private def consumerOf(stub: SkafkaConsumer[IO, String, ByteVector]): ConsumerOf[IO] = new ConsumerOf[IO] {
     def apply[K, V](
       config: ConsumerConfig
     )(implicit fromBytesK: FromBytes[IO, K], fromBytesV: FromBytes[IO, V]) =
-      cats
-        .effect
-        .Resource
-        .pure[IO, SkafkaConsumer[IO, K, V]](
-          (if (config.isolationLevel == IsolationLevel.ReadUncommitted) hwConsumer else readConsumer)
-            .asInstanceOf[SkafkaConsumer[IO, K, V]]
-        )
+      cats.effect.Resource.pure[IO, SkafkaConsumer[IO, K, V]](stub.asInstanceOf[SkafkaConsumer[IO, K, V]])
   }
 
-  // serves `records` one per poll from `position`, advancing it; endOffsets is fixed (the isolation-dependent bound)
+  // serves `records` one per poll from `position`, advancing it; endOffsets is fixed (the captured bound)
   private def consumer(
     endOffset: Long,
     positionRef: Ref[IO, Long],

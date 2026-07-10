@@ -464,75 +464,19 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     }
   }
 
-  test("recovery waits out an open transaction and reads committed snapshots beyond it") {
-    // An open transaction pins the snapshot topic's last-stable-offset below anything committed after
-    // it. Recovery must not complete bounded by that pin (it would silently miss the newer owner's
-    // committed snapshots and recover stale state); it must wait the open transaction out, then include
-    // the committed records and exclude the timed-out (aborted) ones. The open transaction here is
-    // genuinely open during the read: a unique second transactional.id is used, so nothing aborts it
-    // early - only the broker's timeout does. That models the one pin a takeover cannot abort (a foreign
-    // producer's transaction); a crashed owner's own transaction is aborted by the takeover instead - the
-    // next test.
-    val stateTopic = "tx-open-state-topic"
-
-    def record(key: String, value: String) = new ProducerRecord(
-      topic     = stateTopic,
-      partition = Partition.min.some,
-      key       = key.some,
-      value     = value.some,
-    )
-
-    // short transaction.timeout.ms so the broker aborts the "crashed" writer quickly (abort scan runs
-    // every transaction.abort.timed.out.transaction.cleanup.interval.ms, default 10s)
-    val crashedProducer =
-      producerOf(
-        producerConfig.copy(
-          transactionalId    = "tx-open-crashed".some,
-          idempotence        = true,
-          transactionTimeout = 5.seconds,
-        )
-      )
-
-    val test = createTopic(stateTopic, 1) *>
-      crashedProducer.use { producerA =>
-        for {
-          _ <- producerA.initTransactions
-          _ <- producerA.beginTransaction
-          _ <- producerA.send(record("key-uncommitted", "uncommitted")).flatten
-          // the next owner commits a NEWER snapshot above A's still-open transaction
-          _ <- transactionalProducer("tx-open-next").use { producerB =>
-            producerB.initTransactions *>
-              producerB.beginTransaction *>
-              producerB.send(record("key-committed", "committed")).flatten *>
-              producerB.commitTransaction
-          }
-          // the pin must be active when the read starts: without this check, a slow runner where the
-          // broker has already timed A out degrades the test to the aborted case, silently not
-          // exercising the wait
-          lso <- endOffset(stateTopic, IsolationLevel.ReadCommitted)
-          hw  <- endOffset(stateTopic, IsolationLevel.ReadUncommitted)
-          _    = assert(clue(lso.value) < clue(hw.value), "expected an open-transaction pin at read start")
-          // A's transaction is still open here; the read must wait for the broker to time it out
-          stored <- readSnapshots(stateTopic).timeout(60.seconds)
-        } yield {
-          assertEquals(clue(stored.get("key-committed")), utf8("committed"))
-          assertEquals(clue(stored.get("key-uncommitted")), none[ByteVector])
-        }
-      }
-
-    test.unsafeRunSync()
-  }
-
   test("a takeover aborts the crashed owner's dangling transaction (stable transactional.id)") {
-    // Counterpart of the wait test above: when the open transaction belongs to the partition's own
-    // stable transactional.id - a hard-crashed previous owner - recovery does not wait it out. Acquiring
-    // the module runs initTransactions on the same id, which fences the crashed producer and aborts its
-    // dangling transaction; the abort markers are written and replicated before initTransactions
-    // returns, so the last-stable-offset is back at the high watermark before recovery reads. The
-    // crashed producer's transaction.timeout.ms is deliberately long: the pin-resolved assertion right
-    // after module acquisition can only pass through the takeover-abort, never the broker's timeout.
-    // This also pins the "<prefix>-<partition>" id format - under a non-stable (e.g. per-assignment
-    // unique) id the crashed transaction would stay open and the assertion would fail.
+    // The recovery read bounds itself at its own read_committed end offset - the last-stable-offset -
+    // which is complete only because no committed snapshot can sit above an open transaction: every
+    // writer of the partition shares the stable transactional.id, and its mandatory initTransactions
+    // aborts the predecessor's open transaction before it may write. This test pins that mechanism at
+    // the handover: acquiring the module runs initTransactions on the partition's own id, fencing the
+    // crashed producer and aborting its dangling transaction; the abort markers are written and
+    // replicated before initTransactions returns, so the last-stable-offset is back at the high
+    // watermark before recovery reads. The crashed producer's transaction.timeout.ms is deliberately
+    // long: the pin-resolved assertion right after module acquisition can only pass through the
+    // takeover-abort, never the broker's timeout. This also pins the "<prefix>-<partition>" id format -
+    // under a non-stable (e.g. per-assignment unique) id the crashed transaction would stay open and
+    // the assertion would fail.
     val stateTopic = "tx-takeover-abort-state-topic"
     val inputTopic = s"input-$stateTopic"
     val group      = s"$groupId-takeover-abort"

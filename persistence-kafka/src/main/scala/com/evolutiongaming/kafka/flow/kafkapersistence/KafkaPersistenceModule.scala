@@ -18,6 +18,8 @@ import com.evolutiongaming.sstream.Stream
 import scodec.bits.ByteVector
 import com.evolutiongaming.skafka.consumer.ConsumerRecord
 
+import scala.concurrent.duration.*
+
 /** A module, necessary to create a Kafka snapshot persistence.
   */
 trait KafkaPersistenceModule[F[_], S] {
@@ -38,8 +40,8 @@ object KafkaPersistenceModule {
     * @param consumerConfig
     *   config for the snapshot-reading consumer; recovery forces `read_committed` regardless of this value
     * @param producerConfig
-    *   base config for the snapshot producer; `transactionalId` and `idempotence` are overridden per producer and
-    *   `clientId` is suffixed with `-snapshot-<partition>`
+    *   base config for the snapshot producer; `transactionalId`, `idempotence` and `transactionTimeout` are overridden
+    *   per producer (see the respective parameters) and `clientId` is suffixed with `-snapshot-<partition>`
     * @param transactionalIdPrefix
     *   prefix for `transactional.id` (the partition number is appended - the id is stable per partition, so a
     *   takeover's `initTransactions` fences the previous owner's producer and aborts any transaction it left open).
@@ -52,13 +54,23 @@ object KafkaPersistenceModule {
     * @param maxWritesPerTransaction
     *   upper bound of snapshot writes group committed in one per-partition, serialized transaction, see
     *   [[KafkaSnapshotWriteDatabase.transactional]]
+    * @param transactionTimeout
+    *   `transaction.timeout.ms` for the snapshot producer, overriding `producerConfig`'s value (like `transactionalId`
+    *   and `idempotence`). Defaults to 10 seconds - the Kafka Streams EOS default - rather than the client default of 1
+    *   minute: the timeout bounds how long a crashed owner's leftovers can affect others (its pending transactional
+    *   offsets block `requireStable` offset fetches of the input group until resolved; a transaction no takeover aborts
+    *   pins the snapshot topic's last-stable-offset for other readers), while it only needs to exceed the longest
+    *   group-committed batch - typically well under a second. Raise it (or lower `maxWritesPerTransaction`) if very
+    *   large snapshot batches approach it; a transaction exceeding it is aborted by the coordinator and the flush fails
+    *   loudly.
     */
   final case class TransactionalConfig(
     consumerConfig: ConsumerConfig,
     producerConfig: ProducerConfig,
     transactionalIdPrefix: String,
     snapshotTopic: Topic,
-    maxWritesPerTransaction: Int = KafkaSnapshotWriteDatabase.DefaultMaxWritesPerTransaction,
+    maxWritesPerTransaction: Int       = KafkaSnapshotWriteDatabase.DefaultMaxWritesPerTransaction,
+    transactionTimeout: FiniteDuration = 10.seconds,
   )
 
   def caching[F[_]: LogOf: Concurrent: Parallel: Runtime, S](
@@ -196,21 +208,22 @@ object KafkaPersistenceModule {
     implicit toBytesState: ToBytes[F, S]
   ): Resource[F, KafkaSnapshotWriteDatabase.Transactional[F, S]] = {
     implicit val fromTry: FromTry[F] = FromTry.lift
-    import config.{maxWritesPerTransaction, producerConfig, transactionalIdPrefix}
+    import config.{maxWritesPerTransaction, producerConfig, transactionTimeout, transactionalIdPrefix}
     import assignment.{assignedAt, groupMetadata, topicPartition as inputTopicPartition}
 
     val partition = inputTopicPartition.partition
 
     for {
-      // stable per partition (the Kafka Streams model): this producer's initTransactions fences the previous
-      // owner's producer and aborts any transaction it left open, so a hard-crashed owner's dangling transaction
-      // does not outlive the handover (nor keep pinning the snapshot topic's last-stable-offset, which recovery
-      // otherwise has to wait out - see KafkaPartitionPersistence.readSnapshots). Safety does not rest on this
+      // stable per partition (the eos-v1 Kafka Streams model): this producer's initTransactions fences the
+      // previous owner's producer and aborts any transaction it left open, so a hard-crashed owner's dangling
+      // transaction does not outlive the handover - which is also why recovery can bound its read at its own
+      // read_committed end offset (see KafkaPartitionPersistence.readSnapshots). Safety does not rest on this
       // epoch fence: the consumer generation bound into every commit is what fences stale owners
       transactionalId <- Resource.pure[F, String](s"$transactionalIdPrefix-${partition.value}")
       transactionalProducerConfig = producerConfig.copy(
-        transactionalId = transactionalId.some,
-        idempotence     = true,
+        transactionalId    = transactionalId.some,
+        idempotence        = true,
+        transactionTimeout = transactionTimeout,
         common = producerConfig
           .common
           .copy(clientId = producerConfig.common.clientId.map(cid => s"$cid-snapshot-${partition.value}"))

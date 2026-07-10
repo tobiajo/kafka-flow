@@ -142,11 +142,24 @@ fenced — a wedged stale owner fails fast on its first use (`ProducerFencedExce
 transaction later at the offset-commit fence — and **any transaction it left open is aborted on the
 spot**. That abort is the reason for the choice: a hard-crashed owner's dangling transaction otherwise
 survives until `transaction.timeout.ms` and pins the snapshot topic's last-stable-offset — the horizon
-`read_committed` readers (recovery included) cannot see past. With takeover-abort the pin does not
-outlive the handover — the abort's markers are written and replicated before `initTransactions`
-returns, and the module initializes its producer before recovery reads, so recovery starts unpinned;
-it additionally waits out any pin a takeover cannot abort (a foreign producer's transaction on the
-snapshot topic) rather than reading short of it.
+`read_committed` readers (recovery included) cannot see past. The stable id makes that pin harmless by
+construction: every writer of a partition shares its id, and a producer's **mandatory**
+`initTransactions` aborts the predecessor's open transaction before the producer may write, so the
+partition's transactions are serialized — a committed snapshot never sits above an open one. Recovery
+therefore bounds its read at its own `read_committed` end offset (the last-stable-offset) and that
+bound is *complete*, with nothing to wait out; the one pin it does not cover is a foreign producer's
+transaction on the snapshot topic, a deployment already excluded (sharing a snapshot topic mixes state
+on recovery regardless of any read bound). Kafka Streams has to solve the same problem the other way
+around ([KAFKA-10167](https://issues.apache.org/jira/browse/KAFKA-10167)): its eos-v2 per-process ids
+leave a crashed instance's transaction unabortable, so its restore reads to the *high watermark* and
+waits pins out, with the transaction timeout forced down to 10 s to shorten them. The stable
+per-partition id — Streams' own removed eos-v1 model, affordable here because there is a producer per
+partition anyway — is what makes both the wait and the extra bound unnecessary; this mode adopts
+Streams' 10 s timeout default all the same, as the bound on a crashed owner's *other* leftovers (its
+pending transactional offsets block `requireStable` offset fetches until resolved). A recovery read
+stalled far beyond any transient hiccup fails loudly (`RecoveryReadStalledError`) instead of hanging:
+with every record below the target decided, the remaining cause of a stall is log truncation —
+orthogonal to transactions.
 
 No safety is asked of the epoch fence, and none should be: the generation bound into every commit is
 what fences stale owners, and in a rare corner the epoch order can even invert ownership — a stale
@@ -291,14 +304,17 @@ shows corruption with the plain shared producer (no offset binding); the prevent
 with an *older consumer generation* and asserts the newer snapshot survives — isolating the offset
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
 fenced writer fails its next flush and its aborted transaction neither blocks nor leaks into recovery,
-concurrent-write safety. Recovery's read bound is pinned from both sides: an open transaction under a
-foreign id stays genuinely open through the read, which must wait it out — returning the committed
-snapshot beyond the pin, dropping the timed-out record — while its counterpart crashes an owner
-mid-transaction under the partition's own stable id and asserts the takeover's init resolves the pin
-before recovery reads (also pinning the `{prefix}-{partition}` id format against regression).
-`ReadSnapshotsSpec` (unit, stubbed consumers) fails a read bounded by its own `read_committed` end
-offset instead of the `read_uncommitted` one, and requires a read stalled past any transaction's
-possible lifetime to fail with `RecoveryReadStalledError` rather than hang or complete short. The
+concurrent-write safety. The recovery read's bound rests on the takeover-abort, and that is pinned at
+the handover: an owner crashes mid-transaction under the partition's own stable id with a deliberately
+long transaction timeout, and immediately after module acquisition the last-stable-offset must be back
+at the high watermark — only the takeover-abort can pass that, never the broker's timeout — then
+recovery returns the committed snapshot and excludes the dangling record (this also pins the
+`{prefix}-{partition}` id format against regression: unique ids would leave the transaction open and
+fail the assertion). `ReadSnapshotsSpec` (unit, stubbed consumer) covers the read loop itself: it
+drains to the consumer's end offset, and a read stalled far beyond any transient hiccup (a target
+above a truncated log) fails with `RecoveryReadStalledError` rather than hang or complete short.
+`KafkaPersistenceModuleSpec` (unit) pins the module-owned producer settings — the stable id shape,
+idempotence, and the 10 s transaction-timeout default — against whatever `producerConfig` carries. The
 group commit is exercised in isolation by `GroupCommitSpec`, a unit test
 with a recording in-memory producer (no broker). The teardown-await the fence depends on for just-lost
 partitions (Mechanism, last key point) is pinned by `TopicFlowSpec` "remove awaits the flow teardown",
@@ -313,9 +329,12 @@ last joined generation — including that `0` is admitted, the range check rathe
   stored offset. Kafka has no conditional produce primitive, so it cannot be atomic.
 - **Unique per-assignment `transactional.id` (no epoch fencing)**: immune to the init-order corner and
   collision-proof by construction, but a hard-crashed owner's dangling transaction then survives until
-  `transaction.timeout.ms`, pinning recovery behind the last-stable-offset for the full timeout on every
-  crash. Safety is identical either way (the generation fence); the stable id's takeover-abort removes
-  the wait in the common path (see Epoch fencing as takeover-abort).
+  `transaction.timeout.ms` — nobody's `initTransactions` ever aborts it — pinning the snapshot topic's
+  last-stable-offset on every crash. Recovery would then need the Kafka Streams restore shape (a
+  high-watermark target through an uncommitted-isolation lens, waiting pins out — KAFKA-10167), because
+  its own `read_committed` end offset would silently under-read committed snapshots above the pin.
+  Safety is identical either way (the generation fence); the stable id turns the wait and the extra
+  bound into a takeover-abort (see Epoch fencing as takeover-abort).
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
   reassignment, and safe *dynamic* assignment is the point of this design. (Static *membership*
