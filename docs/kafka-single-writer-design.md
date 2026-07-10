@@ -157,7 +157,13 @@ per-partition id — Streams' own removed eos-v1 model, affordable here because 
 partition anyway — is what makes both the wait and the extra bound unnecessary. (The same init that
 aborts the dangling transaction also resolves its pending transactional offsets — the abort markers
 land on `__consumer_offsets` too — so the next owner's `requireStable` offset fetch is equally
-unaffected; a crashed owner's leftovers are gone before anything of this design reads past them.)
+unaffected; a crashed owner's leftovers are gone before anything of this design reads past them.) A
+recovery read stalled far beyond any transient hiccup fails loudly (`RecoveryReadStalledError`) instead
+of hanging: with every record below the target decided, the remaining cause of a stall is log
+truncation. The threshold sits below `max.poll.interval.ms` deliberately — recovery runs on the poll
+thread inside the rebalance callback, so a silent hang would not crash anything: the broker would evict
+the member around the stuck thread, invisible to process-level health checks; failing first turns that
+into a visible flow error.
 
 No safety is asked of the epoch fence, and none should be: the generation bound into every commit is
 what fences stale owners, and in a rare corner the epoch order can even invert ownership — a stale
@@ -308,8 +314,9 @@ long transaction timeout, and immediately after module acquisition the last-stab
 at the high watermark — only the takeover-abort can pass that, never the broker's timeout — then
 recovery returns the committed snapshot and excludes the dangling record (this also pins the
 `{prefix}-{partition}` id format against regression: unique ids would leave the transaction open and
-fail the assertion). `ReadSnapshotsSpec` (unit, stubbed consumer) covers the read loop itself (drains
-to the consumer's end offset), and `KafkaPersistenceModuleSpec` (unit) pins the module-owned producer
+fail the assertion). `ReadSnapshotsSpec` (unit, stubbed consumer) covers the read loop itself: it drains to the consumer's
+end offset, and a read stalled far beyond any transient hiccup (a target above a truncated log) fails
+with `RecoveryReadStalledError` rather than hang or complete short. And `KafkaPersistenceModuleSpec` (unit) pins the module-owned producer
 settings — the stable id shape and idempotence — against whatever `producerConfig` carries. The
 group commit is exercised in isolation by `GroupCommitSpec`, a unit test
 with a recording in-memory producer (no broker). The teardown-await the fence depends on for just-lost
