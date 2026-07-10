@@ -57,10 +57,11 @@ object Consumer {
       private def refresh: F[Unit] =
         consumer.groupMetadata.flatMap(publish)
 
-      // never publish an unknown (negative) generation: paired with an empty member id it is the coordinator's
-      // pre-KIP-447 compatibility input, for which generation validation is SKIPPED - a commit carrying it would
-      // land unfenced. The client reports unknown only before the first join; after falling out of the group it
-      // keeps the last joined generation, so a fallen-out owner stays gated by the generation it held.
+      // never publish an unknown (negative) generation: paired with an empty member id it is indistinguishable
+      // from a pre-KIP-447 client's wire defaults, for which the coordinator SKIPS generation validation - a
+      // commit carrying it would land unfenced. The unknown value itself is just the client's not-yet-joined
+      // initial state, reported only before the first join; after falling out of the group the client keeps
+      // the last joined generation, so a fallen-out owner stays gated by the generation it held.
       private def publish(meta: ConsumerGroupMetadata): F[Unit] =
         groupMetadataRef.set(meta.some).whenA(meta.generationId >= 0)
 
