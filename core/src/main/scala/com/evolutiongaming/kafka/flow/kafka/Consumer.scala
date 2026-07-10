@@ -24,10 +24,10 @@ trait Consumer[F[_]] {
 
   def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]): F[Unit]
 
-  /** Group metadata used to fence a stale owner by generation when binding offset commits into a producer
-    * transaction (KIP-447). `None` until the consumer has joined a group; never an unknown (negative) generation - a
-    * commit carrying one would land unfenced. How the value is kept current is implementation-specific (`of` refreshes
-    * it after every poll).
+  /** Group metadata used to fence a stale owner by generation when binding offset commits into a producer transaction
+    * (KIP-447). `None` until the consumer has joined a group; never an unknown (negative) generation - a commit
+    * carrying one would land unfenced. How the value is kept current is implementation-specific (`of` refreshes it
+    * after every poll).
     */
   def groupMetadata: F[Option[ConsumerGroupMetadata]]
 

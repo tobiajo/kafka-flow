@@ -110,7 +110,7 @@ never recovered.
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
   it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
-  higher timeout lengthens the post-crash stall (below).
+  higher timeout lengthens how long a crashed owner's open transaction pins the snapshot topic (below).
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -126,8 +126,10 @@ Limitations:
   **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
   `flushOnRevoke` does not shrink the replay window there (see the design doc for why).
 - After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
-  `transaction.timeout.ms`; until then a `read_committed` reader — recovery of that partition, or a
-  downstream consumer of your output — can stall behind its last-stable-offset.
+  `transaction.timeout.ms`; until then that open transaction pins the snapshot topic's
+  last-stable-offset, and recovery of that partition cannot see records beyond it — nor can any other
+  `read_committed` reader of the *snapshot topic*. Output topics are unaffected (output stays outside
+  the transaction).
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (one snapshot partition per input
   partition); a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

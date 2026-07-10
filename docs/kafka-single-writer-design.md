@@ -149,8 +149,9 @@ pure availability loss with no safety gain.
 The cost of unique ids — transaction-coordinator state expiring via `transactional.id.expiration.ms` —
 is accepted. A hard-crashed owner's in-flight transaction is, for the same reason, not fenced on the
 spot (a stable id would abort it through the new owner's `initTransactions`); the coordinator reclaims
-it only after `transaction.timeout.ms`, which bounds how long a `read_committed` reader (recovery, or a
-downstream consumer) can stall behind its last-stable-offset.
+it only after `transaction.timeout.ms`, which bounds how long its open transaction pins the snapshot
+topic's last-stable-offset — the horizon `read_committed` readers of that topic (recovery included)
+cannot see past.
 
 ## Consumer rebalance protocols
 
