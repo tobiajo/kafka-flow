@@ -72,8 +72,8 @@ This is corruption prevention, not exactly-once. Output produces go through the 
 producer, and the transaction wraps only the snapshot write and the offset commit, so they stay outside
 it — enrolling them would be full transactional output, an explicit non-goal (see Rejected alternatives).
 Output is therefore at-least-once: a replayed batch re-emits it, so the consuming side must tolerate
-duplicates. The **committable offset** — the minimum offset still held across the partition's keys, or
-the last processed offset once nothing is held — is
+duplicates. The **committable offset** — the minimum offset still held across the partition's keys, or,
+once nothing is held, the offset just past the last processed record — is
 never ahead of the persisted snapshots: an offset becomes committable only after its snapshot is
 persisted, so recovery never skips events.
 
@@ -175,7 +175,7 @@ Under the **classic** protocol that read is nearly sufficient on its own: *compl
 advances land in the group metadata only inside `poll` (a background fence or leave does not touch it —
 the client keeps reporting the last joined generation, which can only self-fence), so the post-poll read
 observes every completed advance before the flush that follows. What remains is the in-flight round: a
-join round can span polls (KIP-266), the broker bumps the generation when all members have joined, and a
+join round can span polls (KIP-266), the broker bumps the generation when the join phase completes, and a
 flush of a retained partition between that bump and this member's sync still carries the previous
 generation — spuriously fenced, on any broker version, and absorbed by nothing; safe, but the
 still-valid owner crashes. Under the **consumer** protocol the epoch additionally advances on the
@@ -188,7 +188,7 @@ The between-polls residual is **consumer-protocol only**, and it is what
 a broker-side coordinator change in Kafka 4.3.0, absorbs: it relaxes the offset-commit epoch check for a
 still-owned partition, so a retained partition's lagging commit is accepted rather than rejected. That is
 why the consumer protocol carries a **broker** version floor and the classic protocol does not: below
-4.3.0 the (much wider) consumer-protocol residual is not absorbed and crashes the still-valid owner —
+4.3.0 the consumer-protocol residual is not absorbed and crashes the still-valid owner —
 safe, but not stable — so brokers 4.3.0+ are recommended for `group.protocol=consumer`; the classic
 in-flight-round residual is absorbed by no broker version, so there is no version to prefer. KIP-1251
 changes the consumer-protocol coordinator only.
