@@ -101,7 +101,8 @@ Key points:
   does not close this — it applies only to lagging commits.) That is closed client-side: a revoked partition's
   flows are torn down inside the synchronous revoke callback, and the broker does not reassign the
   partition until the client acknowledges the revocation — which it cannot do until that callback
-  returns. So no new owner exists while a flow for the partition is still alive.
+  returns. So no new owner exists while a flow for the partition is still alive (the await is pinned by a
+  unit test; see Testing).
 
 The mechanism needs the input topic-partition and a reader of the driving consumer's group metadata
 (`Consumer.groupMetadata`, refreshed after every poll on the poll thread). Both are supplied by the flow
