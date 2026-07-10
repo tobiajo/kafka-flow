@@ -80,9 +80,8 @@ val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[F, State](
 // KafkaFlow.resource(consumerResource, ConsumerFlowOf(inputTopic, TopicFlowOf(kafkaEagerRecovery(moduleOf, /* ... */))))
 ```
 
-`idempotence`, the per-partition `transactional.id` and `transaction.timeout.ms` are set for you —
-don't configure them in `producerConfig` (the timeout has its own `transactionTimeout` field, default
-10 s) — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
+`idempotence` and the per-partition `transactional.id` are set for you — don't configure them in
+`producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
 The id is stable per partition (`<prefix>-<partition>`), so a takeover fences the previous owner's
 producer and aborts any transaction a crashed owner left open. The input topic and the fencing
 generation are supplied by the flow (from the assigned partition and the driving consumer), so neither
@@ -110,13 +109,10 @@ never recovered.
   default cap the overhead is small (see the design doc's Measurements). Each partition also holds its
   own producer and transaction-coordinator state on the brokers, so the footprint scales with the
   partition count.
-- **Tuning for transaction time** — a transaction must commit within
-  `TransactionalConfig.transactionTimeout` (default **10 s**, the Kafka Streams EOS default; applied to
-  the producer as `transaction.timeout.ms`, ≤ the broker's `transaction.max.timeout.ms`). A batch
-  typically commits in well under a second, but large snapshots lengthen it — lower
-  `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. The timeout is how long a
-  crashed owner's leftovers can affect others (pending transactional offsets block the next owner's
-  offset fetch until resolved), so keep it as low as your batches allow.
+- **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
+  `producerConfig` setting, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). A batch
+  typically commits in well under a second, but large snapshots lengthen it with the batch — lower
+  `maxWritesPerTransaction` (at a throughput cost) or raise the timeout.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -132,12 +128,11 @@ Limitations:
   **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
   `flushOnRevoke` does not shrink the replay window there (see the design doc for why).
 - After a hard crash, the failed owner's in-flight transaction is aborted when the partition's next
-  owner initializes its producer (the stable `transactional.id`) — before that owner's recovery reads,
-  so recovery is neither delayed nor affected. Until then — or after `transactionTimeout` plus the
-  broker's abort-scan interval (default 10 s) at the latest — the open transaction pins the snapshot
-  topic's last-stable-offset, which any *other* `read_committed` reader of the snapshot topic cannot
-  see past, and its pending offset commit blocks the input group's offset fetch (`requireStable`).
-  Output topics are unaffected (output stays outside the transaction).
+  owner initializes its producer (the stable `transactional.id`) — before that owner reads snapshots or
+  fetches input offsets, so neither its recovery nor its resume position is affected. Until then — or
+  after `transaction.timeout.ms` plus the broker's abort-scan interval (default 10 s) at the latest —
+  the open transaction pins the snapshot topic's last-stable-offset for any *other* `read_committed`
+  reader of that topic. Output topics are unaffected (output stays outside the transaction).
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (one snapshot partition per input
   partition); a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

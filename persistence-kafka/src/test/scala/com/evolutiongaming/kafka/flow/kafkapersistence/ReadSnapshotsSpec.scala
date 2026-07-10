@@ -58,33 +58,6 @@ class ReadSnapshotsSpec extends FunSuite {
     test.unsafeRunSync()
   }
 
-  test("a read stalled far beyond any transient hiccup fails loudly instead of hanging") {
-    // The target (3) was captured before a hypothetical log truncation; the log now ends at 1, so the
-    // position parks there and can never reach the target. Waiting cannot fix that - everything below
-    // the target is decided and fetchable - so the read must fail with the distinctive error rather
-    // than hang forever or complete with possibly incomplete state.
-    val test = for {
-      positionRef <- Ref.of[IO, Long](0L)
-      result <- KafkaPartitionPersistence
-        .readSnapshots[IO](
-          consumerOf = consumerOf(
-            consumer(endOffset = 3L, positionRef = positionRef, records = List(record(0, "k0")))
-          ),
-          consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
-          snapshotTopic  = topic,
-          partition      = partition,
-        )
-        .attempt
-    } yield result match {
-      case Left(e: KafkaPartitionPersistence.RecoveryReadStalledError) =>
-        assertEquals(e.position, Offset.unsafe(1))
-        assertEquals(e.targetOffset, Offset.unsafe(3))
-      case other => fail(s"expected RecoveryReadStalledError, got $other")
-    }
-
-    test.unsafeRunSync()
-  }
-
   private def consumerOf(stub: SkafkaConsumer[IO, String, ByteVector]): ConsumerOf[IO] = new ConsumerOf[IO] {
     def apply[K, V](
       config: ConsumerConfig

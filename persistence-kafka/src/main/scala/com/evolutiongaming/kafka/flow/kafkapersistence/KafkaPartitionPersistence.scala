@@ -1,7 +1,7 @@
 package com.evolutiongaming.kafka.flow.kafkapersistence
 
 import cats.implicits.*
-import cats.{FlatMap, MonadThrow, data}
+import cats.{FlatMap, Monad, data}
 import com.evolutiongaming.catshelper.{BracketThrowable, Log}
 import com.evolutiongaming.kafka.flow.kafka.Codecs.*
 import com.evolutiongaming.skafka.*
@@ -22,66 +22,30 @@ object KafkaPartitionPersistence {
 
   private case class MissingOffsetError(topicPartition: TopicPartition) extends NoStackTrace
 
-  /** The recovery read made no progress for far longer than any transient hiccup explains, so waiting cannot fix it:
-    * every record below the target is decided and fetchable (the target is the read's own `read_committed` end offset
-    *   - the last stable offset), so the likely cause is a log end that regressed below the captured target - log
-    *     truncation after an unclean leader election, i.e. the cluster lost acknowledged snapshot records. Failing
-    *     loudly beats both hanging forever and silently recovering possibly incomplete state.
-    */
-  final case class RecoveryReadStalledError(
-    topicPartition: TopicPartition,
-    position: Offset,
-    targetOffset: Offset,
-  ) extends RuntimeException(
-        s"recovery read of $topicPartition made no progress at offset $position, short of target $targetOffset, " +
-          "far beyond any transient broker hiccup; the log end has likely regressed below the captured target " +
-          "(log truncation after an unclean leader election) - failing rather than hanging or silently recovering " +
-          "possibly incomplete state"
-      )
-      with NoStackTrace
-
-  // each stalled poll takes at least the 10ms poll timeout, so this many consecutive no-progress polls is
-  // at least ~16 minutes. Nothing legitimate holds the read below its target that long: the target is the
-  // last stable offset, so every record below it is decided and fetchable - only a prolonged broker outage
-  // or a truncated log (see RecoveryReadStalledError) looks like this. A slow-but-progressing read never
-  // comes near it: the count resets on every advance.
-  private[kafkapersistence] val maxStalledPolls = 96000L
-
-  // ~5s of empty 10ms polls between "no progress" log lines: a single empty poll is normal at this poll
-  // rate, a run of them is worth a line so a stuck recovery is visible long before the tripwire
-  private val logEveryStalledPolls = 500L
-
-  private[kafkapersistence] def readPartition[F[_]: MonadThrow: Log](
+  private[kafkapersistence] def readPartition[F[_]: Monad: Log](
     consumer: SkafkaConsumer[F, String, ByteVector],
     snapshotPartition: TopicPartition,
     targetOffset: Offset
   ): F[BytesByKey] =
     Log[F].info(s"Snapshot topic read started up to offset $targetOffset") *>
       FlatMap[F]
-        .tailRecM[(BytesByKey, Option[Offset], Long), BytesByKey]((BytesByKey.empty, none, 0L)) {
-          case (acc, lastPosition, stalledPolls) =>
-            consumer
-              .position(snapshotPartition)
-              .flatMap {
-                case offset if offset >= targetOffset =>
-                  acc.asRight[(BytesByKey, Option[Offset], Long)].pure[F]
-                case offset =>
-                  val stalled = if (lastPosition.contains(offset)) stalledPolls + 1 else 0L
-                  val logStalled = Log[F]
-                    .info(s"Snapshot topic read making no progress at offset $offset, target $targetOffset")
-                    .whenA(stalled > 0 && stalled % logEveryStalledPolls == 0)
-                  // waiting cannot fix a stall this long - fail loudly (see the error's scaladoc)
-                  val failStalled = RecoveryReadStalledError(snapshotPartition, offset, targetOffset)
-                    .raiseError[F, Unit]
-                    .whenA(stalled >= maxStalledPolls)
-                  failStalled *> logStalled *>
-                    consumer
-                      .poll(10.millis) // TODO: make poll timeout configurable
-                      .map { records =>
-                        val read = records.values.values.flatMap(_.toIterable).foldLeft(acc)(processRecord)
-                        (read, offset.some, stalled).asLeft
-                      }
-              }
+        .tailRecM[BytesByKey, BytesByKey](BytesByKey.empty) { acc =>
+          consumer
+            .position(snapshotPartition)
+            .flatMap {
+              case offset if offset >= targetOffset =>
+                acc.asRight[BytesByKey].pure[F]
+              case _ =>
+                consumer
+                  .poll(10.millis) // TODO: make poll timeout configurable
+                  .map(
+                    _.values
+                      .values
+                      .flatMap(_.toIterable)
+                      .foldLeft(acc)(processRecord)
+                      .asLeft
+                  )
+            }
         }
 
   private[kafkapersistence] def processRecord(

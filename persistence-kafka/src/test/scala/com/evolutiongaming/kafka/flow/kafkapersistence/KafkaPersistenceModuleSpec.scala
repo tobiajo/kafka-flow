@@ -15,12 +15,9 @@ import com.evolutiongaming.skafka.producer.{Producer, ProducerConfig, ProducerOf
 import com.evolutiongaming.skafka.{CommonConfig, FromBytes, Offset, Partition, TopicPartition}
 import munit.FunSuite
 
-import scala.concurrent.duration.*
-
 /** The transactional module owns the producer settings that carry its design: the stable per-partition
   * `transactional.id` (a takeover must abort a crashed owner's dangling transaction - the recovery read's bound relies
-  * on it), idempotence, and the 10 s `transaction.timeout.ms` default (the Kafka Streams EOS default) - all applied
-  * over whatever `producerConfig` carries.
+  * on it) and idempotence - applied over whatever `producerConfig` carries.
   */
 class KafkaPersistenceModuleSpec extends FunSuite {
 
@@ -61,26 +58,12 @@ class KafkaPersistenceModuleSpec extends FunSuite {
     snapshotTopic         = "state-topic",
   )
 
-  test("the module applies the stable per-partition id, idempotence and the 10 s timeout default") {
+  test("the module applies the stable per-partition id and idempotence") {
     val test = acquireModule(transactionalConfig).map { config =>
       val produced = config.getOrElse(fail("no producer was created at module acquisition"))
       assertEquals(produced.transactionalId, "app-0".some)
       assertEquals(produced.idempotence, true)
-      assertEquals(produced.transactionTimeout, 10.seconds)
       assertEquals(produced.common.clientId, "client-snapshot-0".some)
-    }
-    test.unsafeRunSync()
-  }
-
-  test("a configured transactionTimeout overrides the default (producerConfig's own value never applies)") {
-    val test = acquireModule(
-      transactionalConfig.copy(
-        producerConfig     = ProducerConfig(transactionTimeout = 1.minute),
-        transactionTimeout = 3.seconds,
-      )
-    ).map { config =>
-      val produced = config.getOrElse(fail("no producer was created at module acquisition"))
-      assertEquals(produced.transactionTimeout, 3.seconds)
     }
     test.unsafeRunSync()
   }
