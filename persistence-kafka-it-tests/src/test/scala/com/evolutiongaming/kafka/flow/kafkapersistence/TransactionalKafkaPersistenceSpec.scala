@@ -465,12 +465,14 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
   }
 
   test("recovery waits out an open transaction and reads committed snapshots beyond it") {
-    // A hard-crashed writer leaves its transaction open for up to transaction.timeout.ms, pinning the
-    // snapshot topic's last-stable-offset below anything committed after it. Recovery must not complete
-    // bounded by that pin (it would silently miss the newer owner's committed snapshots and recover stale
-    // state); it must wait the open transaction out, then include the committed records and exclude the
-    // timed-out (aborted) ones. The open transaction here is genuinely open during the read: a unique
-    // second transactional.id is used, so nothing aborts it early - only the broker's timeout does.
+    // An open transaction pins the snapshot topic's last-stable-offset below anything committed after
+    // it. Recovery must not complete bounded by that pin (it would silently miss the newer owner's
+    // committed snapshots and recover stale state); it must wait the open transaction out, then include
+    // the committed records and exclude the timed-out (aborted) ones. The open transaction here is
+    // genuinely open during the read: a unique second transactional.id is used, so nothing aborts it
+    // early - only the broker's timeout does. That models the one pin a takeover cannot abort (a foreign
+    // producer's transaction); a crashed owner's own transaction is aborted by the takeover instead - the
+    // next test.
     val stateTopic = "tx-open-state-topic"
 
     def record(key: String, value: String) = new ProducerRecord(
@@ -515,6 +517,89 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
         } yield {
           assertEquals(clue(stored.get("key-committed")), utf8("committed"))
           assertEquals(clue(stored.get("key-uncommitted")), none[ByteVector])
+        }
+      }
+
+    test.unsafeRunSync()
+  }
+
+  test("a takeover aborts the crashed owner's dangling transaction (stable transactional.id)") {
+    // Counterpart of the wait test above: when the open transaction belongs to the partition's own
+    // stable transactional.id - a hard-crashed previous owner - recovery does not wait it out. Acquiring
+    // the module runs initTransactions on the same id, which fences the crashed producer and aborts its
+    // dangling transaction; the abort markers are written and replicated before initTransactions
+    // returns, so the last-stable-offset is back at the high watermark before recovery reads. The
+    // crashed producer's transaction.timeout.ms is deliberately long: the pin-resolved assertion right
+    // after module acquisition can only pass through the takeover-abort, never the broker's timeout.
+    // This also pins the "<prefix>-<partition>" id format - under a non-stable (e.g. per-assignment
+    // unique) id the crashed transaction would stay open and the assertion would fail.
+    val stateTopic = "tx-takeover-abort-state-topic"
+    val inputTopic = s"input-$stateTopic"
+    val group      = s"$groupId-takeover-abort"
+    val tp         = TopicPartition(inputTopic, Partition.min)
+
+    def record(key: String, value: String) = new ProducerRecord(
+      topic     = stateTopic,
+      partition = Partition.min.some,
+      key       = key.some,
+      value     = value.some,
+    )
+
+    // the id the module derives for this partition: the crashed owner is what a previous incarnation of
+    // the module's own producer would have been
+    val crashedProducer =
+      producerOf(
+        producerConfig.copy(
+          transactionalId    = s"$appId-${Partition.min.value}".some,
+          idempotence        = true,
+          transactionTimeout = 1.minute,
+        )
+      )
+
+    val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[IO, String](
+      consumerOf = consumerOf,
+      producerOf = producerOf,
+      config = KafkaPersistenceModule.TransactionalConfig(
+        consumerConfig        = consumerConfig,
+        producerConfig        = producerConfig,
+        transactionalIdPrefix = appId,
+        snapshotTopic         = stateTopic,
+      ),
+    )
+
+    val test = createTopic(stateTopic, 1) *> createTopic(inputTopic, 1) *>
+      withJoinedConsumer(group, inputTopic) { current =>
+        crashedProducer.use { crashed =>
+          for {
+            _ <- crashed.initTransactions
+            // a committed snapshot, so recovery has something real to return
+            _ <- crashed.beginTransaction
+            _ <- crashed.send(record("key-committed", "committed")).flatten
+            _ <- crashed.commitTransaction
+            // the crash: a transaction left open - never committed, aborted or closed
+            _    <- crashed.beginTransaction
+            _    <- crashed.send(record("key-dangling", "dangling")).flatten
+            lso0 <- endOffset(stateTopic, IsolationLevel.ReadCommitted)
+            hw0  <- endOffset(stateTopic, IsolationLevel.ReadUncommitted)
+            _     = assert(clue(lso0.value) < clue(hw0.value), "expected the dangling transaction to pin the LSO")
+            // the takeover: acquiring the module runs initTransactions on the partition's stable id
+            stored <- moduleOf.make(PartitionAssignment(tp, Offset.min, IO.pure(current.some))).use { _ =>
+              for {
+                lso1 <- endOffset(stateTopic, IsolationLevel.ReadCommitted)
+                hw1  <- endOffset(stateTopic, IsolationLevel.ReadUncommitted)
+                // the pin is resolved by the init itself - recovery starts unpinned, nothing to wait out
+                _ = assertEquals(
+                  clue(lso1),
+                  clue(hw1),
+                  "expected the takeover's init to abort the dangling transaction"
+                )
+                stored <- readSnapshots(stateTopic)
+              } yield stored
+            }
+          } yield {
+            assertEquals(clue(stored.get("key-committed")), utf8("committed"))
+            assertEquals(clue(stored.get("key-dangling")), none[ByteVector])
+          }
         }
       }
 

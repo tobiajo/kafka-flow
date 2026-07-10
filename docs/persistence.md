@@ -129,9 +129,10 @@ Limitations:
   `flushOnRevoke` does not shrink the replay window there (see the design doc for why).
 - After a hard crash, the failed owner's in-flight transaction is aborted when the partition's next
   owner initializes its producer (the stable `transactional.id`); until then — or after
-  `transaction.timeout.ms` at the latest — it pins the snapshot topic's last-stable-offset, which no
-  `read_committed` reader of the *snapshot topic* can see past; recovery waits such a pin out rather
-  than reading short of it. Output topics are unaffected (output stays outside the transaction).
+  `transaction.timeout.ms` plus the broker's abort-scan interval (default 10 s) at the latest — it pins
+  the snapshot topic's last-stable-offset, which no `read_committed` reader of the *snapshot topic* can
+  see past; recovery waits such a pin out rather than reading short of it. Output topics are unaffected
+  (output stays outside the transaction).
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (one snapshot partition per input
   partition); a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

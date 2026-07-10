@@ -143,8 +143,10 @@ transaction later at the offset-commit fence — and **any transaction it left o
 spot**. That abort is the reason for the choice: a hard-crashed owner's dangling transaction otherwise
 survives until `transaction.timeout.ms` and pins the snapshot topic's last-stable-offset — the horizon
 `read_committed` readers (recovery included) cannot see past. With takeover-abort the pin does not
-outlive the handover; recovery additionally waits out any pin a takeover cannot abort (a foreign
-producer's transaction on the snapshot topic) rather than reading short of it.
+outlive the handover — the abort's markers are written and replicated before `initTransactions`
+returns, and the module initializes its producer before recovery reads, so recovery starts unpinned;
+it additionally waits out any pin a takeover cannot abort (a foreign producer's transaction on the
+snapshot topic) rather than reading short of it.
 
 No safety is asked of the epoch fence, and none should be: the generation bound into every commit is
 what fences stale owners, and in a rare corner the epoch order can even invert ownership — a stale
@@ -289,7 +291,15 @@ shows corruption with the plain shared producer (no offset binding); the prevent
 with an *older consumer generation* and asserts the newer snapshot survives — isolating the offset
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
 fenced writer fails its next flush and its aborted transaction neither blocks nor leaks into recovery,
-concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
+concurrent-write safety. Recovery's read bound is pinned from both sides: an open transaction under a
+foreign id stays genuinely open through the read, which must wait it out — returning the committed
+snapshot beyond the pin, dropping the timed-out record — while its counterpart crashes an owner
+mid-transaction under the partition's own stable id and asserts the takeover's init resolves the pin
+before recovery reads (also pinning the `{prefix}-{partition}` id format against regression).
+`ReadSnapshotsSpec` (unit, stubbed consumers) fails a read bounded by its own `read_committed` end
+offset instead of the `read_uncommitted` one, and requires a read stalled past any transaction's
+possible lifetime to fail with `RecoveryReadStalledError` rather than hang or complete short. The
+group commit is exercised in isolation by `GroupCommitSpec`, a unit test
 with a recording in-memory producer (no broker). The teardown-await the fence depends on for just-lost
 partitions (Mechanism, last key point) is pinned by `TopicFlowSpec` "remove awaits the flow teardown",
 so a refactor to fire-and-forget teardown fails the build rather than silently reopening the gap.
