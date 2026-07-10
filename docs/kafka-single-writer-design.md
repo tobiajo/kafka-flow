@@ -101,8 +101,12 @@ Key points:
   does not close this — it applies only to lagging commits.) That is closed client-side: a revoked partition's
   flows are torn down inside the synchronous revoke callback, and the broker does not reassign the
   partition until the client acknowledges the revocation — which it cannot do until that callback
-  returns. So no new owner exists while a flow for the partition is still alive (the await is pinned by a
-  unit test; see Testing).
+  returns. So while the member stays in the group, no new owner exists while a flow for the partition is
+  still alive (the await is pinned by a unit test; see Testing). The one way out of that coupling is
+  eviction: teardown stalling past the rebalance timeout gets the member kicked and the partition
+  reassigned over the still-live flows — but eviction leaves the member's generation behind the group's,
+  so those flows' commits are fenced. The gap closes by teardown in the normal path and by the fence in
+  the eviction path; nothing relies on the timeout never firing.
 
 The mechanism needs the input topic-partition and a reader of the driving consumer's group metadata
 (`Consumer.groupMetadata`, refreshed after every poll on the poll thread). Both are supplied by the flow
@@ -134,8 +138,9 @@ producer gets a unique `transactional.id` (`"{prefix}-{partition}-{uuid8}"`), so
 never share one. A *stable* per-partition id would add cross-owner epoch fencing, which is both
 redundant and harmful: with a shared id each `initTransactions` bumps the epoch and fences the
 previous holder, so whichever owner inits *latest* wins — a race unrelated to who actually owns the
-partition. A slow stale owner that inits late therefore wins the epoch, its stale write lands (the
-fence fails), and the true owner is fenced instead.
+partition. A slow stale owner that inits late therefore wins the epoch: the epoch fence stops nothing
+it should — only the generation fence still catches the stale write — while fencing the true owner. A
+pure availability loss with no safety gain.
 
 The cost of unique ids — transaction-coordinator state expiring via `transactional.id.expiration.ms` —
 is accepted. A hard-crashed owner's in-flight transaction is, for the same reason, not fenced on the
@@ -151,7 +156,7 @@ under the consumer protocol
 GA in Kafka 4.0, selected by `group.protocol=consumer`); they play the same role, and below *generation*
 stands for both. (KIP-1251, below, adds a separate per-partition *assignment epoch*.) The fence works
 under both because it never depends on a rebalance callback — the generation is tracked by the post-poll
-read (above), and the broker-side fence is protocol-agnostic.
+read (above), and the broker-side fence holds under both.
 
 Why a callback would miss the silent bump (above) is protocol-specific: under the consumer protocol the
 epoch advances on the background heartbeat thread and fires no rebalance callback at all; under the
@@ -187,7 +192,9 @@ The revoke-time flush is a separate case, and the one place the three differ in 
 lands. The **consumer** protocol reaches the same outcome differently: the coordinator keeps the member
 on its epoch until it acknowledges the revocation, and the flush runs before that acknowledgement. Only
 classic **cooperative** fences it: the member is already on the new generation by revoke time, so the
-flush — carrying the generation from the prior poll — is rejected (safe; the new owner replays).
+flush — carrying the generation from the prior poll — is rejected (safe; the new owner replays). All
+three outcomes assume the member is still in the group at flush time; one evicted meanwhile (rebalance
+or session timeout) is fenced regardless — the same safe direction.
 
 ## Write path: group-committed transactions
 

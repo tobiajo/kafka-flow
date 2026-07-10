@@ -24,9 +24,9 @@ trait Consumer[F[_]] {
 
   def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]): F[Unit]
 
-  /** Last consumer group metadata observed from the consumer (refreshed after each poll), used to fence a stale owner
-    * by generation when binding offset commits into a producer transaction (KIP-447). `None` until the consumer has
-    * joined a group.
+  /** Latest joined-generation group metadata read from the consumer (refreshed after each poll; a pre-join unknown
+    * value is never published), used to fence a stale owner by generation when binding offset commits into a producer
+    * transaction (KIP-447). `None` until the consumer has joined a group.
     */
   def groupMetadata: F[Option[ConsumerGroupMetadata]]
 
