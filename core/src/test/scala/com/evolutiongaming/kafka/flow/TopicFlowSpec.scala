@@ -26,7 +26,7 @@ class TopicFlowSpec extends FunSuite {
     val generation =
       ConsumerGroupMetadata(groupId = "group", generationId = 42, memberId = "member", groupInstanceId = none)
 
-    // a consumer whose generation is a distinctive sentinel, so we can tell it apart from a `pure(none)` regression
+    // a consumer reporting a distinctive generation, distinguishable from a `pure(none)` regression
     val consumer = new Consumer[IO] {
       def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[IO]): IO[Unit] = IO.unit
       def poll(timeout: FiniteDuration): IO[ConsumerRecords[String, ByteVector]]    = ConsumerRecords.empty.pure[IO]

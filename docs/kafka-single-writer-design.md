@@ -97,7 +97,8 @@ Key points:
   fire-and-forget commit thread.
 - The fence is per **member + generation**, not per partition: the coordinator checks the committer's
   generation, not which partitions it still owns, so a member still on the current generation cannot be
-  stopped from committing a partition it just lost. That is closed client-side: a revoked partition's
+  stopped from committing a partition it just lost. (KIP-1251's per-partition assignment epoch, below,
+  does not close this — it applies only to lagging commits.) That is closed client-side: a revoked partition's
   flows are torn down inside the synchronous revoke callback, and the broker does not reassign the
   partition until the client acknowledges the revocation — which it cannot do until that callback
   returns. So no new owner exists while a flow for the partition is still alive.
@@ -274,7 +275,9 @@ with an *older consumer generation* and asserts the newer snapshot survives — 
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
 fenced writer fails its next flush, an open transaction neither blocks nor leaks into recovery,
 concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
-with a recording in-memory producer (no broker).
+with a recording in-memory producer (no broker). The teardown-await the fence depends on for just-lost
+partitions (Mechanism, last key point) is pinned by `TopicFlowSpec` "remove awaits the flow teardown",
+so a refactor to fire-and-forget teardown fails the build rather than silently reopening the gap.
 
 ## Rejected alternatives
 
@@ -294,8 +297,9 @@ with a recording in-memory producer (no broker).
   timeout.
 - **Transactional output produces (full exactly-once)**: out of scope; output stays at-least-once.
 - **Capturing the generation in a rebalance callback** (instead of the post-poll read): the bump that
-  matters delivers no callback the typed listener can act on (see Consumer rebalance protocols), so only
-  a post-poll read observes it across both protocols.
+  matters fires no callback the typed listener can act on under the consumer protocol or the classic
+  cooperative assignor, and relying on the classic eager full re-delivery would not port to the other
+  two (see Consumer rebalance protocols); only a post-poll read observes it under all three.
 
 ## Forward-looking
 
