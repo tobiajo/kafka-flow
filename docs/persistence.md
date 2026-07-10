@@ -82,10 +82,9 @@ val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[F, State](
 
 `idempotence` and the per-partition `transactional.id` are set for you — don't configure them in
 `producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
-The id is regenerated per assignment, not stable per partition. The input topic whose offsets are
-committed transactionally, and the consumer generation used to fence stale writers, are both supplied
-by the flow (from the assigned partition and the driving consumer), so neither is part of
-`TransactionalConfig`. One module serves one flow: snapshots are keyed by partition *number* alone, so
+The id is regenerated per assignment, not stable per partition. The input topic and the fencing
+generation are supplied by the flow (from the assigned partition and the driving consumer), so neither
+is part of `TransactionalConfig`. One module serves one flow: snapshots are keyed by partition *number* alone, so
 each input topic needs its own module with its own `snapshotTopic` — sharing a snapshot topic between
 flows would mix their state on recovery.
 

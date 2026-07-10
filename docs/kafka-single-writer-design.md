@@ -105,12 +105,11 @@ Key points:
   flows are torn down inside the synchronous revoke callback, and the broker does not reassign the
   partition until the client acknowledges the revocation — which it cannot do until that callback
   returns. So while the member stays in the group, no new owner exists while a flow for the partition is
-  still alive (the await is pinned by a unit test; see Testing). The one way out of that coupling is
-  eviction: teardown stalling past the rebalance timeout gets the member kicked and the partition
-  reassigned over the still-live flows — but eviction removes the member from the group, so those flows'
-  commits fail member validation (`UNKNOWN_MEMBER_ID`, the same abortable `CommitFailedException`). The
-  gap closes by teardown in the normal path and by the broker's rejection in the eviction path; nothing
-  relies on the timeout never firing.
+  still alive (the await is pinned by a unit test; see Testing). The one way out is eviction — teardown
+  stalling past the rebalance timeout, the partition reassigned over still-live flows — which only swaps
+  the net: an evicted member is removed from the group, so those commits fail member validation
+  (`UNKNOWN_MEMBER_ID`, the same abortable `CommitFailedException`). Nothing relies on the timeout never
+  firing.
 
 The mechanism needs the input topic-partition and a reader of the driving consumer's group metadata
 (`Consumer.groupMetadata`, refreshed after every poll on the poll thread). Both are supplied by the flow
@@ -128,8 +127,7 @@ The `generationId >= 0` guard rejects any negative id, not one specific value �
 coordinator's gate, which is also a range: a transactional commit with an empty member id and *any*
 negative generation is treated as pre-KIP-447 input, for which generation validation is **skipped** — it
 would land unfenced. (The current coordinator keeps the skip for the newer consumer protocol too,
-narrowed to the unknown `−1` — KAFKA-18060 — so the guard is not legacy-only, and every skipped shape
-stays inside the guarded range.) In practice the only negative the client reports is the unknown pre-join
+narrowed to the unknown `−1` — KAFKA-18060; every skipped shape stays inside the guarded range.) In practice the only negative the client reports is the unknown pre-join
 value: after falling out of the group it does not reset back to unknown but keeps the last generation it
 joined, so a fallen-out owner stays fenced by its own stale token. Dropping the pre-join value leaves the
 tracked metadata empty until the first join completes, and a flush in that window — unreachable on the
@@ -165,9 +163,9 @@ The per-member fencing token is the **generation** under the classic protocol an
 under the consumer protocol
 ([KIP-848](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol),
 GA in Kafka 4.0, selected by `group.protocol=consumer`); they play the same role, and below *generation*
-stands for both. (KIP-1251, below, adds a separate per-partition *assignment epoch*.) The fence works
-under both because it never depends on a rebalance callback — the generation is tracked by the post-poll
-read (above), and the broker-side fence holds under both.
+stands for both. (KIP-1251, below, adds a separate per-partition *assignment epoch*.) The fence works under
+both: it never depends on a rebalance callback — the generation is tracked by the post-poll read
+(above) — and the broker-side fence holds under each.
 
 Why a callback would miss the silent bump (above) is protocol-specific: under the consumer protocol the
 epoch advances on the background heartbeat thread and fires no rebalance callback at all; under the
@@ -197,8 +195,7 @@ still-owned partition, so a retained partition's lagging commit is accepted rath
 why the consumer protocol carries a **broker** version floor and the classic protocol does not: below
 4.3.0 the consumer-protocol residual is not absorbed and crashes the still-valid owner —
 safe, but not stable — so brokers 4.3.0+ are recommended for `group.protocol=consumer`; the classic
-in-flight-round residual is absorbed by no broker version, so there is no version to prefer. KIP-1251
-changes the consumer-protocol coordinator only.
+in-flight-round residual is absorbed by no broker version, so there is no version to prefer.
 
 The revoke-time flush is a separate case, and the one place the three differ in outcome. Classic
 **eager** revokes before the member rejoins, so the flush commits under the still-valid generation and
@@ -206,8 +203,8 @@ lands. The **consumer** protocol reaches the same outcome differently: the coord
 on its epoch until it acknowledges the revocation, and the flush runs before that acknowledgement. Only
 classic **cooperative** fences it: the member is already on the new generation by revoke time, so the
 flush — carrying the generation from the prior poll — is rejected (safe; the new owner replays). All
-three outcomes assume the member is still in the group at flush time; one evicted meanwhile (rebalance
-or session timeout) is fenced regardless — the same safe direction.
+three assume the member is still in the group at flush time; one evicted meanwhile is rejected
+regardless — the same safe direction.
 
 ## Write path: group-committed transactions
 
@@ -294,7 +291,7 @@ real eager-recovery (every key recovered on assignment) and flush-on-revoke mach
 shows corruption with the plain shared producer (no offset binding); the prevention drives a stale owner
 with an *older consumer generation* and asserts the newer snapshot survives — isolating the offset
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
-fenced writer fails its next flush, a fenced writer's aborted transaction neither blocks nor leaks into recovery,
+fenced writer fails its next flush and its aborted transaction neither blocks nor leaks into recovery,
 concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
 with a recording in-memory producer (no broker). The teardown-await the fence depends on for just-lost
 partitions (Mechanism, last key point) is pinned by `TopicFlowSpec` "remove awaits the flow teardown",
