@@ -5,7 +5,12 @@ import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.LogOf
 import com.evolutiongaming.kafka.flow.PartitionAssignment
-import com.evolutiongaming.skafka.consumer.{Consumer as SkafkaConsumer, ConsumerConfig, ConsumerGroupMetadata, ConsumerOf}
+import com.evolutiongaming.skafka.consumer.{
+  Consumer as SkafkaConsumer,
+  ConsumerConfig,
+  ConsumerGroupMetadata,
+  ConsumerOf
+}
 import com.evolutiongaming.skafka.producer.{Producer, ProducerConfig, ProducerOf}
 import com.evolutiongaming.skafka.{CommonConfig, FromBytes, Offset, Partition, TopicPartition}
 import munit.FunSuite
@@ -35,7 +40,9 @@ class KafkaPersistenceModuleSpec extends FunSuite {
         def apply[K, V](
           config: ConsumerConfig
         )(implicit fromBytesK: FromBytes[IO, K], fromBytesV: FromBytes[IO, V]) =
-          Resource.eval(IO.raiseError[SkafkaConsumer[IO, K, V]](new IllegalStateException("consumer opened at acquisition")))
+          Resource.eval(
+            IO.raiseError[SkafkaConsumer[IO, K, V]](new IllegalStateException("consumer opened at acquisition"))
+          )
       }
       moduleOf = KafkaPersistenceModuleOf.cachingTransactional[IO, String](
         consumerOf = consumerOf,
