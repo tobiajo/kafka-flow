@@ -11,6 +11,7 @@ import com.evolutiongaming.skafka.consumer.{
   ConsumerConfig,
   ConsumerOf,
   ConsumerRecord,
+  IsolationLevel,
   WithSize
 }
 import scodec.bits.ByteVector
@@ -63,27 +64,42 @@ object KafkaPartitionPersistence {
     snapshotTopic: Topic,
     partition: Partition,
   )(implicit fromBytes: FromBytes[F, String]): F[BytesByKey] = {
-    consumerOf
-      .apply[String, ByteVector](
-        consumerConfig.copy(
-          autoOffsetReset = Earliest,
-          common = consumerConfig
-            .common
-            .copy(clientId = consumerConfig.common.clientId.map(cid => s"$cid-snapshot-$partition"))
-        )
-      )
-      .use { consumer =>
-        val snapshotsPartition =
-          TopicPartition(topic = snapshotTopic, partition = partition)
+    val snapshotsPartition         = TopicPartition(topic = snapshotTopic, partition = partition)
+    val snapshotPartitionSingleton = data.NonEmptySet.of(snapshotsPartition)
 
-        val snapshotPartitionSingleton = data.NonEmptySet.of(snapshotsPartition)
+    def suffixed(config: ConsumerConfig, suffix: String): ConsumerConfig =
+      config.copy(
+        autoOffsetReset = Earliest,
+        common          = config.common.copy(clientId = config.common.clientId.map(cid => s"$cid-$suffix"))
+      )
+
+    // The read target is the high watermark, taken with read_uncommitted. This consumer's own end offset
+    // under read_committed is the last-stable-offset, which an open transaction (e.g. of a hard-crashed
+    // previous owner, for up to its transaction.timeout.ms) pins BELOW records committed after it - a read
+    // bounded by it completes silently missing those committed snapshots. Bounding by the high watermark
+    // makes the read wait such transactions out instead: the read_committed position cannot pass the
+    // last-stable-offset until the broker resolves them, so the read completes only once everything below
+    // the target is decided. For a read_uncommitted config the two bounds coincide.
+    val highWatermark: F[Offset] =
+      consumerOf
+        .apply[String, ByteVector](
+          suffixed(consumerConfig, s"snapshot-$partition-hw").copy(isolationLevel = IsolationLevel.ReadUncommitted)
+        )
+        .use { consumer =>
+          consumer.endOffsets(snapshotPartitionSingleton).flatMap { endOffsets =>
+            BracketThrowable[F].fromOption(
+              endOffsets.get(snapshotsPartition),
+              MissingOffsetError(snapshotsPartition)
+            )
+          }
+        }
+
+    consumerOf
+      .apply[String, ByteVector](suffixed(consumerConfig, s"snapshot-$partition"))
+      .use { consumer =>
         for {
-          _          <- consumer.assign(snapshotPartitionSingleton)
-          endOffsets <- consumer.endOffsets(snapshotPartitionSingleton)
-          targetOffset <- BracketThrowable[F].fromOption(
-            endOffsets.get(snapshotsPartition),
-            MissingOffsetError(snapshotsPartition)
-          )
+          _            <- consumer.assign(snapshotPartitionSingleton)
+          targetOffset <- highWatermark
           bytesByKey <- readPartition(
             consumer,
             snapshotsPartition,
