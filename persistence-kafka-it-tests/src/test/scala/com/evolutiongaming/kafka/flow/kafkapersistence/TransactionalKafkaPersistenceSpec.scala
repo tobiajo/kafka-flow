@@ -5,6 +5,7 @@ import cats.effect.unsafe.IORuntime
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.{FromTry, Log, LogOf}
+import com.evolutiongaming.kafka.flow.kafka.Codecs.*
 import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
 import com.evolutiongaming.kafka.flow.registry.EntityRegistry
 import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
@@ -70,6 +71,13 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     * `read_committed` matches the transactional mode; it is equally correct for reading topics written without
     * transactions, where it behaves the same as `read_uncommitted`.
     */
+  private def endOffset(stateTopic: String, isolation: IsolationLevel): IO[Offset] = {
+    val tp = TopicPartition(stateTopic, Partition.min)
+    consumerOf
+      .apply[String, ByteVector](consumerConfig.copy(isolationLevel = isolation))
+      .use(_.endOffsets(cats.data.NonEmptySet.of(tp)).map(_.getOrElse(tp, Offset.min)))
+  }
+
   private def readSnapshots(stateTopic: String): IO[BytesByKey] =
     KafkaPartitionPersistence.readSnapshots[IO](
       consumerOf     = consumerOf,
@@ -481,6 +489,12 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
               producerB.send(record("key-committed", "committed")).flatten *>
               producerB.commitTransaction
           }
+          // the pin must be active when the read starts: without this check, a slow runner where the
+          // broker has already timed A out degrades the test to the aborted case, silently not
+          // exercising the wait
+          lso <- endOffset(stateTopic, IsolationLevel.ReadCommitted)
+          hw  <- endOffset(stateTopic, IsolationLevel.ReadUncommitted)
+          _    = assert(clue(lso.value) < clue(hw.value), "expected an open-transaction pin at read start")
           // A's transaction is still open here; the read must wait for the broker to time it out
           stored <- readSnapshots(stateTopic).timeout(60.seconds)
         } yield {
