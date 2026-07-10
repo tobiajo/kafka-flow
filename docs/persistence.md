@@ -92,7 +92,7 @@ flows would mix their state on recovery.
 `transactionalIdPrefix` does not affect fencing (that is by consumer generation) — it is a readable
 label and, on an ACL-secured cluster, the `transactional.id` prefix your producer principal must be
 authorized for. Use your `applicationId`; an application running several flows can append any per-flow
-discriminator (e.g. the input topic) — an `"<applicationId>*"` prefixed ACL still covers it.
+discriminator (e.g. the input topic) — a PREFIXED-pattern ACL on `<applicationId>` still covers it.
 
 Snapshot writes and the input-offset commit run in one Kafka transaction per assigned partition; a
 write from a stale consumer generation is fenced by the broker
@@ -133,7 +133,9 @@ Limitations:
 - The fence works under both the **classic** and the **consumer** group protocols
   (`group.protocol=classic|consumer`). With `consumer`, use **brokers 4.3.0+** — below that a still-valid
   owner can be spuriously fenced during a rebalance and crash-loop on the restart (safe, never corruption,
-  but not stable). See [Consumer rebalance protocols](kafka-single-writer-design.md#consumer-rebalance-protocols)
+  but not stable). Note the consumer protocol is not yet selectable through skafka's `ConsumerConfig`;
+  this documents the fence for when it becomes so. See
+  [Consumer rebalance protocols](kafka-single-writer-design.md#consumer-rebalance-protocols)
   in the design doc.
 
 ### Custom snapshot storage

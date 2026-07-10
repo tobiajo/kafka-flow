@@ -46,8 +46,8 @@ object KafkaPersistenceModule {
     *   prefix for `transactional.id` (partition number and a unique per-producer suffix are appended). It does not
     *   affect fencing (that is by consumer generation), so its only roles are a readable label and, on an ACL-secured
     *   cluster, the `transactional.id` prefix the producer principal must be authorized for. Use your `applicationId`;
-    *   an application running several flows can append any per-flow discriminator (e.g. the input topic), which an
-    *   `"<applicationId>*"` prefixed ACL still covers.
+    *   an application running several flows can append any per-flow discriminator (e.g. the input topic), which a
+    *   PREFIXED-pattern ACL on `<applicationId>` still covers.
     * @param snapshotTopic
     *   snapshot topic name (should be configured as a 'compacted' topic) to read/write snapshots
     * @param maxWritesPerTransaction

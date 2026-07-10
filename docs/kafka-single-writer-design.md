@@ -42,7 +42,8 @@ In the default (non-transactional) mode the input offsets are committed through 
 transaction** via `sendOffsetsToTransaction(offsets, consumerGroupMetadata)`
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics)):
 the metadata carries the consumer's **generation**, so the group coordinator validates it and rejects a
-stale one (`ILLEGAL_GENERATION`, surfaced to the client as `CommitFailedException`).
+stale one (`ILLEGAL_GENERATION`, surfaced to the client as `CommitFailedException`). Brokers 2.5+ are
+required — KIP-447's `TxnOffsetCommit` v3 is what carries the generation to the coordinator at all.
 Since that commit and the snapshot writes share a transaction, the rejection aborts the writes too.
 The generation gates both, so a stale owner can neither advance offsets nor overwrite a newer snapshot.
 
@@ -55,15 +56,15 @@ commit. Binding them in one transaction is the link.
 
 ```mermaid
 sequenceDiagram
-    participant B as Stale owner<br/>(old generation)
+    participant S as Stale owner<br/>(old generation)
     participant TC as Broker<br/>(txn + group coordinator)
     participant ST as Snapshot topic
 
-    B->>TC: beginTransaction
-    B->>ST: send stale snapshot (buffered in txn)
-    B->>TC: sendOffsetsToTransaction(offset, gen=old)
-    TC-->>B: ILLEGAL_GENERATION (partition reassigned)
-    B->>TC: abort — stale snapshot never committed
+    S->>TC: beginTransaction
+    S->>ST: send stale snapshot (uncommitted in txn)
+    S->>TC: sendOffsetsToTransaction(offset, gen=old)
+    TC-->>S: ILLEGAL_GENERATION (stale generation —<br/>the group has rebalanced since)
+    S->>TC: abort — stale snapshot never committed
     Note over ST: newer snapshot (new owner's) survives
 ```
 
@@ -71,7 +72,8 @@ This is corruption prevention, not exactly-once. Output produces go through the 
 producer, and the transaction wraps only the snapshot write and the offset commit, so they stay outside
 it — enrolling them would be full transactional output, an explicit non-goal (see Rejected alternatives).
 Output is therefore at-least-once: a replayed batch re-emits it, so the consuming side must tolerate
-duplicates. The **committable offset** — the minimum offset still held across the partition's keys — is
+duplicates. The **committable offset** — the minimum offset still held across the partition's keys, or
+the last processed offset once nothing is held — is
 never ahead of the persisted snapshots: an offset becomes committable only after its snapshot is
 persisted, so recovery never skips events.
 
@@ -79,7 +81,8 @@ Key points:
 
 - **Every** transaction commits the partition's current committable offset, so every write is gated. The
   offset itself advances only on the periodic offset-commit interval (`commitOffsetsInterval`, separate
-  from the snapshot-flush interval `persistEvery`) or on revoke; a snapshot write never advances it, it
+  from the snapshot-flush interval `persistEvery`) or, opt-in, on revoke (`PartitionFlowConfig.commitOnRevoke`,
+  off by default); a snapshot write never advances it, it
   just re-commits the current value to stay gated. That advance is committed in a transaction — batching
   in any snapshot writes queued at that moment, or committing the offset alone (an *offset-only*
   transaction) when there are none.
@@ -104,9 +107,10 @@ Key points:
   returns. So while the member stays in the group, no new owner exists while a flow for the partition is
   still alive (the await is pinned by a unit test; see Testing). The one way out of that coupling is
   eviction: teardown stalling past the rebalance timeout gets the member kicked and the partition
-  reassigned over the still-live flows — but eviction leaves the member's generation behind the group's,
-  so those flows' commits are fenced. The gap closes by teardown in the normal path and by the fence in
-  the eviction path; nothing relies on the timeout never firing.
+  reassigned over the still-live flows — but eviction removes the member from the group, so those flows'
+  commits fail member validation (`UNKNOWN_MEMBER_ID`, the same abortable `CommitFailedException`). The
+  gap closes by teardown in the normal path and by the broker's rejection in the eviction path; nothing
+  relies on the timeout never firing.
 
 The mechanism needs the input topic-partition and a reader of the driving consumer's group metadata
 (`Consumer.groupMetadata`, refreshed after every poll on the poll thread). Both are supplied by the flow
@@ -167,25 +171,27 @@ re-delivers the full assignment a callback could see — and relying on that wou
 two. The post-poll read observes it under all three: classic eager, classic cooperative, and the
 consumer protocol.
 
-Under the **classic** protocol that read is sufficient on its own: generation *advances* land in the
-group metadata only inside `poll` (a background fence or leave does not touch it — the client keeps
-reporting the last joined generation, which can only self-fence), so the post-poll read observes each
-advance before the flush that follows — a silent bump cannot spuriously fence a retained partition, on
-any broker version. Under
-the **consumer** protocol the epoch also advances on the background thread *between* polls, so even a
-post-poll read can be stale by the time the commit reaches the broker; the read narrows that window but
-cannot fully close it, so a spurious fence stays possible — a liveness cost, never a safety one (a lagging
-token only fences).
+Under the **classic** protocol that read is nearly sufficient on its own: *completed* generation
+advances land in the group metadata only inside `poll` (a background fence or leave does not touch it —
+the client keeps reporting the last joined generation, which can only self-fence), so the post-poll read
+observes every completed advance before the flush that follows. What remains is the in-flight round: a
+join round can span polls (KIP-266), the broker bumps the generation when all members have joined, and a
+flush of a retained partition between that bump and this member's sync still carries the previous
+generation — spuriously fenced, on any broker version, and absorbed by nothing; safe, but the
+still-valid owner crashes. Under the **consumer** protocol the epoch additionally advances on the
+background thread *between* polls with no round in flight at all, so even a post-poll read can be stale
+by the time the commit reaches the broker; the read narrows that window but cannot fully close it — the
+same liveness cost, never a safety one (a lagging token only fences).
 
-That residual fence is **consumer-protocol only**, and it is what
+The between-polls residual is **consumer-protocol only**, and it is what
 [KIP-1251](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1251%3A+Assignment+epochs+for+consumer+groups),
 a broker-side coordinator change in Kafka 4.3.0, absorbs: it relaxes the offset-commit epoch check for a
-still-owned partition, so a retained partition's lagging commit is accepted rather than rejected. This is
-why the consumer protocol carries a **broker** version floor the classic protocol does not — below 4.3.0 the
-residual fence is not absorbed and crashes the still-valid owner: safe, but not stable — so brokers
-4.3.0+ are recommended for `group.protocol=consumer`.
-The classic protocol is unaffected: KIP-1251 changes the consumer-protocol coordinator only, and the
-classic exact-generation check needs no floor.
+still-owned partition, so a retained partition's lagging commit is accepted rather than rejected. That is
+why the consumer protocol carries a **broker** version floor and the classic protocol does not: below
+4.3.0 the (much wider) consumer-protocol residual is not absorbed and crashes the still-valid owner —
+safe, but not stable — so brokers 4.3.0+ are recommended for `group.protocol=consumer`; the classic
+in-flight-round residual is absorbed by no broker version, so there is no version to prefer. KIP-1251
+changes the consumer-protocol coordinator only.
 
 The revoke-time flush is a separate case, and the one place the three differ in outcome. Classic
 **eager** revokes before the member rejoins, so the flush commits under the still-valid generation and
@@ -222,7 +228,7 @@ Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current cod
 
 - **Group-committed transactional writes** — `KafkaSnapshotWriteDatabase.transactional` (the
   `GroupCommit` machinery); the per-partition transactional producer is built in `KafkaPersistenceModule`.
-- **Offset commit** (on the periodic tick / on revoke; an offset-only transaction when no snapshot
+- **Offset commit** (on the periodic tick / on revoke with `commitOnRevoke`; an offset-only transaction when no snapshot
   writes are pending) — `ScheduleCommit`.
 - **Consumer-commit reroute** — at wiring the module's `scheduleCommit` (the transactional `ScheduleCommit`)
   overrides the default consumer-backed one (`kafkaPersistenceModule.scheduleCommit.getOrElse(...)` in the
@@ -281,7 +287,7 @@ real eager-recovery (every key recovered on assignment) and flush-on-revoke mach
 shows corruption with the plain shared producer (no offset binding); the prevention drives a stale owner
 with an *older consumer generation* and asserts the newer snapshot survives — isolating the offset
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
-fenced writer fails its next flush, an open transaction neither blocks nor leaks into recovery,
+fenced writer fails its next flush, a fenced writer's aborted transaction neither blocks nor leaks into recovery,
 concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
 with a recording in-memory producer (no broker). The teardown-await the fence depends on for just-lost
 partitions (Mechanism, last key point) is pinned by `TopicFlowSpec` "remove awaits the flow teardown",
