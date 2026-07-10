@@ -24,9 +24,10 @@ trait Consumer[F[_]] {
 
   def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]): F[Unit]
 
-  /** Latest joined-generation group metadata read from the consumer (refreshed after each poll; a pre-join unknown
-    * value is never published), used to fence a stale owner by generation when binding offset commits into a producer
-    * transaction (KIP-447). `None` until the consumer has joined a group.
+  /** Group metadata used to fence a stale owner by generation when binding offset commits into a producer
+    * transaction (KIP-447). `None` until the consumer has joined a group; never an unknown (negative) generation - a
+    * commit carrying one would land unfenced. How the value is kept current is implementation-specific (`of` refreshes
+    * it after every poll).
     */
   def groupMetadata: F[Option[ConsumerGroupMetadata]]
 
@@ -53,7 +54,8 @@ object Consumer {
       // (https://github.com/evolution-gaming/skafka/issues/581), so only a read tracks it. The join round may
       // span polls (KIP-266: poll(Duration) does not block on it), so the read converges on the poll after the
       // round completes; the interim lag only self-fences. Revoked partitions were torn down inside the poll
-      // under the pre-rebalance generation, so every flow still alive is owned in the one just read.
+      // under the pre-rebalance generation, so every flow still alive is owned in the one just read. A failed
+      // read fails the poll itself; its records are uncommitted and simply re-polled.
       private def refresh: F[Unit] =
         consumer.groupMetadata.flatMap(publish)
 

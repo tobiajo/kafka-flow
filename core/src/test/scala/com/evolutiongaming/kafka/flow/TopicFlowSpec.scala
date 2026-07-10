@@ -19,30 +19,32 @@ class TopicFlowSpec extends FunSuite {
   private implicit val logOf: LogOf[IO]     = LogOf.empty[IO]
   private implicit val runtime: Runtime[IO] = Runtime.lift[IO]
 
-  test("add threads the driving consumer's group metadata into the partition flow") {
+  test("add threads the driving consumer's group metadata into the partition flow as a live reader") {
     val topic     = "topic"
     val partition = Partition.min
     val offset    = Offset.min
-    val generation =
+    val generation1 =
       ConsumerGroupMetadata(groupId = "group", generationId = 42, memberId = "member", groupInstanceId = none)
-
-    // a consumer reporting a distinctive generation, distinguishable from a `pure(none)` regression
-    val consumer = new Consumer[IO] {
-      def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[IO]): IO[Unit] = IO.unit
-      def poll(timeout: FiniteDuration): IO[ConsumerRecords[String, ByteVector]]    = ConsumerRecords.empty.pure[IO]
-      def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]): IO[Unit] = IO.unit
-      def groupMetadata: IO[Option[ConsumerGroupMetadata]]                          = generation.some.pure[IO]
-    }
+    val generation2 = generation1.copy(generationId = 43)
 
     val test = for {
-      captured <- Ref.of[IO, Option[ConsumerGroupMetadata]](none)
+      underlying <- Ref.of[IO, Option[ConsumerGroupMetadata]](generation1.some)
+      consumer = new Consumer[IO] {
+        def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[IO]): IO[Unit] = IO.unit
+        def poll(timeout: FiniteDuration): IO[ConsumerRecords[String, ByteVector]]    = ConsumerRecords.empty.pure[IO]
+        def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]): IO[Unit] = IO.unit
+        def groupMetadata: IO[Option[ConsumerGroupMetadata]]                          = underlying.get
+      }
+      // capture the reader itself, not its result: PartitionAssignment requires it be passed along unevaluated,
+      // so a later evaluation must observe a generation bump - a memoized (evaluate-once) regression fails here
+      captured <- Ref.of[IO, Option[IO[Option[ConsumerGroupMetadata]]]](none)
       partitionFlowOf = new PartitionFlowOf[IO] {
         def apply(
           assignment: PartitionAssignment[IO],
           scheduleCommit: ScheduleCommit[IO]
         ): Resource[IO, PartitionFlow[IO]] =
           Resource
-            .eval(assignment.groupMetadata.flatMap(captured.set))
+            .eval(captured.set(assignment.groupMetadata.some))
             .as(
               new PartitionFlow[IO] {
                 def apply(records: List[ConsumerRecord[String, ByteVector]]): IO[Unit] = IO.unit
@@ -50,9 +52,18 @@ class TopicFlowSpec extends FunSuite {
             )
       }
       result <- TopicFlow.of(consumer, topic, partitionFlowOf).use { topicFlow =>
-        topicFlow.add(NonEmptySet.of(partition -> offset)) *> captured.get
+        for {
+          _      <- topicFlow.add(NonEmptySet.of(partition -> offset))
+          reader <- captured.get.flatMap(IO.fromOption(_)(new NoSuchElementException("reader not captured")))
+          first  <- reader
+          _      <- underlying.set(generation2.some)
+          second <- reader
+        } yield (first, second)
       }
-    } yield assertEquals(result, generation.some)
+    } yield {
+      assertEquals(result._1, generation1.some)
+      assertEquals(result._2, generation2.some, "the reader must be live: a memoized value would miss the bump")
+    }
 
     test.unsafeRunSync()
   }

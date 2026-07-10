@@ -66,6 +66,18 @@ class ConsumerSpec extends FunSuite {
     test.unsafeRunSync()
   }
 
+  test("the refresh reads after the poll, not before: a join completing inside poll is visible right after it") {
+    // pins the `poll <* refresh` order. The underlying metadata advances INSIDE poll (as a completing join
+    // does, on the poll thread) and must be visible immediately after that same poll - a pre-poll read
+    // (`refresh *> poll`) would still see the pre-join state and, on the first join, leave None published
+    val test = for {
+      underlying <- Ref.of[IO, ConsumerGroupMetadata](unknown)
+      consumer   <- Consumer.of[IO](kafkaConsumer(underlying, onPoll = underlying.set(joined(7))))
+      after      <- consumer.poll(1.millis) *> consumer.groupMetadata
+    } yield assertEquals(after, joined(7).some, "the read must follow the poll that completed the join")
+    test.unsafeRunSync()
+  }
+
   test("generation 0 is published: the guard is a range check (>= 0), not a -1 test") {
     // 0 is never a live classic generation, but it is inside the guarded range: the coordinator's
     // compatibility skip fires only on negatives, so 0 reaches real validation and only self-fences
@@ -78,24 +90,28 @@ class ConsumerSpec extends FunSuite {
     test.unsafeRunSync()
   }
 
-  // only poll and groupMetadata matter to Consumer.of; everything else delegates to the empty consumer
-  private def kafkaConsumer(meta: Ref[IO, ConsumerGroupMetadata]): SkafkaConsumer[IO, String, ByteVector] =
+  // only poll and groupMetadata matter to Consumer.of; everything else delegates to the empty consumer.
+  // `onPoll` runs inside poll, to simulate state (a join) advancing on the poll itself
+  private def kafkaConsumer(
+    meta: Ref[IO, ConsumerGroupMetadata],
+    onPoll: IO[Unit] = IO.unit,
+  ): SkafkaConsumer[IO, String, ByteVector] =
     new SkafkaConsumer[IO, String, ByteVector] {
       private val delegate = SkafkaConsumer.empty[IO, String, ByteVector]
 
       def groupMetadata = meta.get
 
-      def assign(partitions: NonEmptySet[TopicPartition])                          = delegate.assign(partitions)
-      def assignment                                                               = delegate.assignment
+      def assign(partitions: NonEmptySet[TopicPartition])                         = delegate.assign(partitions)
+      def assignment                                                              = delegate.assignment
       def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[IO]) = delegate.subscribe(topics, listener)
-      def subscribe(topics: NonEmptySet[Topic])                                    = delegate.subscribe(topics)
-      def subscribe(pattern: Pattern, listener: RebalanceListener1[IO]) = delegate.subscribe(pattern, listener)
-      def subscribe(pattern: Pattern)                                   = delegate.subscribe(pattern)
-      def subscription                                                  = delegate.subscription
-      def unsubscribe                                                   = delegate.unsubscribe
-      def poll(timeout: FiniteDuration)                                 = delegate.poll(timeout)
-      def commit                                                        = delegate.commit
-      def commit(timeout: FiniteDuration)                               = delegate.commit(timeout)
+      def subscribe(topics: NonEmptySet[Topic])                                   = delegate.subscribe(topics)
+      def subscribe(pattern: Pattern, listener: RebalanceListener1[IO])   = delegate.subscribe(pattern, listener)
+      def subscribe(pattern: Pattern)                                     = delegate.subscribe(pattern)
+      def subscription                                                    = delegate.subscription
+      def unsubscribe                                                     = delegate.unsubscribe
+      def poll(timeout: FiniteDuration)                                   = onPoll *> delegate.poll(timeout)
+      def commit                                                          = delegate.commit
+      def commit(timeout: FiniteDuration)                                 = delegate.commit(timeout)
       def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]) = delegate.commit(offsets)
       def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata], timeout: FiniteDuration) =
         delegate.commit(offsets, timeout)
@@ -104,22 +120,22 @@ class ConsumerSpec extends FunSuite {
       def seek(partition: TopicPartition, offset: Offset)                      = delegate.seek(partition, offset)
       def seek(partition: TopicPartition, offsetAndMetadata: OffsetAndMetadata) =
         delegate.seek(partition, offsetAndMetadata)
-      def seekToBeginning(partitions: NonEmptySet[TopicPartition]) = delegate.seekToBeginning(partitions)
-      def seekToEnd(partitions: NonEmptySet[TopicPartition])       = delegate.seekToEnd(partitions)
-      def position(partition: TopicPartition)                      = delegate.position(partition)
+      def seekToBeginning(partitions: NonEmptySet[TopicPartition])     = delegate.seekToBeginning(partitions)
+      def seekToEnd(partitions: NonEmptySet[TopicPartition])           = delegate.seekToEnd(partitions)
+      def position(partition: TopicPartition)                          = delegate.position(partition)
       def position(partition: TopicPartition, timeout: FiniteDuration) = delegate.position(partition, timeout)
       def committed(partitions: NonEmptySet[TopicPartition])           = delegate.committed(partitions)
       def committed(partitions: NonEmptySet[TopicPartition], timeout: FiniteDuration) =
         delegate.committed(partitions, timeout)
-      def clientInstanceId(timeout: FiniteDuration)      = delegate.clientInstanceId(timeout)
-      def clientMetrics                                  = delegate.clientMetrics
-      def partitions(topic: Topic)                       = delegate.partitions(topic)
+      def clientInstanceId(timeout: FiniteDuration)         = delegate.clientInstanceId(timeout)
+      def clientMetrics                                     = delegate.clientMetrics
+      def partitions(topic: Topic)                          = delegate.partitions(topic)
       def partitions(topic: Topic, timeout: FiniteDuration) = delegate.partitions(topic, timeout)
-      def topics                                             = delegate.topics
-      def topics(timeout: FiniteDuration)                    = delegate.topics(timeout)
-      def paused                                             = delegate.paused
-      def pause(partitions: NonEmptySet[TopicPartition])     = delegate.pause(partitions)
-      def resume(partitions: NonEmptySet[TopicPartition])    = delegate.resume(partitions)
+      def topics                                            = delegate.topics
+      def topics(timeout: FiniteDuration)                   = delegate.topics(timeout)
+      def paused                                            = delegate.paused
+      def pause(partitions: NonEmptySet[TopicPartition])    = delegate.pause(partitions)
+      def resume(partitions: NonEmptySet[TopicPartition])   = delegate.resume(partitions)
       def offsetsForTimes(timestampsToSearch: Map[TopicPartition, Offset]) =
         delegate.offsetsForTimes(timestampsToSearch)
       def offsetsForTimes(timestampsToSearch: Map[TopicPartition, Offset], timeout: FiniteDuration) =
