@@ -50,23 +50,11 @@ class ReadSnapshotsSpec extends FunSuite {
     val records       = List(record(0, "k0"), record(1, "k1"), record(2, "k2"))
 
     val test = for {
-      position <- Ref.of[IO, Long](0L)
+      position    <- Ref.of[IO, Long](0L)
       readConsumer = consumer(endOffset = lso, positionRef = position, records = records)
       hwConsumer   = consumer(endOffset = highWatermark, positionRef = position, records = Nil)
-      consumerOf = new ConsumerOf[IO] {
-        def apply[K, V](
-          config: ConsumerConfig
-        )(implicit fromBytesK: FromBytes[IO, K], fromBytesV: FromBytes[IO, V]) =
-          cats
-            .effect
-            .Resource
-            .pure[IO, SkafkaConsumer[IO, K, V]](
-              (if (config.isolationLevel == IsolationLevel.ReadUncommitted) hwConsumer else readConsumer)
-                .asInstanceOf[SkafkaConsumer[IO, K, V]]
-            )
-      }
       stored <- KafkaPartitionPersistence.readSnapshots[IO](
-        consumerOf     = consumerOf,
+        consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
         consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
         snapshotTopic  = topic,
         partition      = partition,
@@ -74,6 +62,50 @@ class ReadSnapshotsSpec extends FunSuite {
     } yield assertEquals(stored.keys.toList.sorted, List("k0", "k1", "k2"), "the read must drain past its own LSO")
 
     test.unsafeRunSync()
+  }
+
+  test("a read stalled longer than any transaction may live fails loudly instead of hanging") {
+    // The target (3) was captured before a hypothetical log truncation; the log now ends at 1, so the
+    // position parks there and can never reach the target. Waiting cannot fix that - no transaction may
+    // stay open past transaction.max.timeout.ms - so the read must fail with the distinctive error rather
+    // than hang forever or complete with possibly incomplete state.
+    val test = for {
+      position    <- Ref.of[IO, Long](0L)
+      readConsumer = consumer(endOffset = 1L, positionRef = position, records = List(record(0, "k0")))
+      hwConsumer   = consumer(endOffset = 3L, positionRef = position, records = Nil)
+      result <- KafkaPartitionPersistence
+        .readSnapshots[IO](
+          consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
+          consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
+          snapshotTopic  = topic,
+          partition      = partition,
+        )
+        .attempt
+    } yield result match {
+      case Left(e: KafkaPartitionPersistence.RecoveryReadStalledError) =>
+        assertEquals(e.position, Offset.unsafe(1))
+        assertEquals(e.targetOffset, Offset.unsafe(3))
+      case other => fail(s"expected RecoveryReadStalledError, got $other")
+    }
+
+    test.unsafeRunSync()
+  }
+
+  // dispatches by isolation level: the read consumer for read_committed, the HW consumer for read_uncommitted
+  private def consumerOf(
+    readConsumer: SkafkaConsumer[IO, String, ByteVector],
+    hwConsumer: SkafkaConsumer[IO, String, ByteVector],
+  ): ConsumerOf[IO] = new ConsumerOf[IO] {
+    def apply[K, V](
+      config: ConsumerConfig
+    )(implicit fromBytesK: FromBytes[IO, K], fromBytesV: FromBytes[IO, V]) =
+      cats
+        .effect
+        .Resource
+        .pure[IO, SkafkaConsumer[IO, K, V]](
+          (if (config.isolationLevel == IsolationLevel.ReadUncommitted) hwConsumer else readConsumer)
+            .asInstanceOf[SkafkaConsumer[IO, K, V]]
+        )
   }
 
   // serves `records` one per poll from `position`, advancing it; endOffsets is fixed (the isolation-dependent bound)
@@ -102,13 +134,13 @@ class ReadSnapshotsSpec extends FunSuite {
       def assignment                                                              = delegate.assignment
       def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[IO]) = delegate.subscribe(topics, listener)
       def subscribe(topics: NonEmptySet[Topic])                                   = delegate.subscribe(topics)
-      def subscribe(pattern: Pattern, listener: RebalanceListener1[IO])           = delegate.subscribe(pattern, listener)
-      def subscribe(pattern: Pattern)                                             = delegate.subscribe(pattern)
-      def subscription                                                            = delegate.subscription
-      def unsubscribe                                                             = delegate.unsubscribe
-      def commit                                                                  = delegate.commit
-      def commit(timeout: FiniteDuration)                                         = delegate.commit(timeout)
-      def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata])         = delegate.commit(offsets)
+      def subscribe(pattern: Pattern, listener: RebalanceListener1[IO])   = delegate.subscribe(pattern, listener)
+      def subscribe(pattern: Pattern)                                     = delegate.subscribe(pattern)
+      def subscription                                                    = delegate.subscription
+      def unsubscribe                                                     = delegate.unsubscribe
+      def commit                                                          = delegate.commit
+      def commit(timeout: FiniteDuration)                                 = delegate.commit(timeout)
+      def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata]) = delegate.commit(offsets)
       def commit(offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata], timeout: FiniteDuration) =
         delegate.commit(offsets, timeout)
       def commitLater                                                          = delegate.commitLater
@@ -122,15 +154,15 @@ class ReadSnapshotsSpec extends FunSuite {
       def committed(partitions: NonEmptySet[TopicPartition])           = delegate.committed(partitions)
       def committed(partitions: NonEmptySet[TopicPartition], timeout: FiniteDuration) =
         delegate.committed(partitions, timeout)
-      def clientInstanceId(timeout: FiniteDuration)          = delegate.clientInstanceId(timeout)
-      def clientMetrics                                      = delegate.clientMetrics
-      def partitions(topic: Topic)                           = delegate.partitions(topic)
-      def partitions(topic: Topic, timeout: FiniteDuration)  = delegate.partitions(topic, timeout)
-      def topics                                             = delegate.topics
-      def topics(timeout: FiniteDuration)                    = delegate.topics(timeout)
-      def paused                                             = delegate.paused
-      def pause(partitions: NonEmptySet[TopicPartition])     = delegate.pause(partitions)
-      def resume(partitions: NonEmptySet[TopicPartition])    = delegate.resume(partitions)
+      def clientInstanceId(timeout: FiniteDuration)         = delegate.clientInstanceId(timeout)
+      def clientMetrics                                     = delegate.clientMetrics
+      def partitions(topic: Topic)                          = delegate.partitions(topic)
+      def partitions(topic: Topic, timeout: FiniteDuration) = delegate.partitions(topic, timeout)
+      def topics                                            = delegate.topics
+      def topics(timeout: FiniteDuration)                   = delegate.topics(timeout)
+      def paused                                            = delegate.paused
+      def pause(partitions: NonEmptySet[TopicPartition])    = delegate.pause(partitions)
+      def resume(partitions: NonEmptySet[TopicPartition])   = delegate.resume(partitions)
       def offsetsForTimes(timestampsToSearch: Map[TopicPartition, Offset]) =
         delegate.offsetsForTimes(timestampsToSearch)
       def offsetsForTimes(timestampsToSearch: Map[TopicPartition, Offset], timeout: FiniteDuration) =

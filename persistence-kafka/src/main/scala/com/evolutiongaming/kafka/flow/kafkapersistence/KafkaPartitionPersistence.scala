@@ -1,7 +1,7 @@
 package com.evolutiongaming.kafka.flow.kafkapersistence
 
 import cats.implicits.*
-import cats.{FlatMap, Monad, data}
+import cats.{FlatMap, MonadThrow, data}
 import com.evolutiongaming.catshelper.{BracketThrowable, Log}
 import com.evolutiongaming.kafka.flow.kafka.Codecs.*
 import com.evolutiongaming.skafka.*
@@ -23,37 +23,67 @@ object KafkaPartitionPersistence {
 
   private case class MissingOffsetError(topicPartition: TopicPartition) extends NoStackTrace
 
-  // ~5s of pinned 10ms polls between "waiting" log lines
-  private val logEveryIterations = 500L
+  /** The recovery read made no progress for longer than any open transaction may live, so waiting cannot fix it: the
+    * likely cause is a high watermark that regressed below the captured target - log truncation after an unclean leader
+    * election, i.e. the cluster lost acknowledged snapshot records. Failing loudly beats both hanging forever and
+    * silently recovering possibly incomplete state.
+    */
+  final case class RecoveryReadStalledError(
+    topicPartition: TopicPartition,
+    position: Offset,
+    targetOffset: Offset,
+  ) extends RuntimeException(
+        s"recovery read of $topicPartition made no progress at offset $position, short of target $targetOffset, " +
+          "for longer than transaction.max.timeout.ms allows any transaction to stay open; the high watermark has " +
+          "likely regressed below the captured target (log truncation after an unclean leader election) - failing " +
+          "rather than hanging or silently recovering possibly incomplete state"
+      )
+      with NoStackTrace
 
-  private[kafkapersistence] def readPartition[F[_]: Monad: Log](
+  // each stalled poll takes at least the 10ms poll timeout, so this many consecutive no-progress polls is
+  // at least ~16 minutes - longer than the broker-enforced ceiling on any open transaction
+  // (transaction.max.timeout.ms, default 15 minutes). A read still stalled after that is not waiting on a
+  // transaction. A slow-but-progressing read never comes near this: the count resets on every advance.
+  private[kafkapersistence] val maxStalledPolls = 96000L
+
+  // ~5s of pinned 10ms polls between "waiting" log lines
+  private val logEveryStalledPolls = 500L
+
+  private[kafkapersistence] def readPartition[F[_]: MonadThrow: Log](
     consumer: SkafkaConsumer[F, String, ByteVector],
     snapshotPartition: TopicPartition,
     targetOffset: Offset
   ): F[BytesByKey] =
     Log[F].info(s"Snapshot topic read started up to offset $targetOffset") *>
       FlatMap[F]
-        .tailRecM[(BytesByKey, Long), BytesByKey]((BytesByKey.empty, 0L)) {
-          case (acc, iteration) =>
+        .tailRecM[(BytesByKey, Option[Offset], Long), BytesByKey]((BytesByKey.empty, none, 0L)) {
+          case (acc, lastPosition, stalledPolls) =>
             consumer
               .position(snapshotPartition)
               .flatMap {
                 case offset if offset >= targetOffset =>
-                  acc.asRight[(BytesByKey, Long)].pure[F]
+                  acc.asRight[(BytesByKey, Option[Offset], Long)].pure[F]
                 case offset =>
+                  val stalled = if (lastPosition.contains(offset)) stalledPolls + 1 else 0L
                   // an open transaction below the target parks the position at the last-stable-offset until
                   // the broker resolves it; log while waiting so a pinned read is distinguishable from a hang
-                  Log[F]
+                  val logWaiting = Log[F]
                     .info(
                       s"Snapshot topic read waiting at offset $offset for target $targetOffset " +
                         "(an open transaction pins the read until the broker resolves it)"
                     )
-                    .whenA(iteration > 0 && iteration % logEveryIterations == 0) *>
+                    .whenA(stalled > 0 && stalled % logEveryStalledPolls == 0)
+                  // no transaction may stay open this long: waiting cannot fix it - fail loudly (see the
+                  // error's scaladoc)
+                  val failStalled = RecoveryReadStalledError(snapshotPartition, offset, targetOffset)
+                    .raiseError[F, Unit]
+                    .whenA(stalled >= maxStalledPolls)
+                  failStalled *> logWaiting *>
                     consumer
                       .poll(10.millis) // TODO: make poll timeout configurable
                       .map { records =>
                         val read = records.values.values.flatMap(_.toIterable).foldLeft(acc)(processRecord)
-                        (read, iteration + 1).asLeft
+                        (read, offset.some, stalled).asLeft
                       }
               }
         }
