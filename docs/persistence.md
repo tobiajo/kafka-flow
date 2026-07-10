@@ -82,16 +82,19 @@ val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[F, State](
 
 `idempotence` and the per-partition `transactional.id` are set for you — don't configure them in
 `producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
-The id is regenerated per assignment, not stable per partition. The input topic and the fencing
+The id is stable per partition (`<prefix>-<partition>`), so a takeover fences the previous owner's
+producer and aborts any transaction a crashed owner left open. The input topic and the fencing
 generation are supplied by the flow (from the assigned partition and the driving consumer), so neither
 is part of `TransactionalConfig`. One module serves one flow: snapshots are keyed by partition *number* alone, so
 each input topic needs its own module with its own `snapshotTopic` — sharing a snapshot topic between
 flows would mix their state on recovery.
 
-`transactionalIdPrefix` does not affect fencing (that is by consumer generation) — it is a readable
-label and, on an ACL-secured cluster, the `transactional.id` prefix your producer principal must be
-authorized for. Use your `applicationId`; an application running several flows can append any per-flow
-discriminator (e.g. the input topic) — a PREFIXED-pattern ACL on `<applicationId>` still covers it.
+Safety does not rest on `transactionalIdPrefix` (stale owners are fenced by consumer generation), but
+the id is operative — stable per partition, it is what lets a takeover abort a crashed owner's dangling
+transaction — so treat it like a group id: **unique per application on the cluster**, or applications
+fence each other's producers. Use your `applicationId`; an application running several flows can append
+any per-flow discriminator (e.g. the input topic) — a PREFIXED-pattern ACL on `<applicationId>` still
+covers it.
 
 Snapshot writes and the input-offset commit run in one Kafka transaction per assigned partition; a
 write from a stale consumer generation is fenced by the broker
@@ -105,7 +108,7 @@ never recovered.
   so a burst of N dirty keys is ≈ N / `maxWritesPerTransaction` transactions (default 256) — at the
   default cap the overhead is small (see the design doc's Measurements). Each partition also holds its
   own producer and transaction-coordinator state on the brokers, so the footprint scales with the
-  partition count; under heavy reassignment, tune `transactional.id.expiration.ms`.
+  partition count.
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
   it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
@@ -124,11 +127,11 @@ Limitations:
   nor committed, so the new owner replays those events — noise, not loss. Under the classic
   **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
   `flushOnRevoke` does not shrink the replay window there (see the design doc for why).
-- After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
-  `transaction.timeout.ms`; until then that open transaction pins the snapshot topic's
-  last-stable-offset, and recovery of that partition cannot see records beyond it — nor can any other
-  `read_committed` reader of the *snapshot topic*. Output topics are unaffected (output stays outside
-  the transaction).
+- After a hard crash, the failed owner's in-flight transaction is aborted when the partition's next
+  owner initializes its producer (the stable `transactional.id`); until then — or after
+  `transaction.timeout.ms` at the latest — it pins the snapshot topic's last-stable-offset, which no
+  `read_committed` reader of the *snapshot topic* can see past; recovery waits such a pin out rather
+  than reading short of it. Output topics are unaffected (output stays outside the transaction).
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (one snapshot partition per input
   partition); a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

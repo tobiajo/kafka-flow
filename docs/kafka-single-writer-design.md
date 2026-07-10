@@ -133,29 +133,26 @@ joined, so a fallen-out owner stays fenced by its own stale token. Dropping the 
 tracked metadata empty until the first join completes, and a flush in that window — unreachable on the
 flow path — fails loudly rather than committing ungated.
 
-### No epoch fencing
+### Epoch fencing as takeover-abort
 
-Generation fencing is the sole mechanism; there is deliberately no producer-epoch fencing. Each
-producer gets a unique `transactional.id` (`"{prefix}-{partition}-{uuid8}"`), so old and new owners
-never share one. The alternative — a *stable* per-partition id, the Kafka Streams model — would add
-cross-owner epoch fencing: each `initTransactions` bumps the epoch, fencing the previous holder and
-aborting any transaction it left open. Rejected on three grounds: it catches nothing the generation
-fence does not already catch, so it would be a second fencing mechanism in the safety argument with no
-safety gain; a stable id must be unique per application, topic and partition across everything sharing
-the cluster — a collision means cross-application fencing, where unique ids are collision-proof by
-construction; and its one real operational benefit, aborting a hard-crashed owner's dangling
-transaction at takeover, is a read-side concern here (recovery must bound itself against the
-last-stable-offset pin, below) — a takeover abort can never clear a pinning transaction from any
-*other* producer anyway. There is also a rare corner where the epoch order inverts ownership — a stale
-owner whose `initTransactions` stalls across an immediate follow-up rebalance fences the true owner,
-costing one crash of a valid owner; self-healing, but free to avoid — though the rejection does not
-rest on it.
+Safety rests on generation fencing alone; producer-epoch fencing is employed for a different job. Each
+partition's producer has a **stable** `transactional.id` (`"{prefix}-{partition}"`, the Kafka Streams
+model), so a takeover's `initTransactions` bumps the producer epoch: the previous owner's producer is
+fenced — a wedged stale owner fails fast on its first use (`ProducerFencedException`) instead of a
+transaction later at the offset-commit fence — and **any transaction it left open is aborted on the
+spot**. That abort is the reason for the choice: a hard-crashed owner's dangling transaction otherwise
+survives until `transaction.timeout.ms` and pins the snapshot topic's last-stable-offset — the horizon
+`read_committed` readers (recovery included) cannot see past. With takeover-abort the pin does not
+outlive the handover; recovery additionally waits out any pin a takeover cannot abort (a foreign
+producer's transaction on the snapshot topic) rather than reading short of it.
 
-The cost of unique ids — transaction-coordinator state expiring via `transactional.id.expiration.ms` —
-is accepted. A hard-crashed owner's in-flight transaction is thus not aborted at takeover; the
-coordinator reclaims it only after `transaction.timeout.ms`, which bounds how long it pins the snapshot
-topic's last-stable-offset — the horizon `read_committed` readers of that topic (recovery included)
-cannot see past.
+No safety is asked of the epoch fence, and none should be: the generation bound into every commit is
+what fences stale owners, and in a rare corner the epoch order can even invert ownership — a stale
+owner whose `initTransactions` stalls across an immediate follow-up rebalance fences the true owner
+(one crash of a valid owner; self-healing; safety unaffected). Two operational notes: treat the id
+prefix like a group id — unique per application on the cluster, or applications fence each other's
+producers — and stable ids keep transaction-coordinator state bounded (no per-assignment id
+accumulation against `transactional.id.expiration.ms`).
 
 ## Consumer rebalance protocols
 
@@ -304,10 +301,11 @@ last joined generation — including that `0` is admitted, the range check rathe
 
 - **Transactional snapshot read + snapshot write**: fence a stale writer with a compare-and-set on the
   stored offset. Kafka has no conditional produce primitive, so it cannot be atomic.
-- **Producer-epoch fencing (stable `transactional.id`)**: redundant — it catches nothing the
-  generation fence does not — while adding cross-application id-collision discipline and a rare
-  ownership-inverting init race; its takeover-abort benefit is a read-side concern and would not cover
-  foreign pinning transactions (see No epoch fencing).
+- **Unique per-assignment `transactional.id` (no epoch fencing)**: immune to the init-order corner and
+  collision-proof by construction, but a hard-crashed owner's dangling transaction then survives until
+  `transaction.timeout.ms`, pinning recovery behind the last-stable-offset for the full timeout on every
+  crash. Safety is identical either way (the generation fence); the stable id's takeover-abort removes
+  the wait in the common path (see Epoch fencing as takeover-abort).
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
   reassignment, and safe *dynamic* assignment is the point of this design. (Static *membership*
