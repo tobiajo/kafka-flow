@@ -278,6 +278,9 @@ concurrent-write safety. The group commit is exercised in isolation by `GroupCom
 with a recording in-memory producer (no broker). The teardown-await the fence depends on for just-lost
 partitions (Mechanism, last key point) is pinned by `TopicFlowSpec` "remove awaits the flow teardown",
 so a refactor to fire-and-forget teardown fails the build rather than silently reopening the gap.
+`ConsumerSpec` pins the tracking read itself: metadata is published only by a poll (a bump with no
+callback is observed on the next poll, and not before), and the guard drops negatives while keeping the
+last joined generation — including that `0` is admitted, the range check rather than a `−1` test.
 
 ## Rejected alternatives
 
