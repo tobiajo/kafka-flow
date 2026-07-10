@@ -246,8 +246,10 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       staleFlushScenario(moduleOf, IO.pure(stale.some), moduleOf, IO.pure(current.some), stateTopic, key).map {
         case (staleFlush, stored) =>
           // the release itself succeeds: the rejected write surfaces as a logged-and-swallowed cache entry release
-          // error ("scache: failed to release cache entry: ... CommitFailedException"), which is the desired
-          // outcome for a partition that is being given away anyway
+          // error, which is the desired outcome for a partition that is being given away anyway. With the stable
+          // per-partition transactional.id both flows share a producer id, so the epoch fence fires first here
+          // (ProducerFencedException at flow A's flush - B's init fenced it); the generation fence is isolated by
+          // the fail-fast test below, whose single producer is never epoch-fenced
           assertEquals(clue(staleFlush), Right(()))
           // the protection: the stale (older-generation) write did not land, the new owner's snapshot survived
           assertEquals(clue(stored.get(key)), utf8((1 to 10).map(i => s"e$i").mkString(",")))

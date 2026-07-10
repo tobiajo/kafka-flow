@@ -18,8 +18,6 @@ import com.evolutiongaming.sstream.Stream
 import scodec.bits.ByteVector
 import com.evolutiongaming.skafka.consumer.ConsumerRecord
 
-import java.util.UUID
-
 /** A module, necessary to create a Kafka snapshot persistence.
   */
 trait KafkaPersistenceModule[F[_], S] {
@@ -43,11 +41,12 @@ object KafkaPersistenceModule {
     *   base config for the snapshot producer; `transactionalId` and `idempotence` are overridden per producer and
     *   `clientId` is suffixed with `-snapshot-<partition>`
     * @param transactionalIdPrefix
-    *   prefix for `transactional.id` (partition number and a unique per-producer suffix are appended). It does not
-    *   affect fencing (that is by consumer generation), so its only roles are a readable label and, on an ACL-secured
-    *   cluster, the `transactional.id` prefix the producer principal must be authorized for. Use your `applicationId`;
-    *   an application running several flows can append any per-flow discriminator (e.g. the input topic), which a
-    *   PREFIXED-pattern ACL on `<applicationId>` still covers.
+    *   prefix for `transactional.id` (the partition number is appended - the id is stable per partition, so a
+    *   takeover's `initTransactions` fences the previous owner's producer and aborts any transaction it left open).
+    *   Safety does not rest on it (stale owners are fenced by consumer generation, KIP-447), so treat it like a group
+    *   id: unique per application on the cluster, or applications fence each other's producers. Use your
+    *   `applicationId`; an application running several flows can append any per-flow discriminator (e.g. the input
+    *   topic), which a PREFIXED-pattern ACL on `<applicationId>` still covers.
     * @param snapshotTopic
     *   snapshot topic name (should be configured as a 'compacted' topic) to read/write snapshots
     * @param maxWritesPerTransaction
@@ -140,14 +139,15 @@ object KafkaPersistenceModule {
   }
 
   /** Variant of `caching` protecting the snapshot topic from stale writers by binding the input-offset commit into the
-    * snapshot transaction. Each assigned partition gets a transactional producer with a unique `transactional.id`;
-    * snapshot writes run in group-committed transactions (see [[KafkaSnapshotWriteDatabase.transactional]]) that also
-    * commit the input offset. A stale consumer generation is rejected by the broker (KIP-447), aborting the
-    * transaction, so a stale owner can neither advance offsets nor overwrite a newer snapshot. Recovery reads with
-    * `read_committed`, and unlike `caching` the identity partition mapping is always used; output stays at-least-once.
-    * See the "Protecting against stale snapshot writes" persistence docs for guarantees, limitations, costs and rollout
-    * (including consumer rebalance protocols and broker version floor), and `docs/kafka-single-writer-design.md` for
-    * the mechanism.
+    * snapshot transaction. Each assigned partition gets a transactional producer with a stable per-partition
+    * `transactional.id`, whose `initTransactions` fences the previous owner's producer and aborts any transaction a
+    * crashed owner left open; snapshot writes run in group-committed transactions (see
+    * [[KafkaSnapshotWriteDatabase.transactional]]) that also commit the input offset. A stale consumer generation is
+    * rejected by the broker (KIP-447), aborting the transaction, so a stale owner can neither advance offsets nor
+    * overwrite a newer snapshot. Recovery reads with `read_committed`, and unlike `caching` the identity partition
+    * mapping is always used; output stays at-least-once. See the "Protecting against stale snapshot writes" persistence
+    * docs for guarantees, limitations, costs and rollout (including consumer rebalance protocols and broker version
+    * floor), and `docs/kafka-single-writer-design.md` for the mechanism.
     *
     * The `assignment` must describe the input partition of the SAME consumer that drives this flow (its `groupMetadata`
     * generation is what fences a stale owner); `assignedAt` seeds the offset-to-commit so even the first write is
@@ -183,8 +183,9 @@ object KafkaPersistenceModule {
     }
   }
 
-  /** Builds the per-assignment transactional producer (unique `transactional.id`) and the group-committing write
-    * database that binds the input-offset commit into each snapshot transaction. See [[cachingTransactional]].
+  /** Builds the per-assignment transactional producer (stable per-partition `transactional.id`) and the
+    * group-committing write database that binds the input-offset commit into each snapshot transaction. See
+    * [[cachingTransactional]].
     */
   private def transactionalWriteDatabase[F[_]: Async, S](
     producerOf: ProducerOf[F],
@@ -201,9 +202,12 @@ object KafkaPersistenceModule {
     val partition = inputTopicPartition.partition
 
     for {
-      // unique per producer: fencing is by consumer generation, not this id, so a fresh id per assignment is fine
-      shortId        <- Resource.eval(Async[F].delay(UUID.randomUUID().toString.take(8)))
-      transactionalId = s"$transactionalIdPrefix-${partition.value}-$shortId"
+      // stable per partition (the Kafka Streams model): this producer's initTransactions fences the previous
+      // owner's producer and aborts any transaction it left open, so a hard-crashed owner's dangling transaction
+      // does not outlive the handover (nor keep pinning the snapshot topic's last-stable-offset, which recovery
+      // otherwise has to wait out - see KafkaPartitionPersistence.readSnapshots). Safety does not rest on this
+      // epoch fence: the consumer generation bound into every commit is what fences stale owners
+      transactionalId <- Resource.pure[F, String](s"$transactionalIdPrefix-${partition.value}")
       transactionalProducerConfig = producerConfig.copy(
         transactionalId = transactionalId.some,
         idempotence     = true,
