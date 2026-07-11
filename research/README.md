@@ -23,7 +23,7 @@ of the Cassandra design merged upstream, not a separate arm.
 
 | Implementation | What it is | Guarantee (and residual) | Where verified |
 |---|---|---|---|
-| **Kafka transactional** (the transactional snapshot mode) | snapshot write + input-offset commit bound in one producer transaction, fenced by the consumer **generation** (KIP-447 `sendOffsetsToTransaction`), stable per-partition `transactional.id` (takeover-abort), `read_committed` recovery, group-committed batches, post-poll generation refresh | a stale owner's offset commit is rejected (`ILLEGAL_GENERATION`) and aborts the transaction; residual: the cross-partition flows-alive invariant rests on the documented rebalance contract (modelled in `FlowsAlive`; pinned by `TopicFlowSpec` "remove awaits the flow teardown") | `docs/kafka-single-writer-design.md`; the **Kafka arm** files below; `external-semantics.md` ext(K1)–(K6); claims KF1–KF12; findings F-8, F-10; models `Kafka`/`GroupCommit`/`GroupCommitLanes`/`Epoch`/`FlowsAlive`/`TokenSync`/`RecoveryRead` |
+| **Kafka transactional** (the transactional snapshot mode) | snapshot write + input-offset commit bound in one producer transaction, fenced by the consumer **generation** (KIP-447 `sendOffsetsToTransaction`), stable per-partition `transactional.id` (takeover-abort), `read_committed` recovery, group-committed batches, post-poll generation refresh | a stale owner's offset commit is rejected (`ILLEGAL_GENERATION`) and aborts the transaction; residual: the cross-partition flows-alive invariant rests on the documented rebalance contract (modelled in `FlowsAlive`; pinned by `TopicFlowSpec` "remove awaits the flow teardown") | `docs/kafka-single-writer-design.md`; the **Kafka arm** files below; `external-semantics.md` ext(K1)–(K7); claims KF1–KF13; findings F-8, F-10; models `Kafka`/`GroupCommit`/`GroupCommitLanes`/`Epoch`/`FlowsAlive`/`TokenSync`/`RecoveryRead` |
 | **Cassandra persist-only** (**merged upstream**) | `persist` offset-fenced (`IF offset <= :offset`, first-write compound, `IF offset = null` repair); `delete` a plain last-write-wins `DELETE` | #732 closed **for persists**; residual (documented, accepted): a stale writer can resurrect a *deleted* key | the **Cassandra arm** files (persist-only framing in `cassandra-report.md` §1.1); model `cassandra_notomb` (VIOLATES `INV_NoCorruptDurable`); `SnapshotSpec` IT *on the persist-only branch*; claims X1 |
 | **Cassandra full** (**verified, deferred** — upstream #834) | the above **plus** an offset-carrying tombstone delete (always written in fenced mode, even for a never-persisted key — F-9), the replay-window monotonic buffer, tombstone-floor recovery, and the events-recovery offset floor | #732 closed for persists **and** deletes | `cassandra-report.md` §3–§10; findings F-1..F-9; the full model suite |
 
@@ -58,7 +58,7 @@ sectioned inside.
 | [`kafka-consumer-protocol-experiment.md`](kafka-consumer-protocol-experiment.md) | Kafka | The realized `group.protocol=consumer` (KIP-848) experiment: a vendored skafka fork, IT-proven under both protocols on Kafka 4.3.0, plus the capture-redundancy finding. Additive/experimental — not part of the current design. | "What does it take to support the consumer rebalance protocol — and what did building it teach?" |
 | [`findings.md`](findings.md) | Shared | Consolidated defects and dispositions (F-1..F-10; F-8/F-10 are the Kafka ones) + the single reconciled suite ledger. | "What went wrong, what was fixed, what's accepted-as-is." |
 | [`claims.md`](claims.md) | Shared | Every design claim → evidence class → verdict (Cassandra families; Kafka KF-series). | "Is claim X actually grounded, and in what?" |
-| [`external-semantics.md`](external-semantics.md) | Shared | Primary-source verification of external facts: Cassandra ext(1)–(X2), Kafka-broker ext(K1)–(K6). | "What does LWT / the group coordinator *actually* guarantee?" |
+| [`external-semantics.md`](external-semantics.md) | Shared | Primary-source verification of external facts: Cassandra ext(1)–(X2), Kafka-broker ext(K1)–(K7). | "What does LWT / the group coordinator *actually* guarantee?" |
 | [`model-audit.md`](model-audit.md) | Shared | TLA+ model↔code fidelity, non-vacuity, coverage gaps (per-implementation scope map at its top). | "Is a `HOLDS` result faithful and non-vacuous?" (pair with `../models/README.md`) |
 | [`../models/`](../models/) (+ `models/README.md`) | Shared | The TLA+ suite itself: the refinement tower, the configs, how to run (`run.sh`). | "I want to run or read the models." (`model-audit.md` is the audit *of* them.) |
 
@@ -82,8 +82,8 @@ The Shared files mix implementations; this is where each arm's content lives ins
   Deleted-key / Consistency / TTL / Rejected sections; models `Cassandra`, `CasFirstWrite(Atomic)`,
   `FlushCell`, `SnapshotFlow`, `SingleWriterStore`.
 - **Kafka**: `kafka-*.md` (study, rebalance semantics, dispositions, consumer-protocol experiment); findings
-  F-8 (+ its capture-redundancy corollary) and F-10; `external-semantics.md` ext(K1)–(K6); `claims.md`
-  KF1–KF12; models `Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `FlowsAlive`, `TokenSync`,
+  F-8 (+ its capture-redundancy corollary) and F-10; `external-semantics.md` ext(K1)–(K7); `claims.md`
+  KF1–KF13; models `Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `FlowsAlive`, `TokenSync`,
   `RecoveryRead`.
 
 ## Toolchain

@@ -290,6 +290,36 @@ KAFKA-18060 / KAFKA-19779 / KAFKA-16285, group-coordinator `ClassicGroup` / `Con
 `ProducerStateManager` unstable-offset tracking); kafka-streams 4.0.0 (`StreamsConfig`,
 `ActiveTaskCreator`, `StoreChangelogReader`) and KAFKA-10167.
 
+## ext(K7) Compaction and produce are position-blind — no conditional publish, no version-aware merge — **CONFIRMED (source-level; upstream trackers checked 2026-07)**
+
+The facts behind the Kafka design-space closure (claims KF13): why no non-transactional fence can
+exist on a Kafka snapshot topic.
+
+- **The cleaner keeps the latest record per key by log position, nothing else.** `shouldRetainRecord`
+  (`kafka/log/LogCleaner.scala`, 3.9.0) retains a live record iff its offset is ≥ the `OffsetMap`'s
+  highest offset for that key (records past the map's range are kept as not-yet-cleaned); no value,
+  header or version participates in the decision. Consequence: a stale record appended *after* a newer
+  one eventually becomes the key's **only** copy — read-side reconciliation cannot recover what the
+  cleaner already deleted.
+- **The produce path is unconditional.** Idempotent-producer sequence numbers order a single producer's
+  own writes; nothing lets a write's success depend on the partition's current contents. Upstream has
+  acknowledged both halves of the gap for years without closing them: KIP-27 "Conditional Publish" is
+  *Under Discussion* since 2015, never adopted; KIP-280 "Enhanced log compaction" (header/version-aware
+  compaction strategies) is *Accepted* but never implemented — the proposed `compaction.strategy`
+  config is absent from current broker docs and the implementation JIRA (KAFKA-7061) is unresolved.
+- **Aborted transactional records are removed by cleaning.** "Records from aborted transactions are
+  removed by the cleaner immediately without regard to record keys" (`LogCleaner` class doc, 3.9.0). A
+  `read_uncommitted` view of aborted data is therefore *transient* — present until the cleaner runs,
+  gone after — so any recovery scheme trusting it returns time-dependent results.
+- **Tombstones are removed after the delete horizon.** Cleaning discards a tombstone once its
+  `deleteHorizonMs` (from `delete.retention.ms`) passes (`LogCleaner.scala`, 3.9.0). A
+  header-reconciliation scheme therefore loses its delete fence with time: past the horizon, a stale
+  record following a delete is indistinguishable from a live key.
+
+Sources: `kafka/log/LogCleaner.scala` at 3.9.0 (`shouldRetainRecord`, the class-level cleaning
+contract, the delete-horizon `RecordFilter`); KIP-27 and KIP-280 cwiki status pages and KAFKA-7061
+(all checked 2026-07); current broker topic-config reference (no `compaction.strategy`).
+
 ## ext(C-F9) The F-9 fix's Cassandra mechanics — **CONFIRMED (source-level)**
 
 Independently primary-source-verified after the F-9 fix (the fenced delete now INSERTs an offset-carrying
