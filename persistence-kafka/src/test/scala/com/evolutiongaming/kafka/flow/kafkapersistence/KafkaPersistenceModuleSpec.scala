@@ -60,7 +60,7 @@ class KafkaPersistenceModuleSpec extends FunSuite {
       val produced = config.getOrElse(fail("no producer was created at module acquisition"))
       assertEquals(produced.transactionalId, "app-0".some)
       assertEquals(produced.idempotence, true)
-      assertEquals(produced.transactionTimeout, 10.seconds)
+      assertEquals(produced.transactionTimeout, 1.minute)
       assertEquals(produced.common.clientId, "client-snapshot-0".some)
     }
     test.unsafeRunSync()

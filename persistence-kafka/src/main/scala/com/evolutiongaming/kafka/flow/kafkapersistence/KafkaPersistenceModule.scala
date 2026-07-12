@@ -18,8 +18,6 @@ import com.evolutiongaming.sstream.Stream
 import scodec.bits.ByteVector
 import com.evolutiongaming.skafka.consumer.ConsumerRecord
 
-import scala.concurrent.duration.*
-
 /** A module, necessary to create a Kafka snapshot persistence.
   */
 trait KafkaPersistenceModule[F[_], S] {
@@ -228,9 +226,6 @@ object KafkaPersistenceModule {
       transactionalProducerConfig = producerConfig.copy(
         transactionalId = transactionalId.some,
         idempotence     = true,
-        // the Kafka Streams EOS default: bounds how long a crashed owner's leftovers can affect others when
-        // no takeover aborts them, while a group-committed batch typically commits in well under a second
-        transactionTimeout = 10.seconds,
         common = producerConfig
           .common
           .copy(clientId = producerConfig.common.clientId.map(cid => s"$cid-snapshot-${partition.value}"))
