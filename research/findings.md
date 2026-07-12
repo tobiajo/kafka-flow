@@ -331,7 +331,7 @@ replication study; "post-audit" = the model/tooling additions committed to the m
 |---|---|---|---|---|
 | core unit (JDK 21) | 100/100 | 104/110 → 110/110 | 116/116 | **121/121** (117 at the models-review snapshot; +4 landed after, unrelated to the consumer-protocol experiment, which adds no core tests) |
 | persistence-cassandra IT (real Cassandra) | 30/30 + wiring 1/1 | 33/33 | 35/35 | **36/36** (F-9 never-persisted delete + zombie-rejection + idempotency) |
-| persistence-kafka IT (real Kafka) | 12/12 | 12/12 | 12/12 | **12/12** |
+| persistence-kafka IT (real Kafka) | 12/12 | 12/12 | 12/12 | **14/14** (+2 `RevokeTimeFlushSpec`: the revoke-time flush outcomes under a *real* second-member rebalance — cooperative-sticky fenced, eager-sticky control commits; claim KF14. Full-module run observed 17/17 with `Kip848ConsumerProtocolSpec` (3) included, on a Docker host that can pull the pinned 4.3.0 image) |
 | persistence-kafka / metrics unit | 9/9, 5/5 | 9/9, 6/6 | 9/9, 6/6 | **14/14, 6/6** (+5 `Kip848ConfigSpec`: forked-config bindings + the `group.remote.assignor` classic-omission pin) |
 | TLA+ (TLC 2.16, pinned via tla2tools v1.7.0; `models.yml` runs the suite in CI on this same version; 2.18 re-run open — unreachable in the sandbox, trips `run.sh`'s matchers) | 25→26 | 29 → 36 | 38/38 | **61/61** (35 negative controls; +`tokensync_*` the capture-vs-refresh 2×2 + equivalence, +`gclanes_*`, +`*_mo4`, +`flowsalive_*` over the earlier 41; +`recoveryread_*` with F-10) |
 
@@ -342,8 +342,9 @@ which adds no core tests) and **persistence-kafka unit 14/14** (the +5 is `Kip84
 branch (the standalone consumer-protocol experiment):* the capture-removal was verified there
 as **82 core unit + 12 integration** green — where those 12 include `Kip848ConsumerProtocolSpec` (3) alongside
 the transactional/generation ITs; that "12" is the capture-removal verification run, **distinct from** this
-ledger's `persistence-kafka IT 12/12` (the classic routine suite, unchanged across all stages, run on the
-default broker image). `Kip848ConsumerProtocolSpec` needs a real KIP-848 broker (`apache/kafka:4.3.0`) and is
+ledger's `persistence-kafka IT` count (the classic routine suite, 12/12 unchanged through the models-review
+stage, run on the default broker image; now 14/14 with `RevokeTimeFlushSpec` — the current column).
+`Kip848ConsumerProtocolSpec` needs a real KIP-848 broker (`apache/kafka:4.3.0`) and is
 **not** part of the routine CI suite. The TLA+ `tokensync_*` and `recoveryread_*` sets are in the 61/61 above. Every suite stayed
 green with capture removed — the evidence behind F-8's capture-redundancy corollary and claim KF11.
 

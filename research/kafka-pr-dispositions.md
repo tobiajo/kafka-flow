@@ -72,7 +72,10 @@ generation, is always fenced and its transaction aborts. That is the safe direct
 already belongs to the new owner, and since the broker never checks partition ownership, capturing the
 advanced generation inside the revoke callback would let the late flush overwrite the new owner's
 snapshot. Fenced-is-correct; the cost is availability only (full replay of the revoked partitions),
-now documented rather than promised away.
+now documented rather than promised away. **Since runtime-pinned** by `RevokeTimeFlushSpec`
+(real second-member rebalance, no simulated generation): cooperative-sticky flush fenced with the
+callback observing the already-advanced live generation, eager-sticky control commits — see the
+runtime-pin note under the verdicts table in `kafka-rebalance-semantics.md`.
 
 **B3. Live `groupMetadata` reads (SETTLED: rejected, now for a pinned reason).** Beyond the original
 objections (the serialized consumer cannot be called inside the callback; lag is the safe direction),

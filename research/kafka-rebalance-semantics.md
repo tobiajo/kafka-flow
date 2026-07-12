@@ -28,6 +28,20 @@ cited structure identical between branch 3.9 and trunk for every classic-protoco
 | 8 | KIP-266: the join round can span multiple `poll()` calls; `groupMetadata()` reflects the last COMPLETED join throughout | **CONFIRMED, medium confidence** | `onJoinPrepare` takes a Timer and returns boolean; `joinGroupIfNeeded` returns `false` mid-rebalance and resumes on a later poll (KAFKA-13310 structure, 3.2+). Combined with verdict 2, `groupMetadata()` cannot observe an incomplete join. Inferred from the verified return-false/resume structure rather than end-to-end timeout tracing. |
 | 9 | KIP-848 (`group.protocol=consumer`): epoch advances on the background thread; callbacks still on the app thread; sentinel handled differently; KIP-447 support unclear | **LARGELY UNVERIFIED at first pass — since pinned** | Only the callback-threading half survived the first pass (source quality). A dedicated second pass — decompiled client bytecode plus broker/coordinator primary sources — has since pinned every question this row left open; see the KIP-848 addendum below. |
 
+**Runtime pin of verdicts 3–5 (2026-07-12).** The composed consequence of the source-verified ordering
+— the revoke-time transactional flush is **always fenced** under classic cooperative-sticky (the
+generation is stamped before the revoked callback, so the flush carries the held token and its
+transaction aborts) and **commits** under classic eager-sticky (revoked fires before the join round) —
+is now IT-confirmed against a real broker by `RevokeTimeFlushSpec` (persistence-kafka-it-tests, routine
+suite): a second member joins, the first member's `onPartitionsRevoked` runs the production-shaped
+flush with the token the production path reads, and the test additionally observes the mechanism, not
+only the outcome — inside the cooperative callback the live `groupMetadata()` generation is already
+past the joined one while the flush's token is not (verdict 4 end to end); inside the eager callback
+the generation is unmoved (verdict 3). The eager case is the paired control: same machinery, same held
+token, opposite outcome — the fence is caused by the generation-adoption ordering. This closes the gap
+that verdicts 3–5's consequence was pinned at source level only; before this spec, the fenced/landed
+outcomes were exercised solely with a *simulated* stale generation (`generationId − 1`).
+
 ## KIP-848 addendum (second pass)
 
 Verdict 9 left KIP-848 unpinned. This pass closed it with two independent tracks (2026-07-07):

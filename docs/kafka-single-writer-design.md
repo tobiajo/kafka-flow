@@ -258,7 +258,12 @@ shows corruption with the plain shared producer (no offset binding); the prevent
 with an *older consumer generation* and asserts the newer snapshot survives — isolating the offset
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
 fenced writer fails its next flush, an open transaction neither blocks nor leaks into recovery,
-concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
+concurrent-write safety. `RevokeTimeFlushSpec` pins the revoke-time flush outcomes above under a *real*
+rebalance (a second member joining, no simulated generation): fenced under cooperative-sticky — the
+callback observes the generation already advanced while the flush carries the held token, and nothing
+of the aborted transaction reaches a `read_committed` recovery — and committed under eager-sticky, the
+paired control showing the generation-adoption ordering, not the flush machinery, decides the outcome.
+The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
 with a recording in-memory producer (no broker). Two unit suites pin the client-side pieces the fence
 depends on: `TopicFlowSpec` that removing a partition awaits its flows' teardown, and `ConsumerSpec`
 the post-poll generation tracking and the negative-generation guard.
