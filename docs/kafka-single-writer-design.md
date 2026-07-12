@@ -286,6 +286,15 @@ The mechanism is model-checked in `models/` (TLA+), as a refinement tower: one a
   (`epoch_refines`): epochs are handed out in `initTransactions` order, not ownership order, so a late
   stale owner wins the epoch and its write lands. This is why the fence is on the consumer generation,
   not the producer epoch.
+- **`RecoveryRead` ⇒ `RecoveryReadAtomic`** — the recovery read as a grain-of-atomicity theorem: the
+  read as implemented (capture a bound, drain to it, complete) must refine the one-step atomic read
+  the `Kafka` model assumes in `OwnerRecover`. The theorem is **false for the read as currently
+  shipped** (issue #850: a crashed writer's open transaction pins the `read_committed` end offset
+  below newer committed snapshots — `recoveryread_lso_unique`), and holds under either open remedy
+  (PR #852, the high-watermark bound — `recoveryread_hw_unique`; PR #853, the stable per-partition id
+  takeover-abort — `recoveryread_lso_stable`). The same model states issue #849: with log truncation
+  as an environment action, the bounded read can hang forever (`recoveryread_truncate_stall`); the
+  no-progress tripwire remedy (`recoveryread_truncate_tripwire`) is likewise not yet implemented.
 
 The models verify behaviour *under* their assumptions (the KIP-447 broker fence, poll-thread
 serialization of rebalance callbacks, one open transaction per partition); they do not re-derive them.

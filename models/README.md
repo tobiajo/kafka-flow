@@ -11,7 +11,13 @@ The suite is organised as **one abstract specification with everything else a re
 checked in TLC by a refinement mapping. Each backend is a self-contained, faithful spec that models
 its real mechanism (so its hazards are reachable, not abstracted away — Sec. 7.6); a rejected design
 is a spec whose refinement theorem is *false*; a genuinely finer grain of one operation is a
-grain-of-atomicity refinement underneath a backend (Sec. 7.3).
+grain-of-atomicity refinement underneath a backend (Sec. 7.3); and an *external platform fact* whose
+primary source admits more than one plausible reading is a **constant spanning both readings** (a fact
+knob, Sec. 7.5), never a silent premise of an action — see
+[Platform facts are knobs until pinned](#platform-facts-are-knobs-until-pinned). The obligations
+these configs impose on an implementation are collected normatively in
+[`../research/implementation-requirements.md`](../research/implementation-requirements.md) — every
+negative control there is a MUST.
 
 ## The tower
 
@@ -26,7 +32,9 @@ SingleWriterStore — THE spec
   │    └─ CasFirstWrite   the non-atomic first-write compound ⇒ one atomic CAS (grain of atomicity)
   │
   ├─ Kafka      ✓   consumer-generation fence + capture-coupling + offset seed + atomic offset binding
-  │    └─ GroupCommit     write orchestration: termination + offset ordering
+  │    ├─ GroupCommit     write orchestration: termination + offset ordering
+  │    └─ RecoveryRead ⇒ RecoveryReadAtomic   the read compound ⇒ one atomic read
+  │                       (grain of atomicity; the theorem FAILS for the as-merged read — F-10)
   │
   └─ Epoch      ✗   REJECTED: producer epoch / stable transactional.id (the theorem is false)
 ```
@@ -35,7 +43,13 @@ SingleWriterStore — THE spec
 backends differ only in the fence — Cassandra a per-key offset compare-and-set, Kafka the consumer
 generation (KIP-447) — and each models its mechanism faithfully enough that removing it is a
 reachable refinement violation. `CasFirstWrite` and `GroupCommit` are the finer-grained models, under
-Cassandra and Kafka respectively.
+Cassandra and Kafka respectively; `RecoveryRead ⇒ RecoveryReadAtomic` is the read-side
+grain-of-atomicity theorem under Kafka — `RecoveryReadAtomic` states the atomic read `OwnerRecover`
+assumes, and the refinement holds or fails per config (the F-10 design point fails it). The
+composition with the tower is by implication transitivity across TLC runs: `Kafka ⇒ SWS` assumes the
+atomic read that `RecoveryRead ⇒ RecoveryReadAtomic` discharges — two theorems, one seam, each
+machine-checked; the seam itself (that `OwnerRecover` and `RecoveryReadAtomic` state the same read)
+is a documented correspondence, not a TLC-checked substitution.
 
 The **replay window** (after a handover the new owner resumes at a committed offset below the durable
 snapshot, then replays up) is a *shared* kafka-flow mechanism — **both** backends have it. Each has a
@@ -71,8 +85,10 @@ lives in shared snapshot code (it's Cassandra's protection) while Kafka leans on
 | [`Cassandra`](#cassandra--kafka) | refinement | the offset-gated LWT + offset-carrying tombstone; the owner folds onto its recovered base, and replays a recovered snapshot through the monotone buffer (`offset max highWater`); with `EventsRecovery` the owner recovers from the *journal* — a second, unfenced state source (`restoreEvents`) modelled as a **row set** (`journalRows`, so a stale residue below a tombstone is representable), folded onto the fenced store's snapshot with rows at or below the store's offset filtered out (`FloorFilter` ↔ the offset-vs-floor skip in `ReadState`) — the guard that holds at every recovery, not just the first |
 | [`Kafka`](#cassandra--kafka) | refinement | the generation-fenced transaction, with capture coupled to teardown, the offset seed, and the input-offset commit bound atomically into the snapshot write — which closes the replay window (without it the owner's re-flush regresses the snapshot) |
 | [`Epoch`](#epoch) | rejected | producer-epoch fencing **as the fence** (a stable `transactional.id` with nothing else) — the theorem is false |
-| [`TokenSync`](#tokensync) | equivalence (Kafka) | the owner's published generation token under two bump kinds (callback-firing vs silent) and two sync mechanisms (capture vs post-poll refresh): refresh subsumes capture |
-| [`RecoveryRead`](#recoveryread) | semantics (Kafka) | the recovery read's bound against transactional log semantics (LSO vs high watermark; unique vs stable `transactional.id`): finding F-10 and its two remedies |
+| `TokenSync` | equivalence (Kafka) | the owner's published generation token under two bump kinds (callback-firing vs silent) and two sync mechanisms (capture vs post-poll refresh): refresh subsumes capture |
+| [`RecoveryReadAtomic`](#recoveryread--recoveryreadatomic) | spec (read) | the atomic recovery read the tower assumes (`OwnerRecover`'s one step, stated as a spec): at one linearization point the read observes exactly the committed set |
+| [`RecoveryRead`](#recoveryread--recoveryreadatomic) | grain of atomicity (Kafka) | the read as implemented (capture a bound → drain → complete) ⇒ `RecoveryReadAtomic`, with the load-bearing platform facts held as explicit **fact knobs** (`EndOffsetsIsLSO` — F-10/#850; `Truncation` — the #849 stall) rather than baked in; the refinement fails at the exact defective `Capture` step for the as-merged design |
+| [`RecoveryDeadline`](#recoverydeadline--the-849-timing) | timing (Kafka) | the no-progress tripwire vs the rebalance eviction deadline (the timing half of #849): two clocks (total recovery time vs consecutive no-progress) and the tripwire budget between them, checked — `INV_NoSilentEviction`, `INV_OnlyStalledFails` |
 | [`CasFirstWrite`](#casfirstwrite) | grain of atomicity | the non-atomic first-write compound (`UPDATE` → `INSERT IF NOT EXISTS` → retry) ⇒ one atomic CAS |
 | [`GroupCommit`](#groupcommit) | finer (Kafka) | the write orchestration (lock + queue + per-item `Deferred`): termination + offset ordering |
 | [`FlushCell`](#flushcell) | assumption control | the non-atomic `flushCell` compound (read → `database.write` → `markPersisted`): the paired control for the per-key serialization assumption (A4) |
@@ -80,10 +96,14 @@ lives in shared snapshot code (it's Cassandra's protection) while Kafka leans on
 ## Running
 
 Needs a JRE. `tla2tools.jar` is downloaded to this folder on first run if missing (git-ignored),
-pinned to **v1.7.0 = TLC 2.16** — the version the suite is verified against, and the one the outcome
-matchers target (for 2.16 `run.sh` accepts the unnamed temporal-violation report when a config declares
-exactly one temporal property). Newer TLC (v1.8.0 / 2.18) is not a drop-in — its output tripped every
-matcher — so bump `JAR_VERSION` in `run.sh` only alongside a full suite re-run. Then:
+pinned to the tlaplus release **v1.7.0** — the reproducible artifact the suite is verified against. Its
+jar self-reports **TLC2 Version 2.15 (rev eb3ff99)**; earlier revisions of this README (and the wider
+corpus) said "2.16", assumed from the release number and never checked against the banner — corrected
+throughout. The outcome matchers target this pre-2.17 output (`run.sh` accepts the unnamed
+temporal-violation report when a config declares exactly one temporal property; 2.15 and 2.16 behave
+identically here, so only the label was wrong, not any result). Newer TLC (v1.8.0 / 2.18) is not a
+drop-in — its output tripped every matcher — so bump `JAR_VERSION` in `run.sh` only alongside a full
+suite re-run. Then:
 
 ```sh
 ./run.sh             # check every config; one PASS/FAIL line each, non-zero exit on any failure
@@ -110,11 +130,13 @@ Each config declares its module and expected outcome inline:
 What makes the suite trustworthy is **pairing**: almost every theorem/invariant that should hold has a
 sibling config that flips one knob and makes it *fail* (a removed guard / tombstone / fence / fix /
 fairness), and the refinement check has its own control (`casfw_refines_vacuous`: a deliberately
-mismatched impl/spec pair must fail the mapping). The suite is **61 configs, 35 of them expected
+mismatched impl/spec pair must fail the mapping). The suite is **73 configs, 40 of them expected
 failures**. The most recent additions — the `tokensync_*` capture-vs-refresh 2×2 (+ equivalence), the
 `gclanes_*` two-lane GroupCommit controls, the two `*_mo4`
-higher-bound events configs, the `flowsalive_*` teardown-coupling controls, and the `recoveryread_*`
-recovery-bound corners (F-10) — are grouped under
+higher-bound events configs, the `flowsalive_*` teardown-coupling controls, the `recoveryread*`
+read-refinement family (F-10/#850 as a failed refinement with the `EndOffsetsIsLSO` fact-sweep pair;
+#849 as the `Truncation`/`Tripwire` liveness pair), and the `recoverydeadline_*` timing family (the
+#849 tripwire-vs-eviction-deadline budget, checked) — are grouped under
 *Additional coverage* below but are full members of the suite.
 
 ## What each model checks
@@ -177,9 +199,10 @@ that `Kafka` otherwise has too (without the binding the owner's re-flush below t
 The rejected design — producer-epoch fencing **as the fence**: a stable `transactional.id` whose epoch
 order is the only thing gating writes. Epochs are assigned in `initTransactions` arrival order,
 independent of ownership, so a late-initialising stale owner wins the epoch and its stale write lands.
-Its refinement theorem is *false*. Note what is rejected: epoch order as the *safety* mechanism. The
-adopted design does use a stable per-partition `transactional.id` — for takeover-abort of a crashed
-owner's dangling transaction (`RecoveryRead`, finding F-10) — but safety still rests on the generation
+Its refinement theorem is *false*. Note what is rejected: epoch order as the *safety* mechanism. One
+open F-10 remedy (PR #853) would use a stable per-partition `transactional.id` — for takeover-abort of a
+crashed owner's dangling transaction (`RecoveryRead`, finding F-10) — and that is compatible with this
+rejection: safety still rests on the generation
 bound into every commit; the late-init race this model exhibits is then availability-only (the fenced
 true owner crashes, restarts, re-inits) because the stale write still dies at the generation fence.
 
@@ -187,24 +210,91 @@ true owner crashes, restarts, re-inits) because the stale write still dies at th
 |---|---|---|
 | `epoch_refines` | `Epoch ⇒ SingleWriterStore` does not hold (the stale write lands) | VIOLATES-REFINEMENT `RefSafeSpec` |
 
-### `RecoveryRead`
+### `RecoveryRead` / `RecoveryReadAtomic`
 
-The snapshot-topic recovery read against Kafka's transactional log semantics (finding F-10): the log as
-one-record transactions (committed / open / aborted), the LSO as the offset before the first open
-record (what `read_committed` `endOffsets` returns), the read's completion blocked by any open record
-below its bound (the `read_committed` position cannot pass one), and the broker's timeout abort. The
-double-handover scenario: owner A commits S1, opens a transaction, hard-crashes; owner B (whose
-**mandatory** `initTransactions` aborts A's transaction iff the id is stable — same partition, same id)
-commits the newer S3 and crashes leaving its own transaction open; reader C recovers. Isolated from the
-refinement tower, like `TokenSync`; the correctness bar is `INV_ReadsAllCommitted` — the completed read
-returned every committed record.
+The snapshot-topic recovery read, as a **refinement theorem**:
+`RecoveryRead ⇒ RecoveryReadAtomic` (`RefAtomic`). `RecoveryReadAtomic` is the spec — what the tower
+assumes when `Kafka.tla`'s `OwnerRecover` recovers in one atomic step: at a single **linearization
+point** (`DoRead`) the reader observes exactly the log's committed records, and later responds. The
+implementation is the read as written — capture a bound, drain to it, complete — and the refinement
+maps `Capture` to `DoRead` and `Complete` to `Respond`, so a bound that already *excludes* a committed
+record fails the step simulation **at the defective `Capture` step itself**, not at an end-state proxy
+invariant. This is the read-side sibling of `CasFirstWrite ⇒ CasFirstWriteAtomic`: the read's
+sub-actions do not commute with a concurrent transaction resolving, which is exactly the case where a
+coarse grain "may fail to reveal important details" (Sec. 7.3) — at the tower's abstraction,
+read-completeness held by construction, and F-10 lived inside it.
+
+The environment is the F-10 double-handover cast (owner A commits S1 and crashes with an open
+transaction; owner B — whose **mandatory** `initTransactions` aborts A's transaction iff the id is
+stable — commits the newer S3 and crashes with its own open transaction) plus the broker's
+`transaction.timeout.ms` abort and, behind a knob, tail **truncation** (unclean leader election). The
+**reader is free**: it may linearize anywhere in the script, and writers keep moving after it — what
+justifies "no fenced writer commits during recovery" is the generation fence, discharged in
+`Kafka.tla`, with the `Foreign` knob showing what its absence costs.
+
+**Facts vs. choices.** The constants separate *design knobs* (`StableId` — candidate PR #853,
+`HwTarget` — candidate PR #852, `Tripwire` — the #849 remedy) from **platform-fact knobs** held as
+constants spanning their plausible readings rather than baked into actions:
+
+- `EndOffsetsIsLSO` — what the reader's *own* `read_committed` `endOffsets` returns (the LSO, or the
+  log end). The as-merged design point **flips** across the readings (`recoveryread_endoffsets_hw`
+  HOLDS under the merged-in reading, `recoveryread_lso_unique` VIOLATES the refinement under the
+  truth), so the pair *is* finding F-10 / issue #850, mechanized — a red config pre-merge. The pin
+  that decided it: ext(K2) (KafkaConsumer javadoc) plus the live 85 ms under-read replication.
+- `Truncation` — whether the log end can regress (unclean leader election — pinned ext(K8), documentation grade). The first version of this
+  model was silently append-only — an unwritten "the log never shrinks" assumption, which is issue
+  #849's blind spot. The knob makes the exclusion stated, and its wrong reading costs a **liveness**
+  violation: a captured bound outliving the log end disables `Complete` forever
+  (`recoveryread_truncate_stall`) — in the real system a poll-thread hang into silent member eviction.
+  The `Tripwire` design knob (a bounded no-progress timer, failing loudly below
+  `max.poll.interval.ms`) restores loud termination (`recoveryread_truncate_tripwire`).
+
+The discipline both knobs mechanize: check the design **as written** under every reading; a verdict
+that flips marks a load-bearing fact, to be pinned — primary source **plus** a precondition-asserted
+experiment — before any HOLDS is believed.
+
+**The remedy 2×2** (the design knobs `{StableId, HwTarget}`, at the pinned fact `EndOffsetsIsLSO=TRUE`)
+— the F-10 remedy space, mechanized as a composition check like `TokenSync`'s capture-vs-refresh 2×2:
+
+| | HwTarget=FALSE | HwTarget=TRUE (remedy A, PR #852) |
+|---|---|---|
+| **StableId=FALSE** | `recoveryread_lso_unique` — **VIOLATES** (neither: the under-read is real) | `recoveryread_hw_unique` — **HOLDS** (A alone) |
+| **StableId=TRUE (remedy B, PR #853)** | `recoveryread_lso_stable` — **HOLDS** (B alone) | `recoveryread_both` — **HOLDS** (both compose) |
+
+Reading: without a remedy the refinement fails; **either remedy alone** makes it hold; **both compose**
+without interference. The three HOLDS corners are *safety-equivalent* — each closes #850 — but **not
+cost-equivalent**: A (and therefore "both") pays the broker-timeout wait, while B alone completes at the
+dangling transaction with no wait (`recoveryread_lso_stable` reaches `Terminates` with no `TimeoutAbort`
+on the completion path; `recoveryread_hw_unique`/`recoveryread_both` need it). That latency gap is the
+whole of the A-vs-B decision — the models leave it a decision, not a correctness question.
+
+Honest residuals: (1) *— closed.* The refinement now holds under `Truncation=TRUE` too, via the
+`FreezeObserved` **history variable**: `observed` freezes what the read saw at its linearization point,
+so a lost log tail is a pure environment step (matching the atomic spec's own `Truncate`, mapped result
+unchanged) rather than a spurious record-drop. `recoveryread_trunc_safe` HOLDS `RefAtomic` under
+truncation (safety-under-truncation, mechanized); `recoveryread_trunc_recompute` (the original
+recompute mapping) VIOLATES-REFINEMENT, the paired negative control showing the history variable is
+load-bearing. Only the append-only `INV_ReadCommittedOnly` stays `Truncation=FALSE`-scoped (a delivered
+record later truncated away is not a read defect). (2) the environment actions are textual
+twins in the two modules (defining the implementation's actions *through* the instance would let a
+mapping bug silently disable behavior — vacuity risk — so duplication is the safer failure mode, and
+the failing configs are the mapping's non-vacuity evidence); (3) the seam to the tower —
+`RecoveryReadAtomic` states the same read `OwnerRecover` performs — is a documented correspondence
+composed by implication transitivity, not one TLC run.
 
 | Config | Shows | Outcome |
 |---|---|---|
-| `recoveryread_lso_unique` | F-10 as found: unique per-assignment ids (nobody aborts A's transaction) + the read bounded at its own `read_committed` `endOffsets` — the LSO, pinned below the committed S3; the read completes early, silently missing it (live-replicated: an 85 ms under-read) | VIOLATES `INV_ReadsAllCommitted` |
-| `recoveryread_hw_unique` | remedy (1): the high-watermark bound (an uncommitted-isolation lens) makes the read *wait* the open transaction out — Kafka Streams' restore shape (KAFKA-10167, ext(K6)), mandatory under an id scheme that cannot takeover-abort | HOLDS |
-| `recoveryread_lso_stable` | remedy (2), adopted: with a stable per-partition id, B's mandatory init aborts A's transaction *before B writes*, so a committed record above an open transaction is unreachable in the lineage (`INV_LineageSerialized`) — the plain LSO bound is complete with no wait and no reader-side ordering assumption (C completes at B's dangling transaction, missing nothing) | HOLDS |
-| `recoveryread_lso_foreign` | remedy (2)'s residual as a negative control: an open transaction from *outside* the id lineage (the shared-snapshot-topic misconfiguration the docs exclude) re-pins the LSO below committed records — the one-topic-one-flow discipline is load-bearing, and no read-bound choice absorbs it (the HW bound would only turn silent into slow) | VIOLATES `INV_ReadsAllCommitted` |
+| `recoveryreadatomic_holds` | the spec is self-consistent: the atomic read terminates and returns only committed records (cf. `sws_holds`) | HOLDS |
+| `recoveryread_endoffsets_hw` | the **fact-sweep sibling**: the as-merged design (unique ids, own-`endOffsets` bound) under the *other* reading of ext(K2) (`EndOffsetsIsLSO = FALSE`, `endOffsets` = log end) — the read waits every open transaction out and linearizes; the belief under which the design merged, kept as the diverging pair's green half, not as a design option | HOLDS (incl. `RefAtomic`) |
+| `recoveryread_lso_unique` | F-10 / issue #850 as found: unique per-assignment ids (nobody aborts A's transaction) + the read bounded at its own `read_committed` `endOffsets` — under the pinned reading that is the LSO, pinned below the committed S3; `Capture` excludes S3, so **no linearization point exists** (live-replicated: an 85 ms under-read). Also the mapping's non-vacuity evidence | VIOLATES-REFINEMENT `RefAtomic` |
+| `recoveryread_hw_unique` | remedy (1) (candidate PR #852): the high-watermark bound (an uncommitted-isolation lens, immune to the fact knob) makes the read *wait* the open transaction out — Kafka Streams' restore shape (KAFKA-10167, ext(K6)), mandatory under an id scheme that cannot takeover-abort | HOLDS (incl. `RefAtomic`) |
+| `recoveryread_lso_stable` | remedy (2) (candidate PR #853): with a stable per-partition id, B's mandatory init aborts A's transaction *before B writes*, so a committed record above an open transaction is unreachable in the lineage (`INV_LineageSerialized`) — the plain LSO bound linearizes with no wait and no reader-side ordering assumption | HOLDS (incl. `RefAtomic`) |
+| `recoveryread_both` | the 2×2's fourth corner: A **and** B together — the remedies compose, no interference | HOLDS (incl. `RefAtomic`) |
+| `recoveryread_lso_foreign` | remedy (2)'s residual as a negative control: an open transaction from *outside* the id lineage (the shared-snapshot-topic misconfiguration the docs exclude) re-pins the LSO below committed records — the one-topic-one-flow discipline is load-bearing, and no read-bound choice absorbs it (the HW bound would only turn silent into slow) | VIOLATES-REFINEMENT `RefAtomic` |
+| `recoveryread_truncate_stall` | issue #849: truncation leaves the captured target above the log end; `Complete` is disabled forever — the hang (silent eviction in the real system); safety untouched, pure liveness. Remedy-orthogonal: no bound choice fixes a bound that outlives the log | VIOLATES-TEMPORAL `Terminates` |
+| `recoveryread_truncate_tripwire` | the #849 remedy: the no-progress tripwire converts the hang into a loud failure; a healthy read still completes. Fail-loud is abort-before-response — invisible to, and safe under, the atomic spec | HOLDS (`TerminatesOrFails`) |
+| `recoveryread_trunc_safe` | safety-under-truncation, mechanized: with the `FreezeObserved` history variable the read refines the atomic read even as the log tail is lost (a completed read delivered a correct observation; a hung read fails loud, delivering nothing) | HOLDS (`RefAtomic` under `Truncation=TRUE`) |
+| `recoveryread_trunc_recompute` | the paired negative control: the same run with the original recompute mapping (`FreezeObserved=FALSE`) drops an already-observed record at the `Truncate` step — proving the history variable is load-bearing (the review's C1 finding, now checked) | VIOLATES-REFINEMENT `RefAtomic` |
 
 ### `CasFirstWrite`
 
@@ -258,7 +348,7 @@ rather than a silent article of faith.
 ## Additional coverage
 
 These close residuals the study named but had earlier only argued. Grouped separately because they
-arrived after the core suite, but full members of it (counted in the 61 above, run by `run.sh`).
+arrived after the core suite, but full members of it (counted in the 73 above, run by `run.sh`).
 
 ### `GroupCommitLanes` — the two-lane write orchestration (closes G1/G2)
 
@@ -307,7 +397,7 @@ teardown", on the Kafka branch) adds then removes a partition whose flow release
 asserts it is completed by the time `remove` returns, so a fire-and-forget refactor fails the build.
 Modelled here, pinned by the test there.
 
-*(Related artifacts outside `models/`: `.github/workflows/models.yml` runs this suite on TLC 2.16 in CI.
+*(Related artifacts outside `models/`: `.github/workflows/models.yml` runs this suite on TLC 2.15 (release v1.7.0) in CI.
 The JVM counterpart of the `FlushCell`/A4 model — `FlushCellConcurrencySpec` — and the F-9
 replay-of-a-reaped-tombstone IT ship with the code they protect on the cassandra branch, not here.)*
 
@@ -348,6 +438,38 @@ is what carries it: `Consumer.scala` (capture removed) with the models-branch un
 persistence-kafka 14/14; 82 + 12 on the experiment branch), and the `Kip848ConsumerProtocolSpec` silent-bump
 case against a real 4.3.0 broker. `Kafka.tla` retains capture as the shipped design of record.
 
+### `RecoveryDeadline` — the #849 timing
+
+A standalone timing model (it does not extend `SnapshotFlow`; like `TokenSync` it tracks only its own
+state) for the half of issue #849 the untimed `RecoveryRead` cannot express. `RecoveryRead`'s
+`TerminatesOrFails` proves the read *eventually* completes or fails; #849's operational essence is a
+**deadline** — recovery runs on the poll thread, so a read that has not returned by
+`max.poll.interval.ms` gets the member **silently evicted**. "Fails eventually" is not enough; it must
+fail *loudly, before that deadline*. This model makes the two R-849 budget inequalities checkable
+invariants rather than prose.
+
+The crux is **two clocks that measure different things**: `clock` (ticks since recovery began — the
+eviction deadline runs against this and does *not* reset on progress, because the poll thread is stuck
+the whole time) and `noprog` (consecutive no-progress ticks — the tripwire fires on this and *does*
+reset on progress, R-849.1). A discrete-tick model in the spirit of Specifying Systems Ch. 9, without
+the `RTBound`/Zeno machinery TLC handles poorly.
+
+| Config | Shows | Outcome |
+|---|---|---|
+| `recoverydeadline_notrip` | #849 itself: the read as shipped has no tripwire, so a hang stalls to the deadline and the member is silently evicted | VIOLATES `INV_NoSilentEviction` |
+| `recoverydeadline_hang` | the remedy: a no-progress tripwire with `TripAt < Deadline` catches the hang and fails loudly before eviction | HOLDS |
+| `recoverydeadline_late` | R-849.2 load-bearing: `TripAt >= Deadline` fires too late — eviction wins anyway | VIOLATES `INV_NoSilentEviction` |
+| `recoverydeadline_total` | R-849.1 load-bearing: a tripwire keyed on *total elapsed* (not consecutive no-progress) fails a read that was still making progress (`noprog = 0`) | VIOLATES `INV_OnlyStalledFails` |
+| `recoverydeadline_holds` | the correct tripwire does not over-fire on a healthy read | HOLDS |
+
+Scope boundary, and a genuine finding of building it: eviction of a **slow-but-progressing** recovery
+that legitimately outruns `max.poll.interval.ms` is *not* #849 and *not* caught by a no-progress
+tripwire — the two clocks diverge (total burns while no-progress resets). That is the "large restore"
+concern (size `max.poll.interval.ms` / bound the restore), orthogonal to the hang. So
+`INV_NoSilentEviction` is checked only on the hang configs (no progress possible); the healthy configs
+check only `INV_OnlyStalledFails`. The model names this boundary rather than overclaiming the tripwire
+covers it.
+
 ## Assumptions (verified *under*, not proven)
 
 Per-key linearizable writes (each backend's primitive is one atomic register op — the first-write
@@ -355,8 +477,71 @@ compound is the one place this is modelled, `CasFirstWrite`); deterministic, rep
 user contract, so a value is a function of its offset); poll-thread serialization of rebalance
 callbacks and a key's processing — **A4**, the basis of `Kafka`'s capture-coupling and of treating
 `flushCell`'s read→write→mark compound as atomic (its paired control is `FlushCell`: remove
-serialization and the compound loses a write, `serial_race`); and the KIP-447 broker fence. The models
+serialization and the compound loses a write, `serial_race`); the KIP-447 broker fence; and the
+**takeover-abort visibility** half of ext(K5) — that once a successor's `initTransactions` returns, the
+aborted predecessor's records are not only decided but *visible as aborted* to a `read_committed`
+reader (the marker has replicated). `RecoveryRead` folds the *contract* half (init-before-produce
+serializes the id lineage) into `BInit` and takes this visibility half as given — corroborated on a
+live broker (ext(K5)'s takeover-abort IT: `read_committed` = `read_uncommitted` endOffsets right after
+init) but not mechanized. The models
 verify behaviour under these; they do not re-derive them.
+
+**Every atomic action is a compressed assumption.** The listed assumptions are the ones that were
+*written down* — but a coarse-grained action smuggles in more (Sec. 7.3): `Kafka.tla`'s one-step
+`OwnerRecover` silently assumed *the recovery read returns the complete durable state*, and that
+assumption never appeared on this list, so nothing attacked it (finding F-10 lived inside it for one
+release). The rule this suite now follows: when an action's grain compresses a compound whose
+sub-actions do not commute with the rest of the system, either refine the grain — as `CasFirstWrite ⇒
+CasFirstWriteAtomic` does for the write compound and `RecoveryRead ⇒ RecoveryReadAtomic` now does for
+the read (the compressed assumption stated as a spec and discharged by a checked refinement) — or add
+the compressed assumption to this list — silence is not an option.
+
+## Platform facts are knobs until pinned
+
+The models verify the design against *modeled* platform semantics; TLC has no access to ground truth
+about Kafka or Cassandra. A mis-read javadoc therefore produces a wrong model that verifies cleanly —
+it does not produce a red config. The one structural defense is to stop treating uncertain external
+facts as knowns: **when a load-bearing platform fact's primary source admits more than one plausible
+reading, hold the fact as a `CONSTANT` spanning the readings, and check the design *as written* under
+each one.**
+
+- **Verdicts agree across readings** → the fact is not load-bearing for this design; note it and move on.
+- **Verdicts diverge** → the fact *decides* the design's correctness. It must then be pinned — a
+  primary-source citation in `../research/external-semantics.md` **and** an experiment whose
+  *precondition is asserted* (a test that cannot pass vacuously) — before the HOLDS half of the pair is
+  believed. The knob and both configs stay in the suite afterwards: the red half documents what the
+  wrong reading costs, the green half documents what was believed and why pinning was mandatory.
+
+**The limit of this discipline, stated honestly (advisory review).** A knob only exists for a fact the
+modeller already *suspects* has more than one plausible reading. A fact you are wrongly *certain* of
+gets no knob — which is exactly how F-10 happened: the LSO-vs-log-end reading was absorbed as known,
+not swept. So the fact sweep is a *cure for a named class*, not a *detector* of the class; it cannot
+surface the fact nobody thought to question. And "verdicts agree across readings → not load-bearing"
+is only as strong as the readings enumerated — if the true reading is a third one never modelled,
+two-way agreement is false comfort. The residual is irreducible (it is the unknown-unknown), and the
+only partial mitigation the corpus has is the "every atomic action is a compressed assumption" habit
+(above) plus external review; neither closes it.
+
+The canonical instance is `RecoveryRead`'s `EndOffsetsIsLSO` (what the reader's own `read_committed`
+`endOffsets` returns): the as-merged design HOLDS under one reading (`recoveryread_endoffsets_hw`) and
+VIOLATES the refinement under the other (`recoveryread_lso_unique`) — that divergence *is* finding
+F-10, and the
+original miss happened precisely because the fact was absorbed as a known (in the safe-feeling
+"reader stalls" reading) instead of swept as a knob. The pin that settled it: ext(K2) plus the
+precondition-asserted takeover-abort IT (the original IT was vacuous — its own `initTransactions`
+aborted the transaction it meant to leave open). This is the external-fact counterpart of the suite's
+pairing discipline: pairing keeps a *stated* invariant honest; the fact sweep keeps an *absorbed*
+premise honest.
+
+The same rule covers **environment actions a model omits**: an omitted action is the "never happens"
+reading of a fact, and it deserves a knob whenever the primary source says it *can* happen.
+`RecoveryRead`'s `Truncation` is that case (issue #849; pin: ext(K8)): the append-only first version encoded "the
+log end never regresses" without writing it down; the broker's contract (unclean leader election)
+says otherwise, and the knob's true reading flips a *liveness* verdict (`recoveryread_truncate_stall`
+VIOLATES `Terminates` — the hang behind the silent member eviction — against
+`recoveryread_truncate_tripwire`, where the no-progress tripwire restores loud termination). Safety
+sweeps catch wrong beliefs about what an action *returns*; liveness sweeps catch wrong beliefs about
+what the environment *can do* — a model with no failure actions can prove any termination property.
 
 ## Triggers are abstracted, not modelled
 

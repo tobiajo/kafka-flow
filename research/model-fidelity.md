@@ -1,12 +1,11 @@
 # Model–code fidelity audit
 
-*Shared apparatus — covers all implementations, sectioned by implementation: TLA+ model↔code fidelity audit and coverage gaps. The suite itself and how to run it: [`../models/README.md`](../models/README.md). Corpus index: [`README.md`](README.md).*
+*Apparatus (shared) — TLA+ model↔code fidelity audit and coverage gaps. The suite itself and how to run it: [`../models/README.md`](../models/README.md). Corpus index: [`README.md`](README.md).*
 
 Method: every model action/definition mapped to the code construct it abstracts and verified by
 reading both; every config's constants/expectations checked; pairing discipline audited. Run results:
-all configs replicated (25 at this study's start; 38 after its additions; 61 now, with the later
-`gclanes_*`/`*_mo4`/`flowsalive_*`/`tokensync_*` additions — see the suite ledger in `findings.md`), TLC
-2.16, matching declared outcomes. The audit below merges an independent full-read audit with the orchestrator's
+all 73 configs replicated (the full suite — see the ledger in [`findings.md`](findings.md)), TLC
+2.15 (rev eb3ff99, release v1.7.0), matching declared outcomes. The audit below merges an independent full-read audit with the orchestrator's
 adversarial verification of its findings; dispositions state what was done.
 
 This file is shared across implementations and its sections are thematic (faithful / findings / gaps /
@@ -17,11 +16,12 @@ about only one:
   bullets 1 & 3; findings C1/C2, 7b, pairing holes #1/#2/#4, stale refs; coverage gaps
   events-recovery / `flushCell` / equal-offset / unfenced-wiring; both events-recovery addenda (F-6,
   F-7); and the F-9, A4, B-1 items of the advisory review.
-- **Kafka models** (`Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `TokenSync`): "Verified faithful"
+- **Kafka models** (`Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `TokenSync`,
+  `RecoveryRead` ⇒ `RecoveryReadAtomic`): "Verified faithful"
   bullets 2 (`GroupCommit`) & 4 (generation fencing); finding **K1** and pairing hole #3
   (`kafka_replay_unbound_gap`); coverage gap **G1/G2** (`GroupCommitLanes`); the **Epoch** rejected-design
-  section; the "**K1 resolved**" and "**TokenSync**" addenda; and the −1-gap and group-commit×fence×lag
-  items of the advisory review.
+  section; the "**K1 resolved**", "**TokenSync**" and "**RecoveryRead ⇒ RecoveryReadAtomic**" addenda;
+  and the −1-gap and group-commit×fence×lag items of the advisory review.
 - **Shared / root**: `SingleWriterStore` + the `SnapshotFlow` mapping; the method note above and the
   advisory review's "Foundation held" paragraph.
 
@@ -73,7 +73,7 @@ never checked → `cassandra_replay_fixoff_safe` (HOLDS, safety-only). (#3) `INV
 binding-dependence was never pinned → `kafka_replay_unbound_gap` (VIOLATES). (#4) the
 VIOLATES-REFINEMENT matcher accepted *any* action-property violation → run.sh now matches the
 abstract module the declared alias instantiates. (#1) no negative control for `casfw_refines`
-(a vacuous mapping would pass): originally accepted as low-value, **since closed** —
+(a vacuous mapping would pass) — **closed**:
 `CasFirstWrite`'s abstract instance takes its own `SpecGuarded` (normally = `Guarded`), and
 `casfw_refines_vacuous` runs the ungated compound against the guarded atomic spec: the mapping must
 fail (VIOLATES-REFINEMENT `RefinesAtomic`), so `casfw_refines` passing is evidence, not vacuity.
@@ -84,16 +84,18 @@ sentinel) in `Kafka.tla`.
 
 ## Accepted coverage gaps (with rationale)
 
-- **The recovery read's bound (Kafka)** — *gap since closed; see the RecoveryRead addendum.* The tower
+- **The recovery read's bound (Kafka)** — *closed; see the RecoveryRead addendum.* The tower
   models recovery as an atomic read of the modeled store, so the read's bound (LSO vs. high watermark
   under `read_committed`) did not exist at that abstraction and read-*completeness* held by
   construction — unfalsifiable, and it hid a real defect (F-10, the under-read past an open
   transaction). The lesson is recorded in F-10's detection post-mortem: an abstraction boundary is a
   coverage decision, and it belongs in this list at the time it is made, not after it bites.
-  `RecoveryRead.tla` backfills the corner as a semantics model (the tower's store stays atomic — the
-  bound question is separable and cleaner standalone).
-- **Events-recovery (journal fold)** — *gap since closed; see the second addendum below.* Originally
-  not modelled as a second state source; only the floor side was covered (`TombFloor`, and the study's
+  `RecoveryRead.tla` first backfilled the corner as a standalone semantics model, then was upgraded to
+  a checked grain-of-atomicity refinement of the atomic read the tower assumes
+  (`RecoveryRead ⇒ RecoveryReadAtomic` — the addendum below); the tower's own store stays atomic, with
+  the seam composed by implication transitivity.
+- **Events-recovery (journal fold)** — *closed; see the second addendum below.* The gap was that the
+  journal was not modelled as a second state source; only the floor side was covered (`TombFloor`, and the study's
   `MonotonicInit`/`ReseedFloor` paired with code fix F-3), with the `journals.flush *>
   snapshots.flush` ordering verified by code reading only. Modelling it (the `EventsRecovery` /
   `JournalOrder` / `FloorGuard` knobs) both discharged the ordering claim as a checked negative
@@ -122,14 +124,27 @@ sentinel) in `Kafka.tla`.
   positives `gclanes_holds` / `gclanes_cap1` / `gclanes_abort_holds` HOLD; the configs are part of the
   suite. What the model does *not* prove is its own fidelity to `KafkaSnapshotWriteDatabase`: the lane
   mechanism is faithful by construction and reading, not by a refinement proof against the code.
+- **Shipped-vs-modelled capture divergence (Kafka)** — *recorded as a first-class gap by the advisory
+  review ([`advisory-review.md`](advisory-review.md)), having previously lived only in the TokenSync narrative.* `Kafka.tla`
+  **retains** assignment-capture as its design of record, so the safety theorem `Kafka ⇒
+  SingleWriterStore` is proved against the *capture* variant — but the **shipped** `Consumer.scala` has
+  capture **removed** (the post-poll refresh subsumes it, F-8 corollary / KF11). So the flagship theorem
+  is checked against a variant that is not exactly what ships; the bridge to the shipped variant is
+  prose across three artifacts — `TokenSync` (refresh subsumes capture, but it "does not independently
+  prove the Kafka premise"), `FlowsAlive` (teardown coupling), and the code reading. This is the same
+  *shape* as the F-10 abstraction-boundary lesson (a divergence between model and shipped code carried
+  by argument), so it belongs in this gap list, not only in the TokenSync prose. Not a known defect —
+  the refresh-subsumes-capture argument is sound and the unit suites are green with capture removed —
+  but it is an unmechanized model↔code gap on the primary safety theorem, and is now stated as one.
 
 ## Epoch (rejected design) over-approximation
 
 After `ZombieInit` bumps the epoch, the model's owner keeps writing where the real broker would fence
 it — tolerable for a theorem meant to fail (the counterexample is reachable in the rejected design),
-noted for precision. Scope note after the id-scheme change (F-10): what this model rejects is producer-epoch
-order **as the fence**. The adopted design also uses a stable per-partition `transactional.id` — for
-takeover-abort, not safety — so the negative control outlives the change: safety still never rests on epoch
+noted for precision. Scope note for the F-10 remedy space: what this model rejects is producer-epoch
+order **as the fence**. Remedy 2 (candidate PR #853, not adopted — PR #852's HW bound is the open
+alternative) would use a stable per-partition `transactional.id` — for takeover-abort, not safety — and
+the negative control outlives either choice: safety still never rests on epoch
 order, and the late-init inversion exhibited here is availability-only under the generation fence (the
 stale write dies at the offset commit).
 
@@ -144,11 +159,11 @@ ordering. Composing this with the fence made TLC find a real defect the seam ana
 "in-memory only" (D-2): the **journal revive** — a zombie's delete racing a not-yet-fenced owner's
 replayed appends leaves pre-delete events in the journal; the next events-recovery folds them back to
 life and persists forward durably (`cassandra_events_journal_revive`, VIOLATES `INV_NoCorruptDurable`;
-reproduced against the code — findings F-6). The guard the model shape first suggested was
-`Snapshots.reconcile` (a fold the fenced store provably leads is discarded) — **which was insufficient
-and is superseded; see the F-7 addendum below.** This first model was a *scalar* journal (`journalAt`
-folded by `CorrectContents`), and that is precisely why it could not catch F-7 — it encoded "the
-journal is a correct prefix" by construction. The paired controls pin the floor read
+reproduced against the code — findings F-6). The fold-comparison guard `Snapshots.reconcile` (a fold
+the fenced store provably leads is discarded) is **insufficient** (F-7, addendum below): a *scalar*
+journal (`journalAt` folded by `CorrectContents`) encodes "the journal is a correct prefix" by
+construction, so it cannot catch F-7 — the adopted fix is the offset floor, with the journal now a row
+set. The paired controls pin the floor read
 (`cassandra_events_nofloor`) and the flush ordering (`cassandra_events_unordered`).
 
 ## Addendum: the journal modelled as a row set (F-7 — the review committee's finding)
@@ -172,7 +187,7 @@ reentry control proves the polluted state reachable in the shared state space. R
 second recovery over an advanced store, so **M4** was taken up in full: Cassandra `Handover` is now a
 `0..2` counter, and (Kafka side, same M4) the single-zombie scalars became functions over a bounded
 zombie set with `Rebalance`/`GenBump`/`Handover` as `0..2` counters — two concurrent stale generations,
-the fence still holds. Suite: 38 configs / 23 expected failures, all as declared (TLC 2.16). The lesson
+the fence still holds. The lesson
 is the study's own, turned on itself: a model that assumes the property it is meant to check certifies
 nothing — the row-set remodel is what makes the events-recovery HOLDS mean something.
 
@@ -206,7 +221,7 @@ review found, and what survived it:
   witness invariants (the hazard is reached at the config's own bound with the defense on). All 23
   negative controls fail for their **intended** reason (each counterexample inspected raw). The four
   README assumptions are honestly dispositioned — LWT linearizability, poll-thread serialization and the
-  KIP-447 fence discharged at source in `external-semantics.md`; determinism is a correctly-asserted user
+  KIP-447 fence discharged at source in [`external-semantics.md`](external-semantics.md); determinism is a correctly-asserted user
   contract.
 - **F-9 (Axis F, "skip-tombstone") — a real, confirmed reachability gap, now fixed.** The always-tombstone
   delete in `Cassandra.tla` modelled the *fix* before the code had it, masking the never-persisted-delete
@@ -226,11 +241,11 @@ review found, and what survived it:
   non-vacuous; `cassandra_events_revive_reentry.cfg` now carries a note saying so. Bound not raised
   (raising it does not change which trace TLC reports).
 - **Refuted / out of scope.** The Kafka `-1` unknown-generation gap (Axis D) is broker semantics the models
-  rightly *assume* (like the KIP-447 fence) — source-verified in `external-semantics.md` ext(K3), claim-pinned
+  rightly *assume* (like the KIP-447 fence) — source-verified in [`external-semantics.md`](external-semantics.md) ext(K3), claim-pinned
   KF5, IT-covered; a model knob would be redundant and violate the suite's scope boundary. The one residue
-  — `docs/kafka-single-writer-design.md` framed −1 as a freshness matter, not the fence-*bypass* it is —
-  was a cross-branch doc nit, **since fixed on the Kafka branch (#843)**: the doc now states publishing
-  `generationId < 0` lands the offset commit unfenced, which is why `Consumer.publish` refuses it. The
+  — that [`docs/kafka-single-writer-design.md`](../docs/kafka-single-writer-design.md) could frame −1 as a freshness matter, not the fence-*bypass*
+  it is — is resolved: the design doc (Kafka branch, #843) states publishing `generationId < 0` lands the
+  offset commit unfenced, which is why `Consumer.publish` refuses it. The
   `run.sh` `VIOLATES-REFINEMENT` matcher
   keys on the abstract module only (Axis C): sound today (one action property in `SingleWriterStore`),
   documented in the runner, left as-is. The group-commit×fence×lag composition (Axis D) is a sound modular
@@ -240,8 +255,6 @@ review found, and what survived it:
   path; `INV_NoSlotSteal` / `LIVE_MarkersNotStarved` / `INV_OffsetWithinDurable`, each with a paired
   negative). The Cassandra guard-expired repair and the idle-unload/Epoch
   abstractions are honest, adequately-disclosed boundaries.
-
-Suite after the round: **41 configs / 25 negative controls**, all as declared (TLC 2.16).
 
 ## Addendum: TokenSync — capture vs. refresh equivalence (the capture-removal experiment)
 
@@ -265,22 +278,80 @@ configs (3 HOLDS + 2 negative controls)**. `Kafka.tla` retains capture as the de
 it conflates capture with teardown (its `Poll(z)` is both), so it cannot cleanly show the capture-removed
 variant's zombie-safety — that rests on the code (teardown-on-revoke) and `FlowsAlive`, not on this model.
 
-## Addendum: RecoveryRead — the recovery read's bound (F-10 and its remedies)
+## Addendum: RecoveryRead ⇒ RecoveryReadAtomic — the read joins the tower's theorem structure
 
-`RecoveryRead.tla` is a semantics model isolated from the tower (like `TokenSync`): it checks the
-*reasoning* about Kafka's transactional log semantics against the recovery read's bound, with the
-external facts assumed as modeled, not derived. Fidelity notes: the LSO is defined structurally (the
-offset before the first open record — the `read_committed` `endOffsets` semantics of ext(K2)); the
-read's wait is the `Complete` guard (a `read_committed` position cannot pass an open record); a
-takeover-abort is folded into `BInit` (mandatory init aborts the same-lineage open transaction —
-the *contract* half of ext(K5); the marker-replication visibility half is not modeled and not needed,
-since `BInit` precedes `BWriteS3` in the script exactly as init-before-produce is mandatory in the
-client). The double-handover scenario is a fixed cast (A crashes mid-transaction, B commits above it
-and crashes mid-transaction, C reads), so this is a scripted scenario check, not an exhaustive
-protocol exploration — deliberately: the four configs are the four corners of the design space
-(bound × id scheme), and `TimeoutAbort` is left free to interleave so TLC also covers the pin
-resolving before/after the capture. Non-vacuity: the HOLDS configs carry `PROPERTY Terminates`
-(completion is reached, the read is not forever blocked) and the stable config additionally checks
-`INV_LineageSerialized` — the structural fact (committed-above-open unreachable within a lineage) that
-makes the LSO bound complete, checked rather than asserted. Adds **4 configs (2 HOLDS + 2 negative
-controls)**; run in CI with the rest of the suite (TLC 2.16).
+The read's correctness is now a **checked refinement**, not an isolated semantics check:
+`RecoveryReadAtomic.tla` states the atomic read the tower assumes (`Kafka.tla`'s `OwnerRecover` in
+one step — a single linearization point observing exactly the committed set), and `RecoveryRead.tla`
+is the read as implemented (capture a bound → drain → complete), with `RefAtomic ==
+Atomic!SafeSpec` the step-simulation theorem. The mapping sends `Capture` to the spec's `DoRead` (the
+linearization point) and `Complete` to `Respond` via a `ResultView` state function, so a bound that
+already excludes a committed record fails the simulation *at the defective `Capture` step*. F-10 is
+that theorem false as merged (`recoveryread_lso_unique` VIOLATES-REFINEMENT); either open remedy
+restores it (`recoveryread_hw_unique` = PR #852, `recoveryread_lso_stable` = PR #853, both HOLDS with
+`RefAtomic`); the reader is de-scripted (it may linearize anywhere in the double-handover cast,
+writers continuing around it), which retired the scripted-era proxy invariant
+`INV_ReadsAllCommitted` — under a free reader it was unsound (later commits falsely flag a completed
+read). This mirrors `CasFirstWrite ⇒ CasFirstWriteAtomic` on the write side.
+
+Two **fact knobs** carry the post-mortem's rule (a platform fact whose readings change a verdict is
+load-bearing and must be pinned — primary source + precondition-asserted experiment — before the
+HOLDS half is believed): `EndOffsetsIsLSO` (what the reader's own `read_committed` `endOffsets`
+returns; the flip `recoveryread_endoffsets_hw` HOLDS vs `recoveryread_lso_unique` VIOLATES *is*
+F-10/#850, pinned by ext(K2) + the takeover-abort IT) and `Truncation` (whether the log end can
+regress, pinned ext(K8) at documentation grade — the append-only first version of the model encoded
+"never" without writing it down; the
+true reading flips *liveness*: `recoveryread_truncate_stall` VIOLATES-TEMPORAL `Terminates` = issue
+#849's hang, and the `Tripwire` design knob restores loud termination,
+`recoveryread_truncate_tripwire` HOLDS `TerminatesOrFails`).
+
+Fidelity notes: the LSO is defined structurally (the offset before the first open record); the
+read's wait is the `Complete` guard (a `read_committed` position cannot pass an open record) and its
+reach is `target <= Len(log)` (a position cannot reach a bound past the log end — the #849 seam); a
+takeover-abort is folded into `BInit` (the *contract* half of ext(K5); the marker-replication
+visibility half is not modeled and not needed, since init precedes the takeover's writes exactly as
+in the client). Non-vacuity: the failing refinement configs are the mapping's own evidence that it
+can fail; the stable config additionally checks `INV_LineageSerialized`, and HOLDS configs carry
+`PROPERTY Terminates`. **Residuals, stated:** (1) *— closed.* The refinement now holds under
+`Truncation=TRUE` as well, via a **history variable** `observed` (the `FreezeObserved` knob): the read's
+observation is frozen at its linearization point, so a lost log tail cannot un-observe it, and a
+Truncate is a pure environment step matching the atomic spec's own with the mapped result unchanged.
+`recoveryread_trunc_safe` HOLDS `RefAtomic` under truncation (the tripwire's safety-under-truncation,
+previously prose — review caveat C1, now mechanized), and `recoveryread_trunc_recompute` — the same run
+with the original recompute mapping (`FreezeObserved=FALSE`) — VIOLATES-REFINEMENT, pinning that the
+history variable is load-bearing (the review's C1 finding, now a checked negative control). What stays
+prose is only the append-only `INV_ReadCommittedOnly`, which recomputes against the current log and so
+is checked only on the `Truncation=FALSE` configs (a delivered record later truncated away is not a
+read defect — `RefAtomic` is the safety property under truncation). (2) the writer/broker actions are
+textual twins across the two modules (defining the impl's actions *through* the instance would let a
+mapping bug silently disable behavior); (3) the seam to the tower — that `OwnerRecover` and
+`RecoveryReadAtomic` state the same read — composes by implication transitivity across TLC runs and is a
+documented correspondence, not a checked substitution. Adds **11 configs (7 HOLDS + 4 negative
+controls)**, including the spec's own self-check (`recoveryreadatomic_holds`, cf. `sws_holds`), the
+`trunc_safe`/`trunc_recompute` history-variable pair, and `recoveryread_both` completing the remedy
+2×2 (either remedy alone closes #850; both compose). Run in CI with the rest of the suite (the pinned
+TLC, v1.7.0 / self-reports 2.15).
+
+## Addendum: RecoveryDeadline — the #849 timing (the tripwire vs the eviction deadline)
+
+`RecoveryRead`'s `TerminatesOrFails` is *untimed* — it proves the read eventually completes or fails,
+not that it fails before the poll-thread eviction deadline, which is #849's operational essence.
+`RecoveryDeadline.tla` (standalone, like `TokenSync`) closes that: a discrete-tick model with **two
+clocks that measure different things** — `clock` (ticks since recovery began; the `max.poll.interval.ms`
+deadline runs against it and does *not* reset on progress, because the poll thread is stuck the whole
+time) and `noprog` (consecutive no-progress ticks; the tripwire fires on it and *does* reset). This
+turns R-849's two budget inequalities from prose into checked invariants: `recoverydeadline_notrip`
+VIOLATES `INV_NoSilentEviction` (the shipped unbounded loop → silent eviction — #849 itself),
+`recoverydeadline_hang` HOLDS (the tripwire catches the hang), `recoverydeadline_late` VIOLATES
+(R-849.2: `TripAt >= Deadline` fires too late), `recoverydeadline_total` VIOLATES `INV_OnlyStalledFails`
+(R-849.1: a total-duration tripwire kills a progressing read), `recoverydeadline_holds` HOLDS (no
+over-fire). Non-vacuity: the HOLDS configs reach `TripFail`/`Complete`, not merely avoid `evicted`; the
+VIOLATES configs' traces reach `evicted`/`failed` for the stated reason. **A genuine finding of
+building it, recorded rather than hidden:** eviction of a slow-but-*progressing* recovery that outruns
+`max.poll.interval.ms` is *not* the hang and *not* caught by a no-progress tripwire (the two clocks
+diverge) — the "large restore" concern, orthogonal to #849 and handled by sizing the poll interval, so
+`INV_NoSilentEviction` is asserted only on the hang configs. Fidelity: the tick granularity is the
+abstraction (no `RTBound`/Zeno machinery, which TLC handles poorly); the budgets are symbolic tick
+counts, so the model checks the *structure* of the inequalities, not concrete millisecond values —
+those are the R-849.2a wiring-time validation's job. Adds **5 configs (2 HOLDS + 3 negative
+controls)**. Run in CI with the rest (the pinned TLC).

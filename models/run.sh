@@ -18,11 +18,16 @@
 # Needs a JRE. tla2tools.jar is downloaded to this folder on first run if missing (git-ignored);
 # override the version/URL with the JAR_VERSION/JAR_URL vars below.
 #
-# Pinned to v1.7.0 = TLC2 Version 2.16 of 31 December 2020 -- the version the suite is verified against and
-# the one the matchers below target (2.16 emits the unnamed "Temporal properties were violated." report,
-# which the VIOLATES-TEMPORAL matcher accepts for a single-property config). Newer TLC (e.g. v1.8.0 / 2.18)
-# is NOT a drop-in: its output tripped every matcher (0/N). Bump only with a full suite re-run and any
-# matcher changes it forces.
+# Pinned to tlaplus release v1.7.0 (JAR_URL below) -- the reproducible artifact the suite is verified
+# against. Its jar self-reports "TLC2 Version 2.15 ... rev: eb3ff99" (verify with `java -cp tla2tools.jar
+# tlc2.TLC` -- run `-version`-style: the banner prints on any invocation); earlier revisions of this
+# header and the corpus said "2.16", which was wrong (assumed from the release number, never checked
+# against the banner -- corrected across the corpus). The matchers target this pre-2.17 output: it emits
+# the unnamed "Temporal properties were violated." report (no property name), which the
+# VIOLATES-TEMPORAL matcher accepts for a single-property config -- 2.15 and 2.16 behave identically
+# here, so only the label was wrong, not the results. Newer TLC (e.g. v1.8.0 / 2.18) is NOT a drop-in:
+# its output tripped every matcher (0/N). Bump only with a full suite re-run and any matcher changes it
+# forces.
 set -u
 cd "$(dirname "$0")" || exit 2
 
@@ -81,7 +86,15 @@ for cfg in *.cfg; do
     ((fail++)); continue
   fi
 
-  out="$(java -cp "$JAR" tlc2.TLC -workers "${WORKERS:-auto}" "${flags[@]+"${flags[@]}"}" -config "$cfg" "$spec.tla" 2>&1)"
+  # Reproducibility (both found by the fresh-context model review):
+  #  - Unique metadir per config: TLC's default scratch dir is states/<spec>/<timestamp-to-the-second>,
+  #    so two configs of the SAME spec finishing within one second collide ("directory already exists").
+  #  - Single worker by default: multi-worker (`-workers auto`) liveness checking crashes in some
+  #    environments with `FileNotFoundException .../nodes_0` during implied-temporal checking, falsely
+  #    failing genuinely-HOLDS temporal configs. The suite is tiny, so serial is the reproducible
+  #    default; override with WORKERS=auto for speed once you've confirmed it is stable locally.
+  meta="states/$name.$$"
+  out="$(java -cp "$JAR" tlc2.TLC -workers "${WORKERS:-1}" -metadir "$meta" "${flags[@]+"${flags[@]}"}" -config "$cfg" "$spec.tla" 2>&1)"
 
   case "$expect" in
     HOLDS)
@@ -102,6 +115,7 @@ for cfg in *.cfg; do
       # (RefinesAtomic -> CasFirstWriteAtomic; the Ref* tower aliases -> SingleWriterStore).
       case "${expect#VIOLATES-REFINEMENT }" in
         RefinesAtomic) mod="CasFirstWriteAtomic" ;;
+        RefAtomic)     mod="RecoveryReadAtomic" ;;
         Ref*)          mod="SingleWriterStore" ;;
         *)             mod="[A-Za-z0-9_]+" ;;
       esac
@@ -118,7 +132,7 @@ for cfg in *.cfg; do
   if [[ $r == FAIL ]]; then
     { echo "----- $name: raw TLC output (expected $expect) -----"; tail -n 30 <<<"$out"; echo "----- end $name -----"; } >&2
   fi
-  rm -rf states "${spec}_TTrace_"*.tla "${spec}_TTrace_"*.bin 2>/dev/null
+  rm -rf "$meta" states "${spec}_TTrace_"*.tla "${spec}_TTrace_"*.bin 2>/dev/null
 done
 
 echo "----"

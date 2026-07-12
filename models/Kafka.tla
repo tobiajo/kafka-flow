@@ -180,6 +180,14 @@ OwnerMarker ==
   /\ UNCHANGED <<op, store, ownerPos, ownerLoaded, ownerState, overwrote, scheduled, recoveredAt, liveGen,
                  zAlive, zCapturedGen, zCarriesOffset, rebalances, handovers, oCapturedGen, genBumps>>
 
+\* the owner recovers the durable state -- ONE atomic step. That grain of atomicity (Specifying
+\* Systems Sec. 7.3) compresses a real compound (capture a read bound, drain to it, complete) whose
+\* sub-actions do NOT commute with a concurrent transaction resolving, so read-COMPLETENESS is not
+\* checkable at this abstraction: it holds by construction. The compressed assumption is stated as
+\* its own spec (RecoveryReadAtomic: one linearization point observing exactly the committed set)
+\* and discharged by the checked refinement RecoveryRead => RecoveryReadAtomic, with the bound's
+\* platform semantics (endOffsets under read_committed; log truncation) as explicit fact knobs --
+\* findings F-10/#850 (the theorem false as merged) and #849 (the stall) lived inside this step.
 OwnerRecover ==
   /\ ~ownerLoaded
   /\ ownerState' = RecoveredState
@@ -265,7 +273,7 @@ GenBump ==
 \* weaken the fence; it only closes the lag that GenBump opens. Refresh=FALSE is assignment-time capture
 \* alone (the pre-fix code). GenBump is a free Next disjunct (it can interleave anywhere, not only at a
 \* poll), so this spec already models the background-thread epoch advance; the read (OwnerRefresh) is what
-\* observes it. The capture-removal experiment (kafka-consumer-protocol-experiment.md) drops assignment-time
+\* observes it. The capture-removal experiment (research/kafka-generation-study.md) drops assignment-time
 \* capture entirely and keeps only this refresh; TokenSync.tla demonstrates (under the modeled capture/refresh
 \* asymmetry) that the refresh subsumes capture for owner-token currency. NOTE this spec conflates two
 \* mechanisms that are separate in the code: here `Poll(z)` (the Coupled knob) is the ONLY zombie teardown AND

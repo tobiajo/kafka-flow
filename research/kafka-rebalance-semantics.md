@@ -1,6 +1,6 @@
 # Study: consumer-group rebalance semantics (primary-source verification)
 
-*Kafka arm of the #732 single-writer study — primary-source pin of rebalance mechanics: classic-protocol verdicts, the KIP-848 addendum, and the `group.protocol=consumer` guide. Corpus index: [`README.md`](README.md).*
+*Narrative (supporting). Kafka arm of the #732 single-writer study — primary-source pin of rebalance mechanics: classic-protocol verdicts, the KIP-848 addendum, and the `group.protocol=consumer` guide. Corpus index: [`README.md`](README.md).*
 
 The fencing arguments in the Kafka single-writer design lean on precise claims about kafka-clients
 rebalance mechanics — where the generation moves, when each callback fires, and what the broker
@@ -23,7 +23,7 @@ cited structure identical between branch 3.9 and trunk for every classic-protoco
 | 3 | Eager ordering: revoked fires in `onJoinPrepare`, before the JoinGroup round, with the still-current generation — a commit inside the callback is accepted | **CONFIRMED, one qualification** (3-0) | Revoked fires for ALL owned partitions strictly before `initiateJoinGroup`, with the previous generation passed in; an in-source comment keeps the assignment accessible "to commit offsets etc.". Qualification: acceptance holds for a *graceful* rebalance — client-side ordering cannot prevent a broker-side generation bump racing the commit. If the heartbeat already reset the generation, the lost branch runs instead, so whenever eager revoked fires the generation is valid. |
 | 4 | Cooperative ordering in `onJoinComplete`: generation stamped into `groupMetadata` BEFORE the revoked callback | **CONFIRMED** (3-0) | Exact order: (1) stamp generation+memberId (line ~395); (2) cooperative branch computes revoked = owned − assigned and, only if non-empty, invokes revoked (line ~446); (3) `requestRejoin` inside that guard; (4) `assignor.onAssignment`; (5) `assignFromSubscribed`; (6) `invokePartitionsAssigned(addedPartitions)` UNCONDITIONALLY (line ~469). Same structure on 3.9. So the cooperative revoke callback always runs with the member already on the new generation — still inside the poll, on the app thread. |
 | 5 | Cooperative revoke-time commit carrying the captured (previous) generation is always fenced; one reading `groupMetadata` live would carry the new generation and be ACCEPTED, because the broker validates member+generation, never partition ownership | **CONFIRMED for the classic coordinator** (3-0) | `validateOffsetCommit(group, generationId, memberId, groupInstanceId, isTransactional)` — no partition argument; `doCommitOffsets`/`doTxnCommitOffsets` pass the offsets map to `storeOffsets` with no ownership filtering (assignments stored as opaque bytes). The KRaft-native `ConsumerGroup` validator was NOT verified (the one supporting source was a mailing-list mirror, killed 1-2); trunk `ClassicGroup.validateOffsetCommit` independently confirmed to preserve classic semantics for classic-type groups in 4.x. |
-| 6 | The −1/empty sentinel skips validation on the classic path | **CONFIRMED, and stronger than we claimed** (3-0) | For non-transactional commits the sentinel is accepted only when the group is Empty; for TRANSACTIONAL commits the `UNKNOWN_MEMBER_ID` rejection is gated on `!isTransactional` — the sentinel lands unfenced even against a NON-empty group ("older versions of this protocol do not require memberId and generationId"). The gate survives into the 4.x Java coordinator for classic-type groups. Gate shape: the classic skip keys on any `generationId < 0` with the member id unset — the whole negative family, not only −1; the consumer-type gate is `== −1` exactly (full span table: `external-semantics.md` ext(K3)). This strengthens the publish-guard rationale in `Consumer.publish`. |
+| 6 | The −1/empty sentinel skips validation on the classic path | **CONFIRMED, and stronger than we claimed** (3-0) | For non-transactional commits the sentinel is accepted only when the group is Empty; for TRANSACTIONAL commits the `UNKNOWN_MEMBER_ID` rejection is gated on `!isTransactional` — the sentinel lands unfenced even against a NON-empty group ("older versions of this protocol do not require memberId and generationId"). The gate survives into the 4.x Java coordinator for classic-type groups. Gate shape: the classic skip keys on any `generationId < 0` with the member id unset — the whole negative family, not only −1; the consumer-type gate is `== −1` exactly (full span table: [`external-semantics.md`](external-semantics.md) ext(K3)). This strengthens the publish-guard rationale in `Consumer.publish`. |
 | 7 | `onPartitionsAssigned` fires on every completed rebalance, empty delta included; revoked/lost fire only non-empty | **HALF CONFIRMED / HALF REFUTED** (3-0) | Assigned: unconditional in `onJoinComplete`, javadoc-guaranteed since 2.4/KIP-429 ("always be triggered exactly once ... even if there is no newly assigned partitions ... with an empty collection"), wording unchanged through 3.9. Revoked: the EAGER branch of `onJoinPrepare` has NO `isEmpty` guard — an already-joined eager member owning zero partitions gets an empty revoked callback on rejoin (not on first join, where generation −1 routes to the guarded lost branch). Non-empty holds only for cooperative revoked and all lost paths. The blanket "revoked/lost are empty-gated" in this study's earlier wording was wrong; corrected. |
 | 8 | KIP-266: the join round can span multiple `poll()` calls; `groupMetadata()` reflects the last COMPLETED join throughout | **CONFIRMED, medium confidence** | `onJoinPrepare` takes a Timer and returns boolean; `joinGroupIfNeeded` returns `false` mid-rebalance and resumes on a later poll (KAFKA-13310 structure, 3.2+). Combined with verdict 2, `groupMetadata()` cannot observe an incomplete join. Inferred from the verified return-false/resume structure rather than end-to-end timeout tracing. |
 | 9 | KIP-848 (`group.protocol=consumer`): epoch advances on the background thread; callbacks still on the app thread; sentinel handled differently; KIP-447 support unclear | **LARGELY UNVERIFIED at first pass — since pinned** | Only the callback-threading half survived the first pass (source quality). A dedicated second pass — decompiled client bytecode plus broker/coordinator primary sources — has since pinned every question this row left open; see the KIP-848 addendum below. |
@@ -196,8 +196,9 @@ accepted at the broker and the spurious fence disappears without any read — th
 redundant there (relevant to a future consumer-protocol solution: a 4.3.0+ broker floor could drop it).
 
 The unwinding is therefore gated on the **protocol**, not merely on the skafka fix: sound under classic,
-unsafe under consumer. This is why the canary's note and the dispositions record both scope the "refresh
-can be reconsidered" conclusion to the classic protocol.
+unsafe under consumer. This is why the canary's note and the PR-review dispositions (the appendix in
+[`kafka-generation-study.md`](kafka-generation-study.md)) both scope the "refresh can be reconsidered"
+conclusion to the classic protocol.
 
 ### Residual unknowns from this pass (do not cite as fact)
 
@@ -222,7 +223,7 @@ can be reconsidered" conclusion to the classic protocol.
   translates `StaleMemberEpochException` → `ILLEGAL_GENERATION` on the TxnOffsetCommit path
   (`OffsetMetadataManager.validateTransactionalOffsetCommit`, source-quoted), which the producer aborts
   gracefully (`CommitFailedException`). The earlier "harsher/fatal" framing is corrected in C4, the
-  consequences above, and (now) `docs/kafka-single-writer-design.md`.
+  consequences above, and (now) [`docs/kafka-single-writer-design.md`](../docs/kafka-single-writer-design.md).
 - The **co-tenant-join epoch advance is settled** — B6 pins it at source. The **retained-partition
   revocation-window race** (a *retained*-partition commit issued while the broker bumps the epoch through
   a rebalance) is a concrete instance of the C1 read-to-commit window: on **≤4.2.0** it is fenced
@@ -232,7 +233,7 @@ can be reconsidered" conclusion to the classic protocol.
   empirical unknown.
 - **The addendum was analytical; it is now partly runtime-confirmed.** It rests on decompiled client
   bytecode (4.3.0) and read broker source (4.0–4.2). The realized experiment
-  ([`kafka-consumer-protocol-experiment.md`](kafka-consumer-protocol-experiment.md)) then exercised
+  ([`kafka-generation-study.md`](kafka-generation-study.md)) then exercised
   `group.protocol=consumer` against a live Kafka **4.3.0** broker and confirmed the load-bearing predictions:
   the member epoch advances **on the background thread with no rebalance callback** on a silent bump (only a
   read observes it), the epoch can be **read before the initial assign callback drains** on the poll thread,

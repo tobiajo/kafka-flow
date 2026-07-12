@@ -1,6 +1,6 @@
 # External Cassandra semantics — verification results
 
-*Shared apparatus — covers all implementations, sectioned by implementation: primary-source verification of external facts the designs rest on (Cassandra ext(1)–(X2); Kafka-broker ext(K1)–(K4)). Corpus index: [`README.md`](README.md).*
+*Evidence (shared, sectioned by implementation) — primary-source verification of external facts the designs rest on (Cassandra ext(1)–(X2) and ext(C-F9); Kafka-broker ext(K1)–(K8)). Corpus index: [`README.md`](README.md).*
 
 Claims the design rests on, verified against primary sources (Apache docs, Apache JIRA, Cassandra
 source, DataStax docs; corroborating expert material). Four research passes. Sources are cited by
@@ -8,7 +8,7 @@ their locatable identifiers — JIRA ticket numbers (`CASSANDRA-nnnnn`), source 
 (e.g. `ModificationStatement.buildCasResultSet`), CEP/KIP numbers, and doc titles — rather than raw
 URLs, so a reader can resolve each against the versioned Apache/DataStax source and issue tracker;
 bare hyperlinks were deliberately not embedded (they rot; the identifiers do not). Numbering follows
-`claims.md` ext references.
+[`claims.md`](claims.md) ext references.
 
 ## ext(1) LWT linearizability per partition, no clock dependency — **PARTIALLY CONFIRMED**
 
@@ -86,7 +86,7 @@ Caveats that condition the design's A1 assumption:
 DataStax docs verbatim: "Lightweight transactions use a timestamping mechanism different than for
 normal operations and mixing LWTs and normal operations can result in errors. If lightweight
 transactions are used to write to a row within a partition, only lightweight transactions for both
-read and write operations should be used." Apache in-tree `service/paxos/Paxos.md`: partition updates
+read and write operations should be used." Apache in-tree [`service/paxos/Paxos.md`](https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/paxos/Paxos.md): partition updates
 carry ballot-derived timestamps; "The descriptions and proofs below assume no non-LWT modifications
 to the partition. Any other write … may reach a minority of replicas and leave the partition in an
 inconsistent state." Mechanism: plain write with later wall-clock timestamp shadows a committed LWT
@@ -132,7 +132,7 @@ reaped).
 The Kafka single-writer mode rests on broker guarantees the way the Cassandra mode rests on LWT
 semantics; verified at source (apache/kafka trunk group-coordinator; KIP-447/KIP-848; Kafka 4.0 javadoc).
 Several of these are now **runtime-corroborated** against a real `apache/kafka:4.3.0` broker by the
-consumer-protocol experiment (`Kip848ConsumerProtocolSpec`, `kafka-consumer-protocol-experiment.md`): the
+consumer-protocol experiment (`Kip848ConsumerProtocolSpec`, [`kafka-generation-study.md`](kafka-generation-study.md)): the
 stale-epoch transactional commit is fenced → `CommitFailedException` → abort under *both* protocols (ext(K1)),
 and the silent, no-callback epoch bump is observed (ext(K4)). Source remains the primary evidence; the run
 discharges the addendum's "analytical only" caveat for the exercised cases.
@@ -149,12 +149,12 @@ discharges the addendum's "analytical only" caveat for the exercised cases.
   fence is the *same* strength as classic; **from 4.3.0, KIP-1251 relaxes the lagging side** (a per-partition
   assignment-epoch check accepts a lagging commit for a still-owned partition) — a partition reassigned
   away is still fenced, so it is more forgiving, never less safe (version note in
-  `kafka-rebalance-semantics.md`; KAFKA-19779 is the StreamsGroup-only sibling). The other real
+  [`kafka-rebalance-semantics.md`](kafka-rebalance-semantics.md); KAFKA-19779 is the StreamsGroup-only sibling). The other real
   difference is that the epoch moves off the poll thread (see ext(K4)); the *failure mode is the same as
   classic* — on the transactional path the coordinator translates the stale-epoch error to
   `ILLEGAL_GENERATION`, which the producer aborts gracefully via `CommitFailedException` (an earlier draft
   here called it a *fatal* error — wrong for the transactional path; corrected). Full audit:
-  `kafka-rebalance-semantics.md`, KIP-848 addendum.
+  [`kafka-rebalance-semantics.md`](kafka-rebalance-semantics.md), KIP-848 addendum.
 - **ext(K2) `read_committed` recovery — CONFIRMED, with the stall claim CORRECTED (replicated on a real
   broker).** A `read_committed` consumer reads only committed transactional records and never advances
   past the Last Stable Offset (LSO = min(high watermark, first offset of any open txn)), so an in-flight
@@ -167,14 +167,24 @@ discharges the addendum's "analytical only" caveat for the exercised cases.
   written — replicated against a live broker (an 85 ms "successful" completion missing a committed
   record) and recorded as finding F-10, which maps the remedy space: bound the read at the high
   watermark through a `read_uncommitted` lens and *wait* the open txn out (the Kafka Streams restore
-  shape, ext(K6)) — a wait bounded by the *producer's* `transaction.timeout.ms` (default **60 s**), not
-  the broker cap `transaction.max.timeout.ms` (15 min), which only bounds what a client may request —
+  shape, ext(K6)) — a wait bounded by the *producer's* `transaction.timeout.ms` (default **60 s**) plus
+  the broker's abort-scan interval, not the broker cap `transaction.max.timeout.ms` (15 min), which
+  only bounds what a client may request —
   or make the pin unreachable with a stable per-partition `transactional.id`, whose mandatory
-  `initTransactions` serializes the id lineage (ext(K5)); the design adopted the latter (model
-  `RecoveryRead`). Related, source-verified: the consumer's OffsetFetch always sets `requireStable`
+  `initTransactions` serializes the id lineage (ext(K5)); both remedies are open candidates (PR #852 =
+  the HW bound, PR #853 = the stable id; model `RecoveryRead` proves the read violates with neither
+  and either alone suffices). Related, source-verified: the consumer's OffsetFetch always sets `requireStable`
   (`ConsumerCoordinator` → `OffsetFetchRequest.Builder(groupId, true, …)`), so *pending transactional
   offset commits* make a new owner's `position()` wait (`UNSTABLE_OFFSET_COMMIT` retries) — which is why
   the under-read window needs a crash after the txn's produces but before its `sendOffsetsToTransaction`.
+  **The abort scan — CONFIRMED source-level.** A hung transaction is not aborted exactly at
+  `transaction.timeout.ms`; the coordinator's background scan rolls it back on the next tick of
+  `transaction.abort.timed.out.transaction.cleanup.interval.ms` (*"The interval at which to rollback
+  transactions that have timed out"*, `TransactionStateManagerConfig.TRANSACTIONS_ABORT_TIMED_OUT_TRANSACTION_CLEANUP_INTERVAL_MS_DEFAULT
+  = TimeUnit.SECONDS.toMillis(10)`, checked apache/kafka trunk 2026-07). So the worst-case
+  Remedy-A wait for a hung txn to clear is `transaction.timeout.ms` **+ up to ~10 s**, not
+  `transaction.timeout.ms` alone — the concrete lower bound the R-849 stall tripwire's budget must
+  clear (R-849.2).
 - **ext(K3) Negative-token handling and the `generationId >= 0` guard — CONFIRMED (source-level; both
   coordinators, both consumer clients).** *The negatives.* Classic: `generationId = −1`
   (`UNKNOWN_GENERATION_ID`, the pre-join / not-a-member value). KIP-848 member epochs
@@ -228,14 +238,14 @@ discharges the addendum's "analytical only" caveat for the exercised cases.
   classic-protocol assumption, and only a post-poll *read* can track the epoch there (no callback-based
   scheme can). Validation is member+epoch exact-equality with no per-partition check **through 4.2.0**;
   **from 4.3.0 KIP-1251 relaxes the lagging side** (per-partition assignment-epoch — accept if still
-  owned, fence if reassigned; see ext(K1) and the `kafka-rebalance-semantics.md` version note). The
+  owned, fence if reassigned; see ext(K1) and the [`kafka-rebalance-semantics.md`](kafka-rebalance-semantics.md) version note). The
   revoke-window commit is accepted at the member's
   current epoch (it advances only on the client's revocation acknowledgement), and a stale-epoch fence on
   the transactional path surfaces as `ILLEGAL_GENERATION` → an abortable `CommitFailedException` (graceful,
   same as classic — the coordinator translates `StaleMemberEpochException` on the TxnOffsetCommit path).
   The lagging-epoch relaxation (accept a still-owned partition) shipped for consumer groups in **4.3.0**
   via **KIP-1251** — verified at the tag; KAFKA-19779 is the StreamsGroup-only sibling. Full audit:
-  `kafka-rebalance-semantics.md`, KIP-848 addendum (client bytecode + broker sources).
+  [`kafka-rebalance-semantics.md`](kafka-rebalance-semantics.md), KIP-848 addendum (client bytecode + broker sources).
 - **ext(K5) `initTransactions` resolves the previous transaction before the new producer may write —
   CONFIRMED (contract); and the abort is reader-visible before it returns — CONFIRMED (source-level,
   implementation behavior).** The contract half is javadoc (`KafkaProducer.initTransactions`):
@@ -252,7 +262,7 @@ discharges the addendum's "analytical only" caveat for the exercised cases.
   append already implies. Chain: `initTransactions` returning ⟹ the LSO on every partition the aborted
   transaction touched has passed it. Corroborated on a live broker (an IT asserts `read_committed`
   endOffsets = `read_uncommitted` endOffsets immediately after a takeover's init). Design note: the
-  adopted recovery-read argument (F-10, remedy 2) rests only on the *contract* half — mandatory
+  stable-id recovery-read argument (F-10, remedy 2 — candidate PR #853, not adopted) rests only on the *contract* half — mandatory
   init-before-produce serializes an id lineage, so a committed record above an open transaction is
   unreachable on the partition — with the visibility half corroborated hygiene, not a load-bearing
   assumption.
@@ -319,6 +329,40 @@ exist on a Kafka snapshot topic.
 Sources: `kafka/log/LogCleaner.scala` at 3.9.0 (`shouldRetainRecord`, the class-level cleaning
 contract, the delete-horizon `RecordFilter`); KIP-27 and KIP-280 cwiki status pages and KAFKA-7061
 (all checked 2026-07); current broker topic-config reference (no `compaction.strategy`).
+
+## ext(K8) The log end can regress (unclean leader election) — **CONFIRMED at documentation grade** (not source-level)
+
+The fact behind issue #849 / finding F-11, held as the `Truncation` knob in `RecoveryRead.tla` —
+recorded here because its readings flip a model verdict (`recoveryread_truncate_stall` vs the
+append-only model), which per the suite's fact discipline makes it load-bearing.
+
+- **A leader elected from outside the ISR can lose committed records.** The broker/topic config
+  `unclean.leader.election.enable` is documented as allowing "replicas not in the ISR set to be
+  elected as leader as a last resort, even though doing so may result in data loss"; it defaults to
+  **false** (since 0.11). Data loss here means the partition's log end offset — and with it the high
+  watermark — **regresses**: records that were readable are gone.
+- **Consequence for a bounded read:** a target offset captured before such an election can exceed
+  the log end after it, permanently — the position can never reach the bound, and a loop of the
+  `readPartition` shape polls forever (F-11). Neither R-850 read-bound choice affects this: the
+  stale number is the *captured* bound, whatever it was captured from.
+- **Reachability note, stated honestly:** with the default (`false`) the election never happens
+  automatically; the hazard needs the non-default config, a manual unclean election
+  (`kafka-leader-election --election-type unclean`), or an equivalent disaster. Low probability,
+  but the *consequence* is the silent-eviction failure mode (F-11), which is why the remedy is
+  required anyway.
+- **Grade and the deliberate verification split:** documentation-grade only — no live replication
+  (forcing an unclean election means killing the ISR; impractical here and in CI). That is
+  acceptable *because the remedy does not depend on the mechanism*: the R-849 tripwire is entirely
+  client-side (no progress toward the bound, for any reason, fails loudly), so its
+  precondition-asserted test is a client-side stalled read (see
+  [`implementation-requirements.md`](implementation-requirements.md) R-849-test), not a broker disaster reproduction. What this entry
+  pins is only that the environment CAN produce a bound past the log end — enough to make the
+  append-only log model a wrong reading.
+
+Sources: Kafka broker/topic configuration reference (`unclean.leader.election.enable`, wording and
+default; checked 2026-07); `kafka-leader-election` tool documentation (unclean election type);
+issue #849's premise (log truncation after an unclean leader election regressing the log end below
+a captured recovery target).
 
 ## ext(C-F9) The F-9 fix's Cassandra mechanics — **CONFIRMED (source-level)**
 

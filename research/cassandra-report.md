@@ -1,7 +1,7 @@
 # The Cassandra single-writer snapshot mode under replication:
 # an adversarial self-audit with mechanized verification
 
-*Cassandra arm of the #732 single-writer study — the full narrative: subject, method, results, what didn't hold, threats, review committee. **Start here for Cassandra.** Corpus index: [`README.md`](README.md).*
+*Narrative. Cassandra arm of the #732 single-writer study — the full narrative: subject, method, results, what didn't hold, threats, review committee. **Start here for Cassandra.** Corpus index: [`README.md`](README.md).*
 
 > **Framing (read first).** This is **not** an independent replication in the arm's-length sense: the
 > subject design, this audit, and every fix were produced in one continuous, AI-assisted engineering
@@ -10,44 +10,38 @@
 > executable regression tests, and — the decisive hedge — a fresh-context review committee that treated
 > the finished artifact as a paper under review. That committee found a real defect the self-audit had
 > certified (**F-7**, §10), which is the strongest evidence both for the method's value and for why the
-> "independent" label would have been an overclaim. The prose below is edited toward that honest
-> framing; where an older paragraph still reads as arm's-length replication, the correction is in §6.
->
-> **Errata (post-review).** The abstract's original three-defect tally is superseded. A **fourth** and
-> **fifth** defect were later found — F-6 (the journal revive) and
-> F-7 (its re-entry, a durable-corruption defect in the mode the fence exists to protect). The core
-> *offset fence* held; the *events-recovery composition* did not, until F-7. See §9–§10.
+> "independent" label would have been an overclaim. The transferable rules this study earned are
+> distilled in [README §4](README.md#4-findings-and-lessons); this report is their Cassandra evidence.
 
 ## Abstract
 
-We replicated and adversarially examined the correctness of kafka-flow's
-compare-and-set snapshot mode (branch `tj/address-partition-ownership-overlap-possiblity-cassandra`,
-addressing issue #732: stale partition owners overwriting newer snapshots during rebalance overlap).
-The study re-derived every claim in the design documentation from the artifacts; replicated the test
-suites (unit + integration against real Cassandra and Kafka) and the TLA+ model suite (25 configs at
-study start, 38 now); verified the Cassandra semantics the design rests on against primary sources down to
-Cassandra's source code; and attacked fourteen seams. The offset fence, the
-offset-carrying tombstone, the replay-window monotonic buffer, and the tombstone-floor recovery are
-correct as designed, and every stated negative control fails exactly as declared. The study found
-**three defects at first pass** — one empirically reproduced data-plane defect (a TTL-reconfiguration "poison row"
-whose guard expires, silently disarming the deleted-key replay fence and permanently conflicting all
-writes to the key), one wiring regression (last-write-wins deployments inheriting the fence and a
-per-key recovery read), and one protocol back door (`initPersisted` bypassing the monotonic cell) —
-all three fixed with regression tests, and the third also model-checked with a new paired negative
-control. **Two further defects surfaced later** in the events-recovery composition — F-6 (the journal
-revive) and, after the review committee, F-7 (its second-recovery re-entry, which the first fix and its
-single-recovery tests/model had missed) — both now fixed, with the model rebuilt to represent the
-journal faithfully as a row set. The study further found the Kafka model's `AtomicBind` to be an idealization of the code
-(the binding closes the committed-ahead gap but leaves a one-round trailing window, protected by the
-recovered-snapshot filter); recorded the merged Kafka mode's generation-lag spurious fence (F-8, an
-availability defect fixed by the post-poll generation refresh); corrected the model's claims, closed
-the verification pairing holes and test-coverage holes, and documented the mode's operational preconditions (Cassandra version
-floor, Paxos v2, timeout-unknown semantics, LWT/plain-write exclusivity).
+We adversarially examined the correctness of kafka-flow's compare-and-set snapshot mode (branch
+`tj/address-partition-ownership-overlap-possiblity-cassandra`, addressing issue #732: stale partition
+owners overwriting newer snapshots during rebalance overlap). Every design-doc claim is re-derived from
+the artifacts; the test suites (unit + integration against real Cassandra and Kafka) and the TLA+ model
+suite are replicated; the Cassandra semantics the design rests on are verified against primary sources
+down to the source code; and fourteen seams are attacked. The offset fence, the offset-carrying
+tombstone, the replay-window monotonic buffer, and the tombstone-floor recovery are correct as designed,
+and every negative control fails as declared.
+
+Five defects were found and fixed. Three on the fence's own surface: **F-1**, a TTL-reconfiguration
+"poison row" whose guard cell expires and silently collapses the deleted-key fence to the floor
+(reproduced against real Cassandra — quieter *and* worse than the predicted decode crash); **F-2**, a
+last-write-wins wiring regression inheriting the fence and a per-recovery read; **F-3**, `initPersisted`
+bypassing the monotonic cell. Two in the events-recovery composition: **F-6**, a *journal revive* — a
+not-yet-fenced owner's replayed appends fold pre-delete state back to life durably; and **F-7**, its
+*re-entry* at the second recovery, which a single-recovery fix and its tests/model missed and a
+fresh-context review caught. The core offset fence holds throughout; the events-recovery composition did
+not, until F-7. The study also recorded the merged Kafka mode's generation-lag spurious fence (**F-8**),
+corrected the model's claims (notably the `AtomicBind` idealization, K1), and documented the mode's
+operational preconditions (Cassandra version floor, Paxos v2, timeout-unknown semantics, LWT/plain-write
+exclusivity). The transferable rules are in [README §4](README.md#4-findings-and-lessons); suite counts are the single
+ledger in [`findings.md`](findings.md).
 
 ## 1. Subject and stance
 
 Subject: the full fence (persists **and** deletes gated) as designed in
-`docs/cassandra-single-writer-design.md`, implemented in `persistence-cassandra` +
+[`docs/cassandra-single-writer-design.md`](../docs/cassandra-single-writer-design.md), implemented in `persistence-cassandra` +
 `core`'s snapshot buffer, tested in core/IT suites, and modelled in `models/` (pulled onto this
 branch from the models branch). Stance: adversarial self-audit (see the framing note above — same
 lineage as the subject, so not arm's-length replication, but run *as if* the design doc were a paper
@@ -76,19 +70,19 @@ conservative first step whose cost/benefit the audit is what justifies.
 
 ## 2. Method
 
-1. **Claim inventory** (`claims.md`): 40+ claims extracted from the docs and load-bearing comments,
+1. **Claim inventory** ([`claims.md`](claims.md)): 40+ claims extracted from the docs and load-bearing comments,
    each mapped to evidence class (code / test / model / external / argument-only) and verdict.
-2. **Test replication and audit** (`test-audit.md`): all suites run (JDK 21, sbt; testcontainers with
+2. **Test replication and audit** (§11 below, the test-coverage appendix): all suites run (JDK 21, sbt; testcontainers with
    real Cassandra and Kafka); every snapshot/persistence test read and graded against the inventory.
-3. **Model replication and audit** (`model-audit.md`): all TLC configs run (TLC 2.16, now pinned via
+3. **Model replication and audit** ([`model-fidelity.md`](model-fidelity.md)): all TLC configs run (TLC 2.15 rev eb3ff99, release v1.7.0; earlier labelled "2.16" — corrected, now pinned via
    tla2tools v1.7.0 after a newer-TLC matcher incompatibility was found); every model action mapped to
    the code construct it abstracts; configs audited for pairing (each positive theorem should have a
    knob-flipped negative control).
-4. **External semantics** (`external-semantics.md`): four independent research passes over Apache
+4. **External semantics** ([`external-semantics.md`](external-semantics.md)): four independent research passes over Apache
    docs, JIRA, and the Cassandra source (LWT linearizability + caveats; conditional-result shape and
    null-condition semantics; per-cell TTL and tombstone semantics; serial-vs-commit consistency and
    timestamp tie-breaking).
-5. **Seam analysis** (`seams.md`): fourteen attack hypotheses at the boundaries (buffer/store,
+5. **Seam analysis** (§12 below): fourteen attack hypotheses at the boundaries (buffer/store,
    store/DB semantics, recovery modes, TTL, consistency, wiring, cross-store atomicity), each driven
    to a verdict by code reading plus, where load-bearing, an experiment, a test, or a model.
 6. **Fixes** applied to the subject, each with tests; model changes on the
@@ -106,11 +100,11 @@ conservative first step whose cost/benefit the audit is what justifies.
 - **The replay window.** The monotonic buffer, the delete lift to the high-water, and the flush
   no-op below the floor: verified at three layers, and the two livelocks they prevent (live-key,
   deleted-key) are reachable in the model exactly when the respective mechanism is removed.
-- **The models.** All 25 original configs replicate: 12 positive theorems hold, 13 negative controls
-  fail precisely as declared. The refinement-tower structure is faithful at the audited grain, with
-  the exemptions and idealizations now stated in the models rather than silent (§4.4).
-- **The docs.** The design document's claims are, after this study's earlier editorial pass and the
-  fixes below, individually evidenced; persistence.md's user guidance matches the code.
+- **The models.** Every config replicates: positive theorems hold, negative controls fail precisely as
+  declared. The refinement-tower structure is faithful at the audited grain, with the exemptions and
+  idealizations stated in the models rather than silent (§4.4).
+- **The docs.** The design document's claims are individually evidenced; persistence.md's user guidance
+  matches the code.
 
 ## 4. Results: what did not hold
 
@@ -163,17 +157,44 @@ the livelock lasso when the fix is off.
 - **New configs**: `cassandra_reap` (the TTL scope boundary as a checked expected refinement
   failure), `cassandra_replay_fixoff_safe` (the "safety still holds during the livelock" half,
   verified rather than asserted), `kafka_replay_unbound_gap` (pins `INV_NoReplayGap` as
-  binding-dependent). Suite at the post-audit stage: 29 configs / 16 negative controls, all as
-  declared (current totals in the findings.md ledger).
+  binding-dependent). Suite counts: the [`findings.md`](findings.md) ledger.
 - **Tooling**: run.sh's temporal-violation matcher was TLC-2.18-specific (silently failing three
-  controls under 2.16) and its refinement matcher accepted any action-property violation; both fixed.
+  controls under this pre-2.17 TLC) and its refinement matcher accepted any action-property violation; both fixed.
 
 ### 4.5 Test-coverage holes (closed)
 
 Five audited gaps, each capable of masking a real regression silently — most notably the real
 tombstone read was never asserted against Cassandra (the IT adapter collapsed `Stored` to its value,
 so a read regressing tombstone→None would have passed the entire suite while re-arming the
-deleted-key livelock). All five closed; see `test-audit.md`.
+deleted-key livelock). All five closed; see §11 below (the test-coverage appendix).
+
+### 4.6 F-6: the events-recovery journal revive (fixed; model-checked)
+
+Under events-recovery a not-yet-fenced owner's replayed appends, racing a zombie's delete, re-populate
+the unfenced journal; the fold then folds pre-delete state back to life on the next recovery and the flow
+persists it forward durably — a durable corruption reachable by a plain crash or journal TTL, no zombie
+required. (Under last-write-wins the same revive is unfixable — no trustworthy comparator — a documented
+persistence.md limitation.) The seam analysis under-graded this as in-memory-only (D-2); modelling
+events-recovery as a genuine second state source is what showed the resurrected state becomes durable —
+the rule that a seam covered by code-reading alone is where the defect hides
+([README §4](README.md#4-findings-and-lessons) A1). The adopted fix is the offset floor (§4.7); paired in the model
+(`cassandra_events_journal_revive` VIOLATES `INV_NoCorruptDurable`, with `cassandra_events_nofloor` /
+`cassandra_events_unordered` pinning the floor read and the `journals.flush *> snapshots.flush` ordering).
+
+### 4.7 F-7: the revive's second-recovery re-entry (fixed; model-checked)
+
+A fold-result comparison (discard a recovery fold that trails the store) closes F-6 at the first recovery
+but not the second: once legitimate post-delete events advance the journal to or past the store's offset,
+the polluted fold no longer trails, the comparison passes, and the pre-delete residue folds back to life
+— because *offset is not provenance*, a corrupt fold can trail, equal, or lead the store
+([README §4](README.md#4-findings-and-lessons) B4). The adopted fix is an offset *filter*, not a comparison: `ReadState`
+folds only journal events above the fenced floor (`Snapshots.floor`), an invariant that holds at every
+recovery. Pinned by `ReadStateFloorGateSpec` second-recovery cases (both arms) and a `FlowSpec` IT across
+three recoveries that fails when the filter is reverted; the model is rebuilt with the journal as a row
+set (`journalRows`) so a sub-tombstone residue is representable — `cassandra_events_revive_reentry`
+VIOLATES `INV_NoCorruptDurable` on the fold-compare mode while `cassandra_events_refines` HOLDS under the
+filter (a non-vacuous pair). F-7 was caught by a fresh-context review, not the self-audit, whose tests
+and model both exercised only one recovery ([README §4](README.md#4-findings-and-lessons) A1/A3/B1).
 
 ## 5. Operational preconditions (now documented in the design doc)
 
@@ -188,25 +209,17 @@ configured from the first deployment (else the F-1 repair path handles the resid
 
 ## 6. Threats to validity
 
-- **Tool version**: TLC 2.16 (pinned via tla2tools v1.7.0); the three temporal-violation
+- **Tool version**: TLC 2.15 rev eb3ff99 (pinned via tlaplus release v1.7.0); the three temporal-violation
   verdicts were disambiguated manually (single declared property per config) with a version-tolerant
   classifier. State spaces are small (MaxOffset=3) and no liveness result is *believed* to depend on
-  2.16-specific behaviour. The `models.yml` CI job runs `run.sh` on this same pinned 2.16. Open: a re-run
-  on **newer TLC (2.18)**, unreachable in the sandbox and tripping `run.sh`'s 2.16-targeted matchers on
+  pre-2.17-specific behaviour. The `models.yml` CI job runs `run.sh` on this same pinned release. Open: a re-run
+  on **newer TLC (2.18)**, unreachable in the sandbox and tripping `run.sh`'s pre-2.17-targeted matchers on
   the one CI attempt — so it needs matcher work plus a reachable toolchain. "CI covers it" holds *for
-  2.16*, not 2.18.
+  the pinned 2.15*, not 2.18.
 - **Serialization assumption (A4)**: `flushCell`'s read→write→mark sequence and Kafka's commit-time
   generation read are safe only under kafka-flow's per-key serialization; now stated in the design
   doc's Assumptions, but still **argument-only, unverified** — the study did not attempt to violate it
-  experimentally, and the model assumes rather than checks it (re-graded post-F-7, findings D-1).
-- **Un-modelled remainder, re-graded**: events-recovery's journal is now modelled faithfully as a row
-  set (F-7 remodel), so it is no longer on this list — and it is precisely the seam that, while
-  "covered by code reading instead", hid F-6/F-7. GroupCommit's marker lane/abort paths (G1/G2) were
-  labelled *argued, unverified* here; they are now **modelled** by `GroupCommitLanes.tla`
-  (two-lane split + abort, each guarantee with a paired negative — see §10.3).
-  (The Kafka flows-alive invariant was swept in here too, then corrected by advisory review: it holds by
-  Kafka's documented rebalance contract + awaited teardown, not code reading — only a regression
-  test/model is missing; see kafka-generation-study.md, §10 and model-audit.md.)
+  experimentally, and the model assumes rather than checks it (D-1).
 - **Race test determinism**: the first-write race IT exercises contention probabilistically; the
   retry branch is not deterministically forced (would need session-level fault injection).
 - **Same-lineage authorship (the honest statement of the self-review threat)**: subject, audit, and
@@ -220,201 +233,372 @@ configured from the first deployment (else the F-1 repair path handles the resid
 
 | Branch | Content |
 |---|---|
-| `tj/…-cassandra` | subject + this study's 4 fix/test commits (`796ab0d`, `f1b1865`, `6053bb5`, `384d139`), the post-study F-6 guard (`bda56f3`, §9), and the post-review F-7 fix + doc corrections (`a8aca58`, `7b6f3a1`, §10) |
-| `tj/…-models` = `tj/…-research` | the cassandra branch + the models restacked on its tip (study commits `71cb0e8`, `7c22267`; post-study events-recovery + vacuity work; the post-review faithful-journal + M4 remodel) + `research/` (this report, claims, seams, audits, external semantics, findings) |
+| `tj/…-cassandra` | subject + this study's fix/test commits (F-1/F-2/F-3, the F-6 guard, the F-7 fix + doc corrections) |
+| `tj/…-models` = `tj/…-research` | the cassandra branch + the models restacked on its tip + `research/` (this report, claims, seams and test-coverage appendices, audits, external semantics, findings) |
 
-History note: after the study, the subject branches' histories were rewritten twice — a
-commit-granularity melt for reviewability (trees byte-identical at the tip) and a re-sign — and the
-`research/` directory moved onto the models branch (whose working alias, `…-research`, is kept
-identical). Hashes above are the post-rewrite ones; the study's original working history, including
-the poison-row before-picture, was superseded by that reorganization (the reproduction lives in
-`SnapshotTtlEdgeSpec`). Hashes cited later in the record (e.g. §9/§10) are similarly post-rewrite.
-
-Verification at this report's writing (post-review): core 116/116 · Cassandra IT 35/35 (real Cassandra) ·
-Kafka IT 12/12 · persistence-kafka 9/9 · metrics 6/6 · TLA+ 38/38. These have since advanced — the single
-reconciled count ledger in findings.md (study-end / post-audit / post-review / post-models-review columns,
-current core 121 · Cassandra IT 36 · TLA+ 57) is authoritative over any intermediate count elsewhere in the
-record, including this line.
+Suite counts are the single reconciled ledger in [`findings.md`](findings.md), authoritative over any
+figure elsewhere in the record.
 
 ## 8. Future work
 
-Most of §8's original list is done (§9–§10): the Kafka commit lag, the `casfw_refines` vacuity
-control, events-recovery as a genuine second state source, and the D-2 journal/snapshot gap (now F-6/
-F-7). What genuinely remains: **fault-injected first-write retry determinism** (the race IT is still
-probabilistic); the **A4 per-key serialization assumption** — now exercised both ways (the `FlushCell`
-model and, on the cassandra branch, `FlushCellConcurrencySpec`), though A4's *truth* stays a JVM-threading
-property those pin rather than derive (D-1); executable or
-modelled evidence for **GroupCommit's marker lane / abort paths** (since modelled, §10.3); a
-**regression test/model pinning the Kafka flows-alive invariant**'s synchronous-await (the invariant
-itself holds by Kafka's documented rebalance contract — an earlier over-grade, corrected by advisory
-review; the teardown coupling is since modelled (§10.3) and pinned by a unit test — `TopicFlowSpec`
-"remove awaits the flow teardown" on #843); and an independent **Jepsen-class check of Cassandra
-LWTs**, beyond this repo's scope but the foundation the version-floor guidance rests on.
+What remains: **fault-injected first-write retry determinism** (the race IT is still probabilistic); the
+**A4 per-key serialization assumption**, exercised both ways (the `FlushCell` model and
+`FlushCellConcurrencySpec`) though A4's *truth* stays a JVM-threading property those pin rather than
+derive (D-1); and an independent **Jepsen-class check of Cassandra LWTs**, beyond this repo's scope but
+the foundation the version-floor guidance rests on.
 
-## 9. Addendum (post-study continuation)
+## 9. How the deeper defects were caught
 
-Four of §8's items have since been done, with one changing the study's conclusions. The commit lag
-is now modelled faithfully (model-audit.md, K1 addendum: `kafka_replay` + `kafka_lag_nofilter` +
-`kafka_replay_unbound_gap`); the generation-refresh delta got its own study
-(kafka-generation-study.md); and the `casfw_refines` vacuity hole is closed (`SpecGuarded` decoupled
-from `Guarded`, `casfw_refines_vacuous` — the ungated compound against the guarded atomic spec fails
-the mapping, so the refinement check is shown capable of failing). Most significantly, **modelling events-recovery as a second state source
-found a fourth code defect** the seam analysis had under-graded as in-memory-only (D-2): the *journal
-revive* — the unfenced journal, re-populated by a not-yet-fenced owner's replayed appends racing a
-zombie's delete, folds pre-delete state back to life on the next recovery and the flow persists it
-forward durably. Reclassified as **F-6** (findings.md), reproduced against the code, fixed on the
-subject branch (`Snapshots.reconcile` — a fold the fenced store provably leads is discarded for the
-store's view; the model's `FloorGuard`) — **a fix the review committee later found insufficient at the
-second recovery (F-7, §10); the adopted fix is the offset floor filter, not this fold comparison** — and paired in the model
-(`cassandra_events_journal_revive` / `cassandra_events_refines`, with `cassandra_events_nofloor` and
-`cassandra_events_unordered` pinning the floor read and the `journals.flush *> snapshots.flush`
-ordering). Under last-write-wins the same revive is unfixable (no trustworthy comparator) — now a
-documented persistence.md limitation. A methodological note §6 anticipated: the un-modelled remainder
-was covered "by code reading instead", and code reading is precisely what missed this — the defect
-surfaced only when the seam was given a mechanized model.
+F-6 and F-7 (§4.6–§4.7) were not on the fence's surface — they lived in the events-recovery
+*composition*, and both were caught by widening single-scope evidence, not by more of the same. F-6
+surfaced only when the snapshot-store/journal seam (under-graded by code reading as in-memory-only, D-2)
+was given a genuine second-state-source model. F-7 surfaced only when a fresh-context review exercised a
+*second* recovery that the self-audit's single-recovery tests and model could not see. Both are the
+study's own thesis turned on itself: the seam certified by single-scope evidence is where the defect
+hides ([README §4](README.md#4-findings-and-lessons) A1), and a self-audit cannot certify itself — the fresh-context
+adversary is the load-bearing hedge ([README §4](README.md#4-findings-and-lessons) A3).
 
-## 10. Review committee, F-7, and the revisions
+## 10. The fresh-context review and what it changed
 
-A fresh-context review committee (four reviewers — formal methods, empirical evidence, methodology,
-adversarial correctness) audited the finished artifact as a paper under review. Two of them, working
-independently, found the same defect the self-audit had certified: **F-7**, the journal revive's
-*re-entry*. The F-6 fix (`Snapshots.reconcile`) compared the recovery fold's *result* to the store and
-discarded a fold that trailed it — sound at the first recovery, but once legitimate post-delete events
-advance the journal to or past the store's offset the polluted fold no longer trails and the pre-delete
-residue is folded back to life at the second recovery (durable corruption, reachable by a plain crash
-or journal TTL, no zombie). Offset is not provenance. The self-audit missed it because both its unit
-tests and its model exercised only one recovery, and the model folded `CorrectContents(journalAt)` —
-encoding "the journal is a correct prefix" *by construction*, the very property F-7 violates, so
-`cassandra_events_refines` HOLDING was vacuous.
+A fresh-context committee audited the finished artifact as a paper under review and caught F-7 (§4.7)
+after the self-audit had certified the F-6 fix with passing tests *and* a passing model — the concrete
+case for why an audit of this shape needs a fresh-context adversary and cannot certify itself
+([README §4](README.md#4-findings-and-lessons) A3). Beyond F-7, the review and the per-branch adversarial passes that
+followed produced three outcomes worth recording.
 
-This is F-6's own thesis turned back on the study: the seam certified by single-scope evidence is where
-the defect hid. The revisions accordingly went past the one fix:
+### 10.1 The re-grading heuristic over-fired — grade by provenance
 
-- **F-7 fixed** (`a8aca58`): `ReadState` folds only journal events above the fenced floor
-  (`Snapshots.floor`) onto the store base — an offset filter that holds at every recovery — replacing
-  the fold-result comparison. Pinned by `ReadStateFloorGateSpec` second-recovery cases (both arms) and
-  a flow-level `FlowSpec` IT across three recoveries that fails when the filter is reverted.
-- **Model rebuilt faithfully**: the journal is now a row set (`journalRows`), so a residue below a
-  tombstone is representable; the new control `cassandra_events_revive_reentry` VIOLATES
-  `INV_NoCorruptDurable` on the fold-compare mode while `cassandra_events_refines` HOLDS under the
-  filter — a non-vacuous pair. `cassandra_events_refines` HOLDING now means something.
-- **Structural bounds raised (M4)**: Cassandra `Handover` is a two-count (the second recovery is the
-  F-7 regime); Kafka's single-zombie scalars became functions over a bounded zombie set with two
-  rebalances / gen-bumps, so the fence is checked against two concurrent stale generations (still holds).
-- **Every code-reading-only verdict re-graded** (D-1/A4, GroupCommit G1/G2) to *argued, unverified*
-  with the risk stated, instead of left at pre-F-7 confidence; A4 went into the design doc's
-  Assumptions. (The Kafka flows-alive invariant was initially swept in here too, then corrected by
-  advisory review — it rests on Kafka's documented rebalance contract, not code reading; only a
-  regression test/model is missing.)
-- **Framing corrected**: retitled to *adversarial self-audit with mechanized verification*; the
-  same-lineage authorship stated in §6; the abstract's superseded claims marked with errata; the six-way
-  count drift reconciled into one dated ledger (findings.md); the reproducibility gap closed (the test
-  Cassandra image pinned at/above the study's own version floor).
+F-7's lesson ("a code-reading-only verdict is where a defect hides") was applied as a blanket downgrade
+to *argued, unverified*, and over-fired twice. The Kafka flows-alive invariant holds by Kafka's
+documented `ConsumerRebalanceListener` contract (synchronous revoke/lost-before-assign, completing before
+`poll` returns) plus the awaited `TopicFlow.remove` teardown — a documented external contract is a
+stronger evidence class than a bespoke code-reading argument, and its only genuine residual was that
+nothing *pinned* the synchronous await (now modelled in `FlowsAlive`, §10.3, pinned by `TopicFlowSpec`
+"remove awaits the flow teardown"). The persist-only `<=` rationale is the equal-offset tick re-flush
+(E1) — a timer mutates a key's *value* without advancing its *offset*, so the next flush re-persists at
+the stored offset, which a strict `<` would self-fence — not the timeout-redo an intermediate reading
+proposed. Both were caught by an adversary reading *against* the correction: a correction heuristic must
+itself be audited, and evidence graded by its true provenance ([README §4](README.md#4-findings-and-lessons) A4). The
+full-Cassandra refutation attacked all five load-bearing claims and re-ran every `cassandra_*` config and
+broke nothing; its residual findings were stale prose, not correctness.
 
-Suite after the revisions: **core 116/116 · Cassandra IT 35/35 · Kafka IT 12/12 · TLA+ 38/38**
-(23 negative controls), all as declared. The committee's verdict was *major revisions*; the point of
-record is that the committee — not the authors — is what caught F-7, which is exactly the argument for
-why an audit of this shape needs a fresh-context adversary and cannot certify itself.
+### 10.2 F-9, and a refutation pass that keeps severity honest
 
-### 10.1 The per-branch advisory round — the debatable and hard parts
+Auditing the models on their own terms surfaced **F-9**: the always-tombstone delete modelled the *fix*
+before the code had it, masking a full-mode resurrection of a never-persisted, just-deleted key by a
+paused zombie — the same "assume the property" trap as F-7 ([README §4](README.md#4-findings-and-lessons) B1), caught by the
+review not production. Fixed (a fenced delete always writes the offset-carrying tombstone;
+`deleteCompareAndSet` INSERTs it `IF NOT EXISTS` on an absent row), validated against real Cassandra, and
+paired (`SkipTomb` / `cassandra_skiptomb` VIOLATES `INV_NoResurrection`, committed-keyed because the
+hazard is invisible to the store-offset invariants — [README §4](README.md#4-findings-and-lessons) B4). The refutation pass
+graded F-9 low-severity rather than inflating it and rejected a redundant Kafka `-1` model knob (broker
+semantics the models rightly assume, source-verified and IT-pinned) — a review's refutation pass is as
+valuable as its finding ([README §4](README.md#4-findings-and-lessons) A4). The A4 per-key-serialization premise gained its
+missing paired control (`FlushCell`: `serial_race` VIOLATES `INV_NoLostWrite`, `serial_holds` HOLDS),
+closing the pairing gap while leaving A4's *truth* a JVM-threading property TLC cannot see (D-1).
 
-The committee closed F-7; a subsequent per-branch adversarial pass (Kafka #843, persist-only, full
-Cassandra — each a fresh-context refutation of *that branch's* claims) continued the audit. It is worth
-recording because what it surfaced was less new defects than the **hard, debatable seams where a
-confident correction can still be wrong** — including two in the audit's own re-grading.
+### 10.3 The named residuals, closed
 
-- **The re-grading heuristic over-rotated — twice.** F-7's lesson ("a code-reading-only verdict is
-  where a defect hides") was applied as a blanket downgrade of such verdicts to *argued, unverified*.
-  Two of those downgrades were themselves wrong:
-  - **Kafka flows-alive** ("every flow alive after a poll is owned in the refreshed generation") was
-    graded argued/unverified as if an in-house assumption. It is not: synchronous revoke/lost-*before*-
-    assign, completing before `poll` returns, is a documented `ConsumerRebalanceListener` contract, and
-    `TopicFlow.remove` awaits the teardown on both paths — present correctness holds by construction, and
-    the only genuine residual was that no test/model pinned it against a future async refactor (now
-    modelled, §10.3: `FlowsAlive` shows the awaited coupling load-bearing, and pinned by a unit test —
-    `TopicFlowSpec` "remove awaits the flow teardown" on #843). A documented
-    external contract is not the same evidence class as a bespoke code-reading argument; the heuristic
-    conflated them.
-  - **The persist-only `<=` rationale** took three passes to state correctly: "re-flush of the buffered
-    high-water snapshot" → over-corrected to "LWT timeout-redo at the same offset" (wrong — a timed-out
-    persist tears down and recovers, and the `SnapshotFold` filter converges the redo whether the fence
-    is `<` or `<=`) → finally E1's **equal-offset tick re-flush** (a timer mutates a key's *value* without
-    advancing its *offset*, so the next flush re-persists at the stored offset, which a strict `<` would
-    self-fence). A subtle liveness argument with several plausible-but-wrong explanations; single-pass
-    reading mis-attributed it each time.
+Residuals the study named but had not exercised are now in the suite: `GroupCommitLanes.tla` + `gclanes_*`
+turn the argued-unverified **G1/G2** (marker-lane liveness, no-slot-steal, offset ≤ durable prefix under
+the two-lane race and abort) into checked properties with paired negatives; `cassandra_events_*_mo4`
+re-check the F-7/F-9 revive pair at `MaxOffset=4`, the bound where the genuine delete-residue revive is
+reachable; `FlushCellConcurrencySpec` is the JVM counterpart of the `FlushCell`/**A4** model; the
+reaped-tombstone replay case pins the **F-9** residual against real Cassandra; `FlowsAlive.tla`
+(`flowsalive_holds` / `flowsalive_race`) pins the cross-partition **flows-alive** invariant as *safety*
+(the awaited teardown coupling HOLDS, a fire-and-forget refactor VIOLATES); and `models.yml` runs the
+suite in CI on the pinned TLC 2.15. The Scala tests ship with the code they protect on the cassandra
+branch; the flows-alive unit test (`TopicFlowSpec` "remove awaits the flow teardown") is on the Kafka
+branch (#843).
 
-  Both were caught only by an adversary reading *against* the correction — F-7's shape, one level up: the
-  audit's own re-grading needed auditing.
+## 11. Test coverage audit — coverage matrix and gap closures
 
-- **The full-Cassandra refutation broke nothing.** An independent pass re-ran every `cassandra_*` config
-  (all pass as declared) and attacked the five load-bearing claims — the F-7 floor filter at repeated
-  recoveries, the tombstone, the monotonic buffer, the tombstone-floor decode — finding no defect and no
-  mis-grade. The remaining findings were stale *prose*, not correctness: a config comment still crediting
-  the pre-F-7 "correct-by-construction" vacuity, A4-landing references, a superseded `reconcile` mention.
+*(Folded in from the former standalone test-audit; the coverage detail behind §2.)*
 
-Debatable calls left flagged rather than resolved: whether flows-alive should read "verified (by
-contract)" or "unverified (no regression guard)" is a labelling judgment, not a fact; whether
-persist-only's events-recovery revive is in scope for a mode that keeps master's recovery is arguable; and
-the "code-reading ⇒ argued/unverified" heuristic stays double-edged — it caught F-7, and it over-fired
-twice. The honest summary: the correctness held up to every adversarial pass; the residual difficulty
-lived in the *record* — in calibrating confidence — not in the design.
+Method: all snapshot/persistence test files read in full and mapped against the claims. The `C1..C19`
+labels below are this audit's **own** coverage-item numbering (one per behaviour a test should pin),
+*not* claims.md identifiers — claims.md numbers claims `M/D/R/K/E/N/T/A/X`. The two are related by
+topic, not by index (e.g. C1 stale-persist ↔ claim M1/M4; C8 tombstone read ↔ D5/K4); the C-list is a
+test-side checklist, deliberately finer-grained than the claim list. Strength graded direct/indirect;
+quality problems flagged. Below: the matrix verdicts, then what the study changed.
 
-### 10.2 The models advisory review — auditing the foundation
+### Matrix summary (pre-existing suite)
 
-The models are the layer all of the above rests on, so they were audited last, on their own terms:
-six adversarial axes (root spec & mapping soundness; non-vacuity of every HOLDS; harness soundness;
-model↔code fidelity; the four assumptions; abstraction/effect-envelope), each with a mandate to *break*
-its axis by running TLC experiments, and each candidate then put through a refutation pass before it
-was recorded. The foundation largely held: the refinement mapping genuinely encodes #732, six of seven
-defended HOLDS configs are demonstrably non-vacuous (witness invariants show the hazard reached at the
-config's own bound), all 23 negative controls fail for their intended reason (every counterexample read
-raw), and the four assumptions are honestly dispositioned (three discharged at source in
-`external-semantics.md`, determinism a user contract).
+Strong: stale-persist rejection (C1), equal-offset admission (C2), no-resurrection (C6), monotonic
+buffer drop (C9), delete lift to high-water — three layers, unit/flow/IT (C10), no re-persist below
+floor (C11), buffer-only delete after absent recovery (C14), TTL on insert+update (C15), the #732
+A/B reproduction/prevention through real PartitionFlow machinery with only `compareAndSet` varying
+(C17), unfenced-stays-LWW (C18).
 
-Two findings survived refutation and produced real changes. **F-9** (the "skip-tombstone" gap): the
-model's always-tombstone delete modelled the *fix* before the code had it, masking a full-mode
-resurrection of a never-persisted, just-deleted key by a paused zombie — the same "assume the property"
-trap as F-7, but caught by the review, not in production. It is now **fixed in code** (a fenced delete
-always writes the offset-carrying tombstone; `deleteCompareAndSet` INSERTs it `IF NOT EXISTS` on an
-absent row), validated against real Cassandra, and given a paired model control (`SkipTomb` /
-`INV_NoResurrection`, committed-keyed because the hazard is invisible to the store-offset invariants).
-The refutation is what kept it honest: it graded the defect **low-severity** (a create-and-delete inside
-one flush interval overlapping a held-snapshot zombie) rather than letting the review inflate it, and it
-**rejected** the sibling Kafka `-1` proposal as out of scope — that fence-bypass is broker semantics the
-models rightly *assume*, already source-verified and IT-pinned, so a model knob would have been
-redundant machinery. Second, the A4 per-key-serialization assumption — the one load-bearing premise
-without the suite's signature negative control — now has one (`FlushCell`: `serial_race` violates
-`INV_NoLostWrite`, `serial_holds` holds), closing the *pairing* gap while leaving A4's *truth* where it
-honestly sits (a JVM-threading property TLC cannot see). A third item (**B-1**) resolved to a labelling
-correction: the F-7 negative fires at the adopted bound via the loss *dual* of the revive it narrates —
-same family, same fix, non-vacuous — so the config comment was corrected rather than the bound raised.
+Medium: first-write fallback (C3, exercised by necessity, not isolated), first-write race (C4,
+probabilistic — conflicts not guaranteed under serialization; retry branch not deterministically
+forced), tombstone row-kept/value-null (C5, inferred not selected), replayed-delete idempotence (C7 —
+equal-offset half only), tombstone floor seeding (C12 — core-direct, store mimicked).
 
-The pattern of §10 held once more: the correctness survived, and the review's own value was as much in
-its refutation pass — sizing F-9 honestly, refusing the redundant Kafka knob — as in the finding itself.
-Suite after the round: 41 configs / 25 negative controls, all as declared.
+**Gaps found (each could mask a real regression):**
+1. **C8 — the real tombstone read was never asserted** (the IT adapter collapsed `Stored` to its
+   value): a `read` regressing tombstone→None would pass the entire suite while re-arming the
+   deleted-key livelock. *The highest-value finding of the audit.*
+2. **C7 (absent half)** — the "deleting an absent key" test actually deleted an equal-offset
+   tombstone; the true row-absent branch never executed.
+3. **C16** — nothing asserted the tombstone carries the TTL (probe was `TTL(value)`, null after
+   delete).
+4. **C13 (gate half)** — the `fenced` gate on the events-recovery floor read untested in either
+   direction.
+5. **C19** — the metrics wrapper's `Stored` delegation untested; a wrapper collapsing the tombstone
+   would silently disarm the floor.
 
-### 10.3 Closing the named residuals
+### Closures (this study)
 
-Residuals the study *named* but had not *exercised* were closed and folded into the
-suite: (1) `GroupCommitLanes.tla` + seven
-`gclanes_*` configs turn the *argued-unverified* **G1/G2** (marker-lane liveness / no-slot-steal; offset
-≤ durable prefix under the two-lane race and abort) into checked properties, each with a paired negative;
-(2) `cassandra_events_*_mo4` re-check the F-7/F-9 revive pair at `MaxOffset=4`, the bound where the
-genuine delete-residue revive (not just its loss dual) is reachable — closing **B-1**'s bounded-MC
-caveat; (3) `core/.../FlushCellConcurrencySpec.scala` is the JVM counterpart of the `FlushCell`/**A4**
-model — a cats-effect race that loses a write unserialized (200/200) and loses none under `Semaphore(1)`
-+ sequential phases; (4) the `persistence-cassandra-it-tests` replay-of-a-reaped-tombstone case pins the
-**F-9** residual against real Cassandra; and (5) `.github/workflows/models.yml` runs `run.sh` (pinned to
-TLC 2.16, the verified version) in CI, not only locally; and (6) `FlowsAlive.tla` +
-`flowsalive_holds` / `flowsalive_race` pin the cross-partition **flows-alive** invariant by modelling
-teardown as a separate interleavable action gated by an `AwaitTeardown` knob and checking `live ⊆ owned`
-as *safety* — the awaited revoke-teardown coupling HOLDS, a fire-and-forget refactor VIOLATES. (This was
-the residual first judged intractable *as a timing test*; modelling it deterministically sidesteps the
-flakiness — a real-rebalance liveness harness was the wrong shape, an exhaustive model the right one.)
-The model artifacts (1, 2, 5, 6) are now part of the suite — **57 configs** (incl. the Kafka
-`tokensync_*` capture-vs-refresh set), run in CI. The two Scala
-tests (3, 4) ship with the code they protect on the **cassandra branch** (#6), not on this research
-branch, so they run in the normal build regardless of whether the study merges. The flows-alive
-invariant's *in-code* complement — a unit test on the **Kafka branch** (#843), `TopicFlowSpec` "remove
-awaits the flow teardown" — adds then removes a partition whose flow release completes a `Deferred` and
-asserts it is completed by the time `remove` returns, so a fire-and-forget refactor fails the build.
+All five gaps closed — commit "Close the audited verification gaps…" (`384d139` on the cassandra
+branch): SnapshotSpec asserts `Stored.Tombstone(offset)` from the real store, adds the
+never-written-key delete (no row created) and the `TTL(offset)` tombstone probe;
+`ReadStateFloorGateSpec` pins read-iff-fenced; `SnapshotDatabaseMetricsSpec` pins verbatim
+pass-through. Additionally the study's fix commits carry their own regression tests
+(`SnapshotTtlEdgeSpec` poison-row repair E2E, `CassandraPersistenceWiringSpec` fenced-per-mode,
+two `initPersisted`-floor cases in `SnapshotsSpec`).
+
+### Noted, not changed
+
+- **C4 probabilistic race**: making the first-write retry deterministic needs fault injection at the
+  session layer; the race test remains valuable as-is (asserts no corruption + highest-wins under
+  real contention). Accepted.
+- **Mimic drift risk** (`SnapshotReplayFencingSpec` hand-models CAS gating in two doubles; one mock
+  deletes by row-removal, diverging from tombstone semantics): mitigated by the new C8 IT assertion
+  anchoring the real store's behaviour; flagged for a comment if the doubles are reused.
+- **Undocumented behaviours with tests**: conflict-on-revoke is swallowed by scache (FlowSpec pins
+  it; persistence.md describes it); revoke-time `scheduleCommit` failure swallowed (PartitionFlowSpec);
+  `AdditionalPersistSpec`'s feature is outside the studied docs. No action for this study.
+- **Impure counter in a `State` program** (`SnapshotsSpec.countingSnapshotDb` uses a `var`): safe
+  under single `runS`; would double-count if the `Eval` were forced twice. Cosmetic; left.
+
+### Suite results
+
+The single reconciled count is the [`findings.md`](findings.md) ledger (current: core 121 ·
+Cassandra IT 36 · TLA+ 57), authoritative over any figure elsewhere in the record.
+
+## 12. Seam analysis — attack hypotheses and verdicts
+
+*(Folded in from the former standalone seam analysis — the boundary-by-boundary attack catalog behind §2's method; S1–S14, each an attack hypothesis with its verdict.)*
+
+Each seam: what could break there, how I attacked it, verdict. Status: OPEN until closed by
+code-reading + test/model/experiment evidence.
+
+### S1 — TTL reconfiguration ⇒ poison row (null `offset` cell) — **FINDING — CONFIRMED, fixed (F-1)**
+
+**Attack.** Cassandra TTLs are per-cell (pending ext (4) confirmation). Every CAS write stamps the
+statement's TTL onto the cells *it* writes; it never rewrites `created`/`metadata` cells it doesn't
+touch. (A *persist* is the exception: it writes all of `created, metadata, value, offset`, refreshing
+all four.) But the CAS **delete** writes only `value=null, offset=:offset`. So:
+
+1. Deploy without TTL; persist key K (4 cells, no TTL).
+2. Redeploy with `ttl = T` (the documented recommendation for delete workloads!).
+3. Delete K: tombstone writes `value=null` (deletion marker) + `offset` with TTL T.
+   `created`/`metadata` cells keep **no TTL** — they live forever.
+4. At `t+T` the `offset` cell expires. Row still visible via live `created`/`metadata` cells:
+   `value=null`, `offset=null`.
+
+Consequences (from code reading):
+- `CassandraSnapshots.read` (persistence-cassandra …/CassandraSnapshots.scala:133): tombstone branch
+  does `row.decode[Offset]("offset")` **non-optionally** ⇒ decode of null ⇒ exception ⇒ **every
+  recovery of K fails, forever** (cells never expire). Same non-optional decode on the live branch
+  (line 301) for the analogous value-alive/offset-expired shape (TTL *shortening* variant).
+- Write path: `IF offset <= :offset` against null offset ⇒ not applied (pending ext (3));
+  `resolveConditional` sees null stored offset ⇒ "row absent" ⇒ `INSERT IF NOT EXISTS` ⇒ row exists ⇒
+  not applied ⇒ retry `UPDATE` ⇒ not applied ⇒ `SnapshotWriteConflict` — **every write to K
+  perma-conflicts** until all cells expire (never, in the TTL-enable scenario).
+
+Variants: (a) TTL enabled between persist and delete (permanent poison); (b) TTL shortened
+(poison until the longest old TTL); (c) TTL disabled after tombstones written (tombstone `offset`
+cell still carries old TTL; on expiry, `value`'s deletion marker is gone after gc_grace… row likely
+fully disappears — benign); (d) same-TTL steady state — offset cell is always the last written ⇒
+always outlives siblings ⇒ **unreachable in steady state** (matches the code comment's claim).
+
+**Verdict — CONFIRMED, fixed (F-1).** Reachable only across a TTL reconfiguration, but the recommended
+rollout ("configure a TTL for workloads that delete keys") *is* that reconfiguration on an existing
+deployment. Reproduced against real Cassandra (`SnapshotTtlEdgeSpec`): the null `offset` decodes as
+**0** — a silent floor loss, not the predicted decode crash, so reality is quieter *and* worse
+([README §4](README.md#4-findings-and-lessons) D2). Fixed by the Paxos-safe `IF offset = null` repair, with the read
+treating a null-offset row as absent (ext(4) confirms the per-cell TTL semantics). See §4.1.
+
+### S2 — `flushCell` is not atomic vs concurrent `put` — ASSUMPTION-CRITICAL, not a defect
+
+`flushCell`: `state.get` → `database.write` → `markPersisted` (modify current cell). If an `append`
+replaced the cell between the DB write and `markPersisted`, the *new* cell would be marked persisted
+without having been written (lost write). Requires intra-key concurrency, which kafka-flow's
+poll-thread serialization forbids (ticks, folds, flushes of one key are serialized; models README
+states it as an assumption). Same shape existed pre-branch. **Verdict: correct under stated
+serialization assumption; assumption now surfaced in claims A4. No fix; now stated as the design doc's
+4th Assumption (and the models README).**
+
+### S3 — First-write compound interleavings
+
+`UPDATE`(absent) → `INSERT IF NOT EXISTS` → retry `UPDATE`. Attacks: two first-writers (covered:
+model `casfw_3w`, IT race test); reap between INSERT-loss and retry ⇒ spurious conflict (covered:
+`casfw_reap`, `casfw_spurious`, absorbed in `cassandra_firstwrite_spurious`); zombie DELETE between
+loser-INSERT and retry — retry sees absent ⇒ conflict(none) ⇒ teardown/recover — absorbed the same
+way. **Verdict: closed by models + code; the spurious path's "recovers on next flush" is checked as
+convergence in `cassandra_firstwrite_spurious`.**
+
+### S4 — Snapshot-store delete vs journal delete: no cross-store atomicity — pre-existing gap
+
+`Buffers.delete(persist=true, o)`: `snapshots.delete` then `journals.delete` then `keys.delete`.
+Crash after the first: tombstone at `o` durable, journal intact. Snapshot-recovery mode: recovers
+tombstone floor, replays input — correct. Events-recovery mode: fold over the *intact journal*
+resurrects the pre-delete state in memory; a later flush persists it above `X` (CAS admits: offset
+grew) — the delete is lost. Record-driven deletes re-issue on replay (offset uncommitted ⇒ record
+reprocessed); **tick-driven deletes have no such guarantee** (wall-clock condition may not re-fire
+deterministically, though expiry-style ticks usually re-fire). Same hazard exists under LWW (and
+pre-branch); CAS neither causes nor fixes the cross-store *atomicity*. **Verdict — this seam is where F-6/F-7 live (fixed).** Recovery folds only journal rows above the
+fenced store's floor onto the store base (`ReadState`), so residue below a tombstone is never folded, at
+every recovery — modelled (row-set journal, `cassandra_events_*`) and pinned (`FlowSpec` revive IT). The
+seam was under-graded as an in-memory-only gap until it was modelled as a genuine second state source
+([README §4](README.md#4-findings-and-lessons) A1); a fold-*comparison* fix then re-admitted the resurrection at the second
+recovery because offset is not provenance ([README §4](README.md#4-findings-and-lessons) B4) — hence the floor *filter*.
+See §4.6–§4.7. The residual — a delete that never became durable (a crash *before* the tombstone write) —
+is inherent to the two-store design, which is why `Buffers.delete` writes the tombstone before clearing
+the journal.
+
+### S5 — Equal-offset tombstone → live resurrection at the same offset
+
+Tick creates state at offset `X` for a key tombstoned at `X` (buffer: `put(Live(v, X))` over
+`Tombstone(X)`: not below ⇒ replaces; store: `IF offset <= X` applies). Legitimate owner acting at its
+stored offset — by design (equal-offset admission). A *zombie* at exactly `X` could do the same — the
+documented equal-offset gap; contents equal under determinism (its fold at `X` is the same events).
+**Verdict: closed by design argument E1/E2 + determinism assumption; model should exercise an
+equal-offset zombie (MG2, model-fidelity).**
+
+### S6 — `Snapshots.read` tombstone sets floor but returns `None` — downstream interplay
+
+`Persistence.read` sees `None` ⇒ no `initPersistedState`, no `Timestamps.onPersisted` ⇒ `persistedAt`
+stays unset ⇒ K3's buffer-only delete holds. But: the tombstone cell is set with `persisted=true`, so
+a subsequent `flush` (with no new append) writes nothing — correct. A subsequent append above floor
+replaces cell (`persisted=false`) ⇒ flush persists — correct. Append *below* floor: dropped, cell
+stays tombstone/persisted ⇒ flush no-op — correct (this is K1's fix). **Verdict: closed by code
+reading; covered by SnapshotReplayFencingSpec (per the test-coverage appendix, §11).**
+
+### S7 — Double-read on recovery (events mode): `ReadState` floor read then journal fold
+
+`ReadState(journals, fold, snapshots)`: `snapshots.read.void` (fenced only) then fold. The floor read
+*itself* recovers a live snapshot's value and discards it (`.void`) — no state leak; tombstone sets
+buffer cell (side-effect wanted); live snapshot **does not** set the buffer (read returns value
+without seeding cell — `initPersistedState` is only called by `Persistence.read` on `Some`... but
+here the *outer* read result is the fold result, not the snapshot). Attack: events-mode, key has live
+snapshot at X (journal intact). Floor read returns `Some(v)` (no cell seeded — Live branch of
+`Snapshots.read` is pure). Fold rebuilds from journal ⇒ `Persistence.read` returns fold result ⇒
+`initPersistedState(foldState)` seeds buffer at the fold's offset. Consistent. But subtle: the
+`Snapshots.read` Live branch does NOT seed the floor — for a *live* key in events mode the floor
+comes from the fold result (journal intact ⇒ reconstructs to X̃ = journal's top offset). If the
+journal was truncated/TTL-reaped *below* the snapshot offset X, fold yields state at X̃ < X with no
+floor at X ⇒ replay-window self-fence possible for a *live* key in events mode — the design says
+events-recovery pairing with CAS "buys no stale-writer safety" and only the deleted-key livelock is
+removed. A live key with journal-TTL < snapshot presence could still self-fence. **Attack refined:**
+events mode + journal TTL reaping + CAS snapshots (an odd but constructible pairing — snapshots
+written but never read for state). The floor read DOES run (`fenced`) but its Live result seeds
+nothing. **Verdict: CLOSED — fixed; and this seam correctly anticipated the live-snapshot arm of F-7.**
+The candidate fix named here ("`Snapshots.read`'s Live branch should also seed the floor") is exactly
+the adopted fix: `read` now seeds the live cell so `Snapshots.floor` carries the live snapshot's offset,
+and `ReadState` folds only journal rows above that floor onto the live snapshot as the base — so a
+journal reaped/polluted below a live snapshot recovers the snapshot, not a truncated fold. The review
+committee's F-7 is the general form of this exact hazard (both the tombstone and this live arm),
+reached across two recoveries; the live arm is pinned by `ReadStateFloorGateSpec`'s
+"live key's post-snapshot journal suffix folds onto the store base" second-recovery case. Credit where
+due: the seam analysis flagged the live arm and left it OPEN with the right fix — it was the *tombstone*
+arm's re-entry, and the model's vacuity, that the self-audit then under-verified (F-7).
+
+### S8 — Unfenced buffer receiving a `Stored.Tombstone` from a downgraded store
+
+CAS→LWW downgrade leaves tombstone rows; LWW-mode `read` still surfaces `Stored.Tombstone` ⇒ buffer
+(fenced under current wiring — see S9) floors at X. Replays below X dropped. Benign under
+determinism; key readable (None) and re-persistable above X. With the S9 fix (LWW wired unfenced),
+`Snapshots.read`'s tombstone branch still sets the floor cell (offset carried in the `Stored`), so
+behavior is the same — acceptable either way. **Verdict: benign; document the downgrade residue
+(tombstone rows persist until TTL/manual cleanup; they floor the buffer even in LWW mode).**
+
+### S9 — Fenced buffer wired for LWW-mode Cassandra — **FINDING, cost regression + doc mismatch**
+
+`CassandraPersistence` builds one `PersistenceModule`; its `restoreEvents`/`restoreSnapshots`/
+`snapshotsOnly` call `snapshots.snapshotsOf` — the `KafkaSnapshot` extension that always passes
+`Some(_.offset)` ⇒ `fenced=true` **for both write modes**. Consequences for `compareAndSet=false`
+users after upgrading:
+1. `restoreEvents` now performs a per-key snapshot-store read on every key recovery (the `fenced`
+   gate is true) — a pure cost regression vs master for a mode that can never recover a tombstone
+   floor (LWW deletes remove rows). Eager recovery ⇒ one extra point-read per key per rebalance.
+2. Monotonic buffer semantics (lower-offset appends dropped) replace master's last-write-wins
+   buffer — behavior delta, benign under determinism (A2), arguably a robustness improvement
+   (prevents transient durable regression during replay under LWW), but undocumented: the design doc
+   says the fence is live "only for the offset-carrying KafkaSnapshot / compare-and-set wiring",
+   which conflates snapshot-type with write-mode.
+**Fix candidate F2:** wire by mode — `compareAndSet=false` ⇒ `SnapshotsOf.backedBy(db)` (exact master
+behavior); `true` ⇒ `db.snapshotsOf`. Needs a wiring seam in `PersistenceModule` (overridable
+`snapshotsOf` member) or a mode-aware module in `CassandraPersistence`. **Verdict: FINDING → fixed
+(F-2): mode-scoped `snapshotsOf` hook; `CassandraPersistenceWiringSpec` pins fenced-per-mode.**
+
+### S10 — Determinism violated (A2 broken): blast radius
+
+If folds are non-deterministic: (i) equal-offset replacement can change contents (E2's records-equal
+argument still bounds the *events*, but tick state diverges — doc already says this); (ii) monotonic
+buffer drops a replay re-derivation that would have *differed* — the durable keeps the older
+derivation; recovery point unaffected, no committed events lost — still safe by the offset argument;
+(iii) LWW comparison: master would have overwritten with the new derivation. Net: CAS mode under
+broken A2 degrades to "first derivation at an offset wins", never loses offsets. **Verdict: closed —
+safety does not rest on A2; only value-level reproducibility does. Worth one sentence in doc.**
+
+### S11 — `Offset` boundary values
+
+`Offset.min` = 0 sentinel eliminated by `deef301` (explicit `Option`) ✅. Tombstone at `Offset.min`:
+`put` lift uses `max` — fine. `Handover c ∈ 0..offset` covers 0. **Closed.**
+
+### S12 — `SnapshotWriteConflict` swallowed anywhere?
+
+Grep: raised in `resolveConditional`/`deleteCompareAndSet`; no `recover`/`handleError` on the persist
+path in core/persistence-cassandra main code; `GroupCommit` is Kafka-only. Flow teardown semantics
+per doc. **Closed (grep + reading; FlowSpec IT exercises the teardown).**
+
+### S13 — `initPersisted` bypasses the monotonic cell discipline — **FINDING, code/comment contradiction**
+
+`Snapshots` class doc: "Every write (`append`, `delete`) and recovery (`read`) flows through that one
+cell, kept monotonic"; `put` is called "the single monotonic write site". But `initPersisted` does
+`state.set(Cell(Live(...), persisted=true))` **unconditionally** — a second, non-monotonic write site.
+Reachable clobber: events-recovery seeds a tombstone floor `X` via `Snapshots.read`; the journal fold
+then returns a state (journal not cleared — e.g. S4 partial delete failure, or journal written before
+a crash) at offset `X̃ < X`; `Persistence.read`'s `flatTap` calls `initPersistedState` ⇒ cell reset to
+`Live(X̃)` ⇒ floor lost ⇒ replay-window writes below `X` conflict again — the exact livelock K1/K5
+fixed, resurrected through the back door. In snapshot-recovery mode it is harmless (init follows read
+of the same snapshot at the same offset). **Fix candidate F3: route `initPersisted` through the
+monotonic `put` (drop a below-floor init, preserving the floor cell), or floor-guard the `set`.**
+**Verdict: FINDING → fixed (F-3): `initPersisted` routes through `put`; unit-tested and model-checked
+(`MonotonicInit` / `cassandra_init_clobber`).**
+
+### S14 — Poison-row handling (S1 follow-through, post ext(4) confirmation) — **Closed (fixed, F-1)**
+
+Ext (4) CONFIRMED per-cell TTL + row-marker semantics (see external-semantics.md), with one addition
+that reshapes the fix space: the first write is an `INSERT` — if executed by a no-TTL deployment it
+leaves an **immortal row marker**, so even a delete that tombstones `created`/`metadata` cannot make
+the row disappear when `offset` expires. Prevention inside the delete statement is therefore
+insufficient; the read and write paths must tolerate `offset = null`:
+- read: tombstone branch must decode `offset` as `Option`; null ⇒ treat as absent (guard expired ≡
+  reaped) instead of throwing on decode.
+- write: distinguish "row absent" from "row present, `offset` null" in the not-applied result if the
+  driver exposes it (ext (2) pending; the experiment below settles it empirically); a null-guard
+  repair write (`IF offset = null`) is the Paxos-safe resurrection path, else the key perma-conflicts
+  on flush even after the read fix.
+- docs: recommend configuring the TTL from the first deployment; enabling it later leaves immortal
+  markers/cells for keys deleted after the switch.
+**Experiment planned** (`SnapshotTtlEdgeSpec`, research branch): no-TTL instance persists k@10; ttl=1s
+instance deletes k@11; wait past expiry; assert row visible with value=null, offset=null; record
+current `read` (expected: decode failure) and `persist` (expected: SnapshotWriteConflict) behavior;
+log the LWT not-applied result shape for the poison row vs a truly absent row (settles ext (2)/(3)
+empirically).
+
+**Experiment outcome (closes S1/S14).** Run against real Cassandra. The poison row is reachable
+exactly as constructed, and the perma-conflict prediction CONFIRMED — but the read prediction was
+**REFUTED, and reality is worse**: `row.decode[Offset]` on the null cell yields **0**, not an
+exception, so the tombstone floor silently collapses to `Offset.min` — the deleted-key replay fence
+is disarmed with no error signal at all. The not-applied result shape DOES discriminate the poison
+row from a truly absent one (condition column present-with-null vs absent from the metadata),
+settling ext(2)/(3) empirically and later re-confirmed at Cassandra source level
+(external-semantics.md). Fixed as findings **F-1** (`6053bb5`): guard-expired row reads as absent,
+delete on it is an idempotent no-op, persist claims it via the Paxos-safe `IF offset = null` repair;
+`SnapshotTtlEdgeSpec` (now on the cassandra branch) pins the state and the repair end to end.
+**Closed (fixed).**
