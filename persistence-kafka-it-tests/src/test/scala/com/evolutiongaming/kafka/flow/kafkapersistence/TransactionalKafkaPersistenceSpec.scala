@@ -456,12 +456,11 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
   }
 
   test("recovery waits out an open transaction and reads committed snapshots beyond it") {
-    // A hard-crashed writer leaves its transaction open for up to transaction.timeout.ms, pinning the
-    // snapshot topic's last-stable-offset below anything committed after it. Recovery must not complete
-    // bounded by that pin (it would silently miss the newer owner's committed snapshots and recover stale
-    // state); it must wait the open transaction out, then include the committed records and exclude the
-    // timed-out (aborted) ones. The open transaction here is genuinely open during the read: a unique
-    // second transactional.id is used, so nothing aborts it early - only the broker's timeout does.
+    // Recovery must not complete bounded by the last-stable-offset pin of a crashed writer's open
+    // transaction (it would silently miss committed snapshots above it); it must wait the transaction
+    // out, then include the committed records and exclude the timed-out ones. The transaction here is
+    // genuinely open during the read: a unique second transactional.id, so nothing aborts it early -
+    // only the broker's timeout does.
     val stateTopic = "tx-open-state-topic"
 
     def record(key: String, value: String) = new ProducerRecord(

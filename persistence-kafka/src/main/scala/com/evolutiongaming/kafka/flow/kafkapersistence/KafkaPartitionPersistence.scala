@@ -78,16 +78,13 @@ object KafkaPartitionPersistence {
         BracketThrowable[F].fromOption(endOffsets.get(snapshotsPartition), MissingOffsetError(snapshotsPartition))
       }
 
-    // The read target must be the high watermark. Under read_committed this consumer's own end offset is
-    // the last-stable-offset, which an open transaction (e.g. of a hard-crashed previous owner, for up to
-    // its transaction.timeout.ms plus the broker's abort-scan interval, default 10s) pins BELOW records
-    // committed after it - a read bounded by it completes silently missing those committed snapshots. So
-    // for a read_committed config the target is captured up front by a short-lived read_uncommitted
-    // consumer, which makes the read wait such transactions out: the read_committed position cannot pass
-    // the last-stable-offset until the broker resolves them, so the read completes only once everything
-    // below the target is decided - committed records included, aborted ones filtered. (Kafka Streams'
-    // restore does the same for the same reason - KAFKA-10167.) Under read_uncommitted the consumer's own
-    // end offset already is the high watermark, so no extra capture is needed.
+    // The read target must be the high watermark, not this consumer's own end offset: under read_committed
+    // that is the last-stable-offset, which a crashed writer's open transaction pins below records
+    // committed after it - a read bounded there would silently miss them. A target captured through a
+    // short-lived read_uncommitted consumer instead makes the read wait such a transaction out, completing
+    // only once everything below the target is decided (Kafka Streams' restore uses the same bound -
+    // KAFKA-10167; see the design doc's "Recovery read"). Under read_uncommitted the consumer's own end
+    // offset already is the high watermark, so no extra capture is needed.
     val capturedHighWatermark: F[Option[Offset]] =
       if (consumerConfig.isolationLevel == IsolationLevel.ReadCommitted)
         consumerOf
