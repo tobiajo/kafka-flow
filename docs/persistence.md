@@ -103,7 +103,10 @@ write from a stale consumer generation is fenced by the broker
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics),
 brokers 2.5+) and surfaces as
 `CommitFailedException`. Recovery reads `read_committed`, so a fenced writer's aborted records are
-never recovered.
+never recovered, and the read targets the snapshot topic's high watermark — not the last-stable-offset
+an open transaction pins — so a hard-crashed owner's leftover transaction is waited out, never
+silently read short of: committed snapshots are never missed
+([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850) is closed).
 
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
@@ -113,7 +116,7 @@ never recovered.
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
   it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
-  higher timeout widens the post-crash window (below).
+  higher timeout lengthens how long a post-crash recovery can wait (below).
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -129,11 +132,10 @@ Limitations:
   **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
   `flushOnRevoke` does not shrink the replay window there.
 - After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
-  `transaction.timeout.ms`; until then that open transaction pins the snapshot topic's
-  last-stable-offset, and a recovery in that window silently misses records beyond it — even committed
-  ones — while input offsets are not held back the same way, so a second handover inside the window
-  can recover stale state
-  ([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)).
+  `transaction.timeout.ms` (plus its abort scan, default 10 s); a recovery in that window waits the
+  open transaction out — the read cannot complete short of it — so takeover after an ungraceful
+  shutdown is delayed by up to that long (~70 s at the defaults): an availability cost, never a wrong
+  read.
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
   a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

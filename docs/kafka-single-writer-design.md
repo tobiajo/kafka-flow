@@ -86,7 +86,9 @@ Key points:
   transaction) when there are none.
 - The offset-to-commit is **seeded with the assigned offset**, so even the first snapshot flush (before
   the first commit tick) carries an offset and is gated.
-- Recovery is forced to `read_committed` so a fenced writer's aborted records are invisible.
+- Recovery is forced to `read_committed` so a fenced writer's aborted records are invisible, and its
+  read targets the high watermark so an open transaction is waited out, never silently read short of
+  (see Recovery read below).
 - The ordinary consumer-group offset commit is **replaced**, not run alongside. In the default mode the
   committable offset is staged and the **consumer** commits it; in this mode that same offset-scheduling
   step is rerouted to the **producer**, so the offset is committed only inside the transaction (above).
@@ -135,7 +137,32 @@ is accepted. A hard-crashed owner's in-flight transaction is, for the same reaso
 takeover (a stable id would abort it through the new owner's `initTransactions`); the coordinator
 reclaims it only after `transaction.timeout.ms`, which bounds how long it pins the snapshot topic's
 last-stable-offset — the offset `read_committed` readers of that topic (recovery included) cannot
-see past.
+see past. The recovery read is therefore bounded by the **high watermark**, not by that pinned
+offset, so it waits such a transaction out instead of completing short of it (next section).
+
+### Recovery read: bounded by the high watermark
+
+A `read_committed` consumer's own `endOffsets` is the **last-stable-offset**: the minimum of the high
+watermark and the first offset of any open transaction. Bounding the recovery read by it is a defect:
+a hard-crashed owner's open transaction (up to `transaction.timeout.ms` old, see above) pins the LSO
+*below* records committed after it, so a recovery in that window completed "successfully" while
+silently missing a newer owner's committed snapshots — with a second handover inside the window the
+next owner recovers stale state yet resumes from the newer committed input offset, the corruption
+shape of [#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fencing violated
+([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850); replicated on a real
+broker as an 85 ms read missing a committed snapshot).
+
+So the read target is the **high watermark**, captured up front by a short-lived `read_uncommitted`
+consumer (only when the read itself is `read_committed`; under `read_uncommitted` the consumer's own
+end offset already is the high watermark and nothing changes). The `read_committed` position cannot
+pass the LSO until the broker resolves the open transaction, so the read genuinely waits it out —
+bounded by the producer's `transaction.timeout.ms` plus the broker's abort scan
+(`transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s) — and completes only
+once everything below the target is decided: committed records included, aborted ones filtered.
+Kafka Streams' restore uses the same bound for the same reason
+([KAFKA-10167](https://issues.apache.org/jira/browse/KAFKA-10167)). The cost is availability, never
+correctness: a post-crash recovery inside the window is *delayed* until the broker aborts the
+leftover transaction, where it previously returned fast but wrong.
 
 ## Consumer rebalance protocols
 
@@ -257,11 +284,15 @@ real eager-recovery (every key recovered on assignment) and flush-on-revoke mach
 shows corruption with the plain shared producer (no offset binding); the prevention drives a stale owner
 with an *older consumer generation* and asserts the newer snapshot survives — isolating the offset
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
-fenced writer fails its next flush, an open transaction neither blocks nor leaks into recovery,
-concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
-with a recording in-memory producer (no broker). Two unit suites pin the client-side pieces the fence
-depends on: `TopicFlowSpec` that removing a partition awaits its flows' teardown, and `ConsumerSpec`
-the post-poll generation tracking and the negative-generation guard.
+fenced writer fails its next flush, concurrent-write safety, and the recovery-read bound: a
+transaction kept genuinely open through the read (a unique second id, a short
+`transaction.timeout.ms`, and an asserted-active LSO pin when the read starts) makes the read wait,
+include the committed record and exclude the timed-out one. The group commit is exercised in isolation
+by `GroupCommitSpec`, a unit test with a recording in-memory producer (no broker). Unit suites pin the
+client-side pieces the mechanism depends on: `TopicFlowSpec` that removing a partition awaits its
+flows' teardown, `ConsumerSpec` the post-poll generation tracking and the negative-generation guard,
+and `ReadSnapshotsSpec` the read target — a target taken from the read consumer's own `endOffsets`
+stops at the LSO and fails the suite.
 
 ## Rejected alternatives
 
@@ -269,7 +300,10 @@ the post-poll generation tracking and the negative-generation guard.
   stored offset. Kafka has no conditional produce primitive, so it cannot be atomic.
 - **Producer-epoch fencing (stable `transactional.id`)**: redundant with the generation fence, and
   the epoch order can diverge from ownership order, spuriously fencing the true owner (see No epoch
-  fencing).
+  fencing). It would also abort a crashed owner's leftover transaction at takeover, making post-crash
+  recovery immediate — here recovery instead waits the leftover out (see Recovery read), keeping ids
+  free of naming discipline (a stable id must be unique per application on the cluster, like a group
+  id).
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
   reassignment, and safe *dynamic* assignment is the point of this design. (Static *membership*
