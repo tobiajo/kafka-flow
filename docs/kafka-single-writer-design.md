@@ -87,8 +87,8 @@ Key points:
 - The offset-to-commit is **seeded with the assigned offset**, so even the first snapshot flush (before
   the first commit tick) carries an offset and is gated.
 - Recovery is forced to `read_committed` so a fenced writer's aborted records are invisible, and its
-  read targets the high watermark, so an open transaction is waited out rather than read short of
-  (see Recovery read below).
+  read targets the high watermark, so an open transaction delays the read instead of silently
+  truncating it (see Recovery read below).
 - The ordinary consumer-group offset commit is **replaced**, not run alongside. In the default mode the
   committable offset is staged and the **consumer** commits it; in this mode that same offset-scheduling
   step is rerouted to the **producer**, so the offset is committed only inside the transaction (above).
@@ -307,8 +307,7 @@ stops at the LSO and fails the suite.
   the epoch order can diverge from ownership order, spuriously fencing the true owner (see No epoch
   fencing). It would also abort a crashed owner's leftover transaction at takeover, making post-crash
   recovery immediate — here recovery instead waits the leftover out (see Recovery read), keeping ids
-  free of naming discipline (a stable id must be unique per application on the cluster, like a group
-  id).
+  free of naming discipline (a stable id needs a cluster-unique prefix per flow, like a group id).
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
   reassignment, and safe *dynamic* assignment is the point of this design. (Static *membership*

@@ -22,6 +22,9 @@ import scodec.bits.ByteVector
 import java.util.regex.Pattern
 import scala.concurrent.duration.FiniteDuration
 
+/** Pins the recovery-read target against regression to the read consumer's own end offset (the last-stable-offset,
+  * which an open transaction pins below committed records).
+  */
 class ReadSnapshotsSpec extends FunSuite {
 
   implicit val log: Log[IO]         = Log.empty[IO]

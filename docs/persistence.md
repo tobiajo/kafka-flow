@@ -104,8 +104,8 @@ write from a stale consumer generation is fenced by the broker
 brokers 2.5+) and surfaces as
 `CommitFailedException`. Recovery reads `read_committed`, so a fenced writer's aborted records are
 never recovered. If the previous owner crashed mid-write, recovery waits until the broker aborts its
-unfinished transaction (bounded — see the limitations below), then reads everything committed:
-committed snapshots are never missed.
+unfinished transaction (bounded, see the limitations below), then reads everything committed — nothing
+is missed.
 
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
