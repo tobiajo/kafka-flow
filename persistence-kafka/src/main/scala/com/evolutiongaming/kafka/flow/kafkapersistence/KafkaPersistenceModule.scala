@@ -41,11 +41,10 @@ object KafkaPersistenceModule {
     *   base config for the snapshot producer; `transactionalId` and `idempotence` are overridden per producer and
     *   `clientId` is suffixed with `-snapshot-<partition>`
     * @param transactionalIdPrefix
-    *   prefix for `transactional.id` (the partition number is appended - the id is stable per partition, so a
-    *   takeover's `initTransactions` fences the previous owner's producer and aborts any transaction it left open).
-    *   Fencing of stale writers stays with the consumer generation, but the takeover-abort makes a crashed owner's
-    *   leftovers not outlive the handover - so treat the prefix like a group id: one prefix per flow, unique on the
-    *   cluster (e.g. an `"<applicationId>-<inputTopic>"` string), or producers share ids and fence each other. On an
+    *   prefix for `transactional.id` (the partition number is appended). The id is stable per partition - a takeover's
+    *   `initTransactions` aborts any transaction a crashed previous owner left open - so treat the prefix like a group
+    *   id: one prefix per flow, unique on the cluster (e.g. an `"<applicationId>-<inputTopic>"` string), or producers
+    *   share ids and fence each other. The prefix does not fence stale writers (that is by consumer generation). On an
     *   ACL-secured cluster it is also the `transactional.id` prefix the producer principal must be authorized for.
     * @param snapshotTopic
     *   snapshot topic name (should be configured as a 'compacted' topic) to read/write snapshots
@@ -204,12 +203,9 @@ object KafkaPersistenceModule {
     val partition = inputTopicPartition.partition
 
     for {
-      // stable per partition (the eos-v1 Kafka Streams model): this producer's initTransactions fences the
-      // previous owner's producer and aborts any transaction a hard-crashed owner left open, so its leftovers
-      // (an open transaction pinning the topic's last-stable-offset; pending transactional offsets blocking
-      // requireStable offset fetches) do not outlive the handover. Fencing of stale writers stays with the
-      // consumer generation bound into every commit, never with producer-epoch order (a late-initing stale
-      // owner can win the epoch; that inversion costs availability, not safety)
+      // stable per partition, never unique per assignment: every owner shares the id, so this producer's
+      // initTransactions aborts whatever a crashed predecessor left open. Fencing of stale writers stays
+      // with the consumer generation, not the producer epoch (see the design doc's "Stable transactional.id")
       transactionalId <- Resource.pure[F, String](s"$transactionalIdPrefix-${partition.value}")
       transactionalProducerConfig = producerConfig.copy(
         transactionalId = transactionalId.some,

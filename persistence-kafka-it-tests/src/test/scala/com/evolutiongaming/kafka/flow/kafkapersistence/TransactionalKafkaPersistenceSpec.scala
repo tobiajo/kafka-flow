@@ -456,17 +456,13 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
   }
 
   test("a takeover aborts the crashed owner's dangling transaction (stable transactional.id)") {
-    // Every writer of a partition shares the stable transactional.id, and its mandatory initTransactions
-    // aborts the predecessor's open transaction before it may write - so a hard-crashed owner's dangling
-    // transaction does not outlive the handover, and no committed snapshot can sit above an open
-    // transaction on the topic. This test pins that at the handover: acquiring the module runs
-    // initTransactions on the partition's own id, fencing the crashed producer and aborting its dangling
-    // transaction; the abort markers are written and replicated before initTransactions returns, so the
-    // last-stable-offset is back at the high watermark before recovery reads. The crashed producer's
-    // transaction.timeout.ms is deliberately long: the pin-resolved assertion right after module
-    // acquisition can only pass through the takeover-abort, never the broker's timeout. This also pins
-    // the "<prefix>-<partition>" id shape - under a per-assignment unique id the crashed transaction
-    // would stay open and the assertion would fail.
+    // Acquiring the module runs initTransactions on the partition's stable id, aborting whatever
+    // transaction a crashed previous owner left open - the abort markers land before initTransactions
+    // returns, so the last-stable-offset is back at the high watermark before recovery reads. The crashed
+    // producer's transaction.timeout.ms is deliberately long: the assertion right after acquisition can
+    // only pass through the takeover-abort, never the broker's timeout. This also pins the
+    // "<prefix>-<partition>" id shape - under a unique-suffix id the transaction would stay open and the
+    // assertion would fail.
     val stateTopic = "tx-takeover-abort-state-topic"
     val inputTopic = s"input-$stateTopic"
 
