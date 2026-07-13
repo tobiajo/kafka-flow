@@ -116,7 +116,10 @@ silently read short of: committed snapshots are never missed
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
   it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
-  higher timeout lengthens how long a post-crash recovery can wait (below).
+  higher timeout lengthens how long a post-crash recovery can wait (below); if fast post-crash
+  takeover matters, lower it toward Kafka Streams' EOS default (10 s) instead, keeping it comfortably
+  above the longest group-committed batch — the broker's abort scan (default 10 s) floors the wait,
+  so ~10–20 s is the practical best case.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -134,7 +137,8 @@ Limitations:
 - After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
   `transaction.timeout.ms` (plus its abort scan, default 10 s); a recovery in that window waits the
   open transaction out — the read cannot complete short of it — so takeover after an ungraceful
-  shutdown is delayed by up to that long (~70 s at the defaults): an availability cost, never a wrong
+  shutdown is delayed by up to that long (~70 s at the defaults; ~10–20 s with the timeout at Kafka
+  Streams' EOS default of 10 s, see the tuning note above): an availability cost, never a wrong
   read.
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
   a non-identity mapper is not supported here.

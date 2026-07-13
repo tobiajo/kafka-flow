@@ -164,6 +164,16 @@ Kafka Streams' restore uses the same bound for the same reason
 correctness: a post-crash recovery inside the window is *delayed* until the broker aborts the
 leftover transaction, where it previously returned fast but wrong.
 
+How long that delay can be is a producer setting, not a design constant: `transaction.timeout.ms`
+passes through `producerConfig` at the client default (1 min), putting the worst case near 70 s.
+Kafka Streams runs EOS with a 10 s default as compensation for an id scheme that cannot
+takeover-abort — the position this design is in by construction — and the same compensation applies
+here: lowering the timeout toward 10 s cuts the post-crash wait to ~10–20 s. It cannot cut it
+further — the broker's abort scan floors the wait whatever the timeout. Size it comfortably above
+the longest group-committed batch (see Write path): a commit that outlives the timeout is aborted by
+the coordinator and crashes the owner, so large snapshots may call for a lower
+`maxWritesPerTransaction` instead of a higher timeout.
+
 ## Consumer rebalance protocols
 
 The per-member fencing token is the **generation** under the classic protocol and the **member epoch**
