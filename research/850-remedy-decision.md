@@ -130,9 +130,13 @@ force prefixed grants. Non-overlapping grants make collision a denied request, n
 **B's foreign-producer residual** (the one silent case,
 [`models/README.md`](../models/README.md) `recoveryread_lso_foreign`): a transactional producer
 *outside the id lineage* writing the snapshot topic can pin the LSO across a takeover, and B's init
-does not abort it — the under-read returns, silently. It needs two simultaneous misconfigurations
-(a foreign writer on a topic that must be exclusive anyway — S-4, whose violation already mixes
-state on recovery regardless of any read bound). Under A the same situation is **slow, not silent**
+does not abort it — the under-read returns, silently. The committed-data version needs two
+simultaneous misconfigurations (a foreign writer on a topic that must be exclusive anyway — S-4,
+whose violation already mixes state on recovery regardless of any read bound) — but one
+misconfiguration suffices for the pin alone: a foreign transactional producer that opens a
+transaction on the topic and hangs without committing mixes no state (`read_committed` filters what
+never commits) yet pins the LSO, so the silent case does not require an already-corrupt topology.
+Under A the same situation is **slow, not silent**
 (the HW bound waits the foreign transaction out). This is the structural asymmetry of the whole
 comparison: **A's misuse worst case is a stall; B's is the silent under-read** — and **A+B removes
 it**: with the HW bound retained, an orphan B cannot abort turns back into a loud wait.
@@ -303,8 +307,8 @@ Verbal cells; no scores. Evidence: the section named in the row.
 
 **Adopt both mechanics: B as the identity scheme, A's high-watermark read bound retained as the
 completeness backstop — the `recoveryread_both` corner: PR #853 and PR #852 combined, with the #849
-tripwire (#851) stacked last.** (Constrained to one mechanic, or staging the adoption: **B first**,
-A as triggered hardening — §5.1.)
+tripwire (#851) stacked last.** (Constrained to one mechanic, or staging the adoption: **A first**,
+B added for the latency constant — §5.1.)
 
 Under the rule: **(1)** eliminates B-only (the foreign-pin residual is silent). A and A+B both pass
 it — A trivially (no id discipline to regress; every misuse stalls loudly), A+B by conversion (the
@@ -343,41 +347,48 @@ the combined one.
   judgement, not a predicate — the HW-capture path's coverage is deemed not worth co-maintaining,
   with the id-shape pin (`KafkaPersistenceModuleSpec`) trusted as the sole regression guard.
 
-### 5.1 If adopting only one: B first, A as staged hardening
+### 5.1 If adopting only one: A first, then B
 
-If the composed corner is not on the table — one mechanic now, the other at most later — adopt **B**
-and stage A, not the reverse.
+If the composed corner is not landed at once — one mechanic now, the other at most later — adopt
+**A** first and add B for the latency constant, not the reverse. (An earlier revision of this
+section recommended B first; the correction and what refuted it are recorded at the end, per the
+corpus's convention for corrected over-claims.)
 
-Owning the tension first: under the rule's *letter*, A-only outranks B-only on criterion (1) —
-A-only has no silent case at all, B-only has the foreign-pin residual. The staged recommendation
-weighs that residual by its precondition: a foreign writer on a snapshot topic that must be
-exclusive anyway (S-4) already mixes state on recovery — silent corruption under **either**
-mechanic. The read bound decides only *how* that broken topology fails (slow-and-loud vs silent),
-not whether it does; and the one *realistic* instance of the residual is B's own migration window —
-transient (roll + `T + S`), and exactly the exposure shipped today. Weighing a conditional residual
-inside an already-lost topology below an unconditional latency constant is a judgement; a reader who
-rejects it starts with A (the §5 drop-to-A predicates are then the guide).
+Three things decide the order, and they all point the same way:
 
-What makes B the right *first* mechanic rather than merely the better half:
+1. **A→B has zero silent exposure at every instant; B→A does not.** A ships user-invisible — no
+   migration, no naming obligation, no config break — and closes the silent under-read the moment it
+   lands. When B follows, A's bound is already in place and covers exactly the old-format orphans
+   B's rolling deploy leaves behind (§2.5) — the migration window that under B-first is a transient
+   re-opening of the F-10 exposure. The staged path A→B ends at the same recommended corner with
+   nothing silent along the way; B→A spends its interim in the failure class the decision rule
+   ranks above everything else.
+2. **The rule decides this one without being overridden.** Criterion (1) orders A-only above B-only
+   directly — A-only has no silent case at all, and B-only's foreign-pin residual is reachable on a
+   *single* misconfiguration (the hanging foreign transaction, §2.2), not only inside an
+   already-corrupt topology. A staged recommendation that starts with B has to argue around the
+   rule; one that starts with A follows it.
+3. **What A-first costs is bounded and loud**: the wait tail on hard crashes (~70 s default,
+   10–20 s tuned) for as long as B is deferred — an availability cost on a rare path, exactly the
+   currency the rule spends last.
 
-1. **B buys the prize the decision exists for.** The corpus reduced the whole choice to the latency
-   gap; A-only closes the correctness hole but keeps the ~70 s default tail, the `T` coupling, and
-   the tripwire arithmetic. B-only closes the same hole *and* deletes all three (R-849.2: "seconds
-   suffice" under B).
-2. **The ordering is asymmetric in cost.** B carries the only user-visible break — the id shape and
-   the cluster-scoped prefix obligation — and the mode is **EXPERIMENTAL**, explicitly free of
-   compatibility guarantees: the cheapest moment for that break is now, and it only gets more
-   expensive as users accrete. A is user-invisible (a reader-internal bound) and composes later at
-   any time (model-proven, §1). *B-then-maybe-A leaves the cheap step for later; A-then-maybe-B
-   saves the expensive one — the wrong order.*
-3. **A-first would still pay B's migration eventually** — plus the interim years of the wait tail —
-   whereas B-first may never need the second step at all.
+**When to take the second step (B)** — now latency-driven, not safety-driven: the recovery SLO (or
+incident experience) makes the post-crash wait tail unacceptable; operating the `T`/tripwire
+arithmetic proves burdensome in practice; broker-state churn from per-assignment ids matters at the
+deployment's scale (§2.4). One scheduling note survives from the corrected revision: B carries the
+only user-visible break (the id shape and the cluster-scoped prefix obligation), and the mode is
+**EXPERIMENTAL**, explicitly free of compatibility guarantees — so if B is wanted at all, taking the
+step while the marker still stands is materially cheaper than after users accrete. Defer B, don't
+shelve it silently.
 
-**Triggers for adding A later** (any one suffices; each is observable): a foreign-writer or
-prefix-collision event on a snapshot topic; snapshot topics on a cluster whose tenancy grows beyond
-the team's naming governance and has no `TransactionalId` ACLs; an audit or the removal of the
-EXPERIMENTAL marker calling for defense-in-depth; a planned id-shape change (its rolling window
-re-creates the old-format-orphan exposure that only A's bound covers).
+**The correction, for the record.** The earlier B-first ordering rested on discounting B-only's
+silent residual by its precondition — "a foreign writer on a must-be-exclusive topic already
+corrupts silently under either mechanic" — plus the EXPERIMENTAL-window cost asymmetry. The
+discount has a counterexample (a foreign transaction that never commits mixes no state yet pins the
+LSO — §2.2), the cost asymmetry is a scheduling argument, not an ordering one (it survives above),
+and B-first ignored that A-first makes B's own roll windowless. B-first survives only as the §5
+drop-to-B judgement: a single mechanic forever, a hard sub-second recovery requirement, and
+demonstrably sound topology governance.
 
 **Falsifiers — what would change this recommendation:**
 - Measurement showing `initTransactions` takeover-abort materially slower than sub-second at
