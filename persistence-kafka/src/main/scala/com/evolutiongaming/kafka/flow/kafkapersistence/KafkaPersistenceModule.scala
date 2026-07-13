@@ -44,9 +44,9 @@ object KafkaPersistenceModule {
     *   prefix for `transactional.id` (the partition number is appended - the id is stable per partition, so a
     *   takeover's `initTransactions` fences the previous owner's producer and aborts any transaction it left open).
     *   Fencing of stale writers stays with the consumer generation, but the takeover-abort makes a crashed owner's
-    *   leftovers not outlive the handover - so treat the prefix like a group id: unique per application on the cluster
-    *   (e.g. a `"<groupId>-<inputTopic>"` string), or applications fence each other's producers. On an ACL-secured
-    *   cluster it is also the `transactional.id` prefix the producer principal must be authorized for.
+    *   leftovers not outlive the handover - so treat the prefix like a group id: one prefix per flow, unique on the
+    *   cluster (e.g. an `"<applicationId>-<inputTopic>"` string), or producers share ids and fence each other. On an
+    *   ACL-secured cluster it is also the `transactional.id` prefix the producer principal must be authorized for.
     * @param snapshotTopic
     *   snapshot topic name (should be configured as a 'compacted' topic) to read/write snapshots
     * @param maxWritesPerTransaction

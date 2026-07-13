@@ -127,20 +127,13 @@ Kafka Streams model, affordable here because the mode runs a producer per partit
 owner of a partition shares its id, so a new owner's mandatory `initTransactions` fences the previous
 owner's producer and aborts any transaction it left open, before the new owner may write.
 
-That closes a recovery defect by construction. With per-assignment unique ids
-(`"{prefix}-{partition}-{uuid8}"`) nothing aborts a hard-crashed owner's open transaction before
-`transaction.timeout.ms` — no other producer ever inits its id — and until then that open transaction
-pins the snapshot topic's last-stable-offset below records committed after it. The recovery read is
-bounded by its own `read_committed` `endOffsets` (the LSO), so it completed "successfully" while
-silently missing a newer owner's committed snapshots; with a second handover inside the window the
-next owner recovers stale state yet resumes from the newer committed input offset — the corruption
-shape of [#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fencing violated
-([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)). With the stable id the
-partition's transactions are serialized, so a committed snapshot never sits above an open transaction
-and the existing read bound is complete. Takeover after a hard crash is immediate instead of
-timeout-bounded, and the same init resolves the crashed owner's pending transactional offsets (abort
-markers land on `__consumer_offsets` too), so the next owner's `requireStable` offset fetch is equally
-unaffected.
+Sharing the id is what makes recovery complete: the partition's transactions are serialized on one id
+lineage, so a committed snapshot never sits above an open transaction and the recovery read's own
+`read_committed` end offset is a complete bound (a per-assignment unique id would leave that bound
+short — see Rejected alternatives). Takeover after a hard crash is immediate — nothing waits for
+`transaction.timeout.ms` — and the same init resolves the crashed owner's pending transactional
+offsets on `__consumer_offsets` (abort markers land there too), so the offset fetch, which must not
+see pending transactional commits, is equally unaffected.
 
 The shared id is deliberately **not** the fence. Fencing of stale writers stays with the consumer
 generation bound into every commit, never with producer-epoch order: the epoch order can diverge from
@@ -149,14 +142,13 @@ and fence the partition's valid owner — one crash of a valid owner (availabili
 stale write still dies at the generation fence. What the stable id buys is only the takeover-abort
 above.
 
-The cost is a naming discipline: treat `transactionalIdPrefix` like a group id — unique per
-application on the cluster, with each flow of a multi-flow application given its own prefix (e.g. by
-appending the input topic) — or applications fence each other's producers. `transaction.timeout.ms`
-remains only the backstop for leftovers no takeover reaches; skafka's default (1 min) is kept, since a
-group-committed batch typically commits in well under a second. (Kafka Streams EOS lowers it to 10 s
-to compensate for ids that cannot takeover-abort; the stable id takes over on init, so that
-compensation is unnecessary here.) Transaction-coordinator state is bounded by the partition count
-instead of accumulating a `transactional.id` per assignment.
+The cost is a naming discipline: treat `transactionalIdPrefix` like a group id — one prefix per flow,
+unique on the cluster (e.g. `"<applicationId>-<inputTopic>"`) — or producers share ids and fence each
+other. `transaction.timeout.ms` remains only the backstop for leftovers no takeover reaches; skafka's
+default (1 min) is kept, since a group-committed batch typically commits in well under a second.
+(Kafka Streams EOS lowers it to 10 s to compensate for ids that cannot takeover-abort; the stable id
+takes over on init, so that compensation is unnecessary here.) Transaction-coordinator state is
+bounded by the partition count.
 
 ## Consumer rebalance protocols
 
@@ -301,9 +293,12 @@ capturing `ProducerOf`.
   generation (see Stable transactional.id).
 - **Unique per-assignment `transactional.id`s** (`"{prefix}-{partition}-{uuid8}"`): no naming
   discipline to observe — but nothing aborts a hard-crashed owner's open transaction before
-  `transaction.timeout.ms`, which pins the snapshot topic's last-stable-offset and silently truncates
-  a recovery read in that window
-  ([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)); coordinator state
+  `transaction.timeout.ms` (no other producer ever inits its id), and until then it pins the snapshot
+  topic's last-stable-offset below records committed after it, silently truncating a recovery read: a
+  second handover inside the window recovers stale state yet resumes from the newer committed input
+  offset — the corruption shape of
+  [#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fence violated
+  ([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)). Coordinator state
   also accumulates per assignment until `transactional.id.expiration.ms`.
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
