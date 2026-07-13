@@ -86,24 +86,33 @@ val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[F, State](
 
 `idempotence` and the per-partition `transactional.id` are set for you — don't configure them in
 `producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
-The id is regenerated per assignment, not stable per partition. The input topic whose offsets are
+The id is stable per partition (`"<prefix>-<partition>"`): every owner of a partition shares it, so a
+takeover's `initTransactions` fences the previous owner's producer and aborts any transaction it left
+open — a hard-crashed owner's leftovers do not outlive the handover. The input topic whose offsets are
 committed transactionally, and the consumer generation used to fence stale writers, are both supplied
 by the flow (from the assigned partition and the driving consumer), so neither is part of
 `TransactionalConfig`. One module serves one flow: snapshots are keyed by partition *number* alone, so
 each input topic needs its own module with its own `snapshotTopic` — sharing a snapshot topic between
 flows would mix their state on recovery.
 
-`transactionalIdPrefix` does not affect fencing (that is by consumer generation) — it is a readable
-label and, on an ACL-secured cluster, the `transactional.id` prefix your producer principal must be
-authorized for. Use your `applicationId`; an application running several flows can append any per-flow
-discriminator (e.g. the input topic) — an `"<applicationId>*"` prefixed ACL still covers it.
+`transactionalIdPrefix` does not affect fencing of stale writers (that is by consumer generation), but
+it names the stable producer identity the takeover-abort works through — so treat it like a group id:
+unique per application on the cluster, or applications fence each other's producers. Use your
+`applicationId`; an application running several flows must give each flow its own prefix by appending a
+per-flow discriminator (e.g. the input topic) — an `"<applicationId>*"` prefixed ACL still covers it,
+and on an ACL-secured cluster the prefix is what your producer principal must be authorized for.
 
 Snapshot writes and the input-offset commit run in one Kafka transaction per assigned partition; a
 write from a stale consumer generation is fenced by the broker
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics),
 brokers 2.5+) and surfaces as
 `CommitFailedException`. Recovery reads `read_committed`, so a fenced writer's aborted records are
-never recovered.
+never recovered. After a hard crash the takeover is immediate: acquiring the module runs
+`initTransactions` on the partition's stable id, aborting the crashed owner's open transaction before
+recovery reads — so an open transaction never pins the snapshot topic's last-stable-offset into a
+recovery, and committed snapshots are never silently missed
+([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850) is closed by
+construction).
 
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
@@ -112,8 +121,9 @@ never recovered.
   own producer and transaction-coordinator state on the brokers.
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
-  it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
-  higher timeout widens the post-crash window (below).
+  it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. The
+  timeout is only the backstop for a crashed owner's leftovers no takeover reaches (a takeover aborts
+  them immediately), so raising it does not delay recovery.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -128,12 +138,9 @@ Limitations:
   nor committed, so the new owner replays those events — noise, not loss. Under the classic
   **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
   `flushOnRevoke` does not shrink the replay window there.
-- After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
-  `transaction.timeout.ms`; until then that open transaction pins the snapshot topic's
-  last-stable-offset, and a recovery in that window silently misses records beyond it — even committed
-  ones — while input offsets are not held back the same way, so a second handover inside the window
-  can recover stale state
-  ([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)).
+- A stale owner that runs `initTransactions` *after* the current owner's can win the producer epoch
+  and fence the partition's valid owner — one crash of a valid owner (availability, not safety): its
+  stale write still dies at the generation fence, and the restarted owner re-inits on the stable id.
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
   a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

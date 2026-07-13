@@ -120,22 +120,43 @@ The unknown (negative) pre-join generation is never published — the coordinato
 validation for a commit carrying it, so it would land unfenced; a flush before the first join instead
 fails loudly rather than committing ungated.
 
-### No epoch fencing
+### Stable transactional.id: the takeover aborts leftovers
 
-Generation fencing is the sole mechanism; there is deliberately no producer-epoch fencing. Each
-producer gets a unique `transactional.id` (`"{prefix}-{partition}-{uuid8}"`), so old and new owners
-never share one. A *stable* per-partition id would add cross-owner epoch fencing: with a shared id
-each `initTransactions` bumps the epoch and fences the previous holder. That is redundant here — a
-stale owner's write is already rejected by the generation fence — and the epoch order can diverge from
-ownership order (whichever owner inits *latest* wins), spuriously fencing the true owner: a crash of a
-valid owner, never a stale write landing.
+Each partition's producer uses a **stable** `transactional.id`, `"{prefix}-{partition}"` — the EOS-v1
+Kafka Streams model, affordable here because the mode runs a producer per partition anyway. Every
+owner of a partition shares its id, so a new owner's mandatory `initTransactions` fences the previous
+owner's producer and aborts any transaction it left open, before the new owner may write.
 
-The cost of unique ids — transaction-coordinator state expiring via `transactional.id.expiration.ms` —
-is accepted. A hard-crashed owner's in-flight transaction is, for the same reason, not aborted at
-takeover (a stable id would abort it through the new owner's `initTransactions`); the coordinator
-reclaims it only after `transaction.timeout.ms`, which bounds how long it pins the snapshot topic's
-last-stable-offset — the offset `read_committed` readers of that topic (recovery included) cannot
-see past.
+That closes a recovery defect by construction. With per-assignment unique ids
+(`"{prefix}-{partition}-{uuid8}"`) nothing aborts a hard-crashed owner's open transaction before
+`transaction.timeout.ms` — no other producer ever inits its id — and until then that open transaction
+pins the snapshot topic's last-stable-offset below records committed after it. The recovery read is
+bounded by its own `read_committed` `endOffsets` (the LSO), so it completed "successfully" while
+silently missing a newer owner's committed snapshots; with a second handover inside the window the
+next owner recovers stale state yet resumes from the newer committed input offset — the corruption
+shape of [#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fencing violated
+([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)). With the stable id the
+partition's transactions are serialized, so a committed snapshot never sits above an open transaction
+and the existing read bound is complete. Takeover after a hard crash is immediate instead of
+timeout-bounded, and the same init resolves the crashed owner's pending transactional offsets (abort
+markers land on `__consumer_offsets` too), so the next owner's `requireStable` offset fetch is equally
+unaffected.
+
+The shared id is deliberately **not** the fence. Fencing of stale writers stays with the consumer
+generation bound into every commit, never with producer-epoch order: the epoch order can diverge from
+ownership order (whichever owner inits *latest* wins), so a late-initing stale owner can win the epoch
+and fence the partition's valid owner — one crash of a valid owner (availability, not safety); its
+stale write still dies at the generation fence. What the stable id buys is only the takeover-abort
+above.
+
+The cost is a naming discipline: treat `transactionalIdPrefix` like a group id — unique per
+application on the cluster, with each flow of a multi-flow application given its own prefix (e.g. by
+appending the input topic) — or applications fence each other's producers. `transaction.timeout.ms`
+remains only the backstop for leftovers no takeover reaches; skafka's default (1 min) is kept, since a
+group-committed batch typically commits in well under a second. (Kafka Streams EOS lowers it to 10 s
+to compensate for ids that cannot takeover-abort; the stable id takes over on init, so that
+compensation is unnecessary here.) Transaction-coordinator state is bounded by the partition count
+instead of accumulating a `transactional.id` per assignment.
 
 ## Consumer rebalance protocols
 
@@ -258,18 +279,32 @@ shows corruption with the plain shared producer (no offset binding); the prevent
 with an *older consumer generation* and asserts the newer snapshot survives — isolating the offset
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
 fenced writer fails its next flush, an open transaction neither blocks nor leaks into recovery,
-concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
+concurrent-write safety. The takeover-abort is pinned at the handover: a test crashes an owner
+mid-transaction under the partition's own stable id with a deliberately long transaction timeout, and
+asserts the last-stable-offset is back at the high watermark immediately after module acquisition —
+only the takeover-abort can pass that, never the broker's timeout — then that recovery returns the
+committed snapshot and excludes the dangling record, also pinning the `"{prefix}-{partition}"` id
+shape against regression. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
 with a recording in-memory producer (no broker). Two unit suites pin the client-side pieces the fence
 depends on: `TopicFlowSpec` that removing a partition awaits its flows' teardown, and `ConsumerSpec`
-the post-poll generation tracking and the negative-generation guard.
+the post-poll generation tracking and the negative-generation guard; `KafkaPersistenceModuleSpec` pins
+the module-owned producer settings (the stable id shape, idempotence, the suffixed client id) via a
+capturing `ProducerOf`.
 
 ## Rejected alternatives
 
 - **Transactional snapshot read + snapshot write**: fence a stale writer with a compare-and-set on the
   stored offset. Kafka has no conditional produce primitive, so it cannot be atomic.
-- **Producer-epoch fencing (stable `transactional.id`)**: redundant with the generation fence, and
-  the epoch order can diverge from ownership order, spuriously fencing the true owner (see No epoch
-  fencing).
+- **Producer-epoch order as the fence**: the epoch order can diverge from ownership order (whichever
+  owner inits *latest* wins), spuriously fencing the true owner. The stable per-partition
+  `transactional.id` is kept for its takeover-abort, never as the fence — that stays with the
+  generation (see Stable transactional.id).
+- **Unique per-assignment `transactional.id`s** (`"{prefix}-{partition}-{uuid8}"`): no naming
+  discipline to observe — but nothing aborts a hard-crashed owner's open transaction before
+  `transaction.timeout.ms`, which pins the snapshot topic's last-stable-offset and silently truncates
+  a recovery read in that window
+  ([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)); coordinator state
+  also accumulates per assignment until `transactional.id.expiration.ms`.
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
   reassignment, and safe *dynamic* assignment is the point of this design. (Static *membership*
