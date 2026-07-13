@@ -461,9 +461,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     // bounded by that pin (it would silently miss the newer owner's committed snapshots and recover stale
     // state); it must wait the open transaction out, then include the committed records and exclude the
     // timed-out (aborted) ones. The open transaction here is genuinely open during the read: a unique
-    // second transactional.id is used, so nothing aborts it early - only the broker's timeout does. (The
-    // previous version of this test reused the crashed producer's id, so the second initTransactions
-    // aborted the transaction before the read ran - it never exercised the open case.)
+    // second transactional.id is used, so nothing aborts it early - only the broker's timeout does.
     val stateTopic = "tx-open-state-topic"
 
     def record(key: String, value: String) = new ProducerRecord(

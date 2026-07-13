@@ -103,10 +103,9 @@ write from a stale consumer generation is fenced by the broker
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics),
 brokers 2.5+) and surfaces as
 `CommitFailedException`. Recovery reads `read_committed`, so a fenced writer's aborted records are
-never recovered, and the read targets the snapshot topic's high watermark — not the last-stable-offset
-an open transaction pins — so a hard-crashed owner's leftover transaction is waited out, never
-silently read short of: committed snapshots are never missed
-([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850) is closed).
+never recovered. If the previous owner crashed mid-write, recovery waits until the broker aborts its
+unfinished transaction (bounded — see the limitations below), then reads everything committed:
+committed snapshots are never missed.
 
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
@@ -115,11 +114,10 @@ silently read short of: committed snapshots are never missed
   own producer and transaction-coordinator state on the brokers.
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
-  it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
-  higher timeout lengthens how long a post-crash recovery can wait (below); if fast post-crash
-  takeover matters, lower it toward Kafka Streams' EOS default (10 s) instead, keeping it comfortably
-  above the longest group-committed batch — the broker's abort scan (default 10 s) floors the wait,
-  so ~10–20 s is the practical best case.
+  it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout.
+  The same timeout bounds how long a post-crash recovery waits (below); if fast post-crash takeover
+  matters, lower it toward Kafka Streams' EOS default (10 s), keeping it comfortably above the
+  longest group-committed batch.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -135,11 +133,10 @@ Limitations:
   **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
   `flushOnRevoke` does not shrink the replay window there.
 - After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
-  `transaction.timeout.ms` (plus its abort scan, default 10 s); a recovery in that window waits the
-  open transaction out — the read cannot complete short of it — so takeover after an ungraceful
-  shutdown is delayed by up to that long (~70 s at the defaults; ~10–20 s with the timeout at Kafka
-  Streams' EOS default of 10 s, see the tuning note above): an availability cost, never a wrong
-  read.
+  `transaction.timeout.ms` plus the broker's abort scan (default 10 s); recovery waits that
+  transaction out, so takeover after an ungraceful shutdown is delayed by up to that long — ~70 s at
+  the defaults, ~10–20 s with the timeout at 10 s (see the tuning note above): an availability cost,
+  never a wrong read.
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
   a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

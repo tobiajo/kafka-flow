@@ -87,7 +87,7 @@ Key points:
 - The offset-to-commit is **seeded with the assigned offset**, so even the first snapshot flush (before
   the first commit tick) carries an offset and is gated.
 - Recovery is forced to `read_committed` so a fenced writer's aborted records are invisible, and its
-  read targets the high watermark so an open transaction is waited out, never silently read short of
+  read targets the high watermark, so an open transaction is waited out rather than read short of
   (see Recovery read below).
 - The ordinary consumer-group offset commit is **replaced**, not run alongside. In the default mode the
   committable offset is staged and the **consumer** commits it; in this mode that same offset-scheduling
@@ -137,42 +137,37 @@ is accepted. A hard-crashed owner's in-flight transaction is, for the same reaso
 takeover (a stable id would abort it through the new owner's `initTransactions`); the coordinator
 reclaims it only after `transaction.timeout.ms`, which bounds how long it pins the snapshot topic's
 last-stable-offset — the offset `read_committed` readers of that topic (recovery included) cannot
-see past. The recovery read is therefore bounded by the **high watermark**, not by that pinned
-offset, so it waits such a transaction out instead of completing short of it (next section).
+see past. The recovery read therefore targets the **high watermark** (next section).
 
 ### Recovery read: bounded by the high watermark
 
-A `read_committed` consumer's own `endOffsets` is the **last-stable-offset**: the minimum of the high
-watermark and the first offset of any open transaction. Bounding the recovery read by it is a defect:
-a hard-crashed owner's open transaction (up to `transaction.timeout.ms` old, see above) pins the LSO
-*below* records committed after it, so a recovery in that window completed "successfully" while
-silently missing a newer owner's committed snapshots — with a second handover inside the window the
-next owner recovers stale state yet resumes from the newer committed input offset, the corruption
-shape of [#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fencing violated
-([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850); replicated on a real
-broker as an 85 ms read missing a committed snapshot).
+The read must not bound itself by its own `endOffsets`: a `read_committed` consumer's `endOffsets` is
+the **last-stable-offset** — the minimum of the high watermark and the first offset of any open
+transaction — which a crashed writer's open transaction (above) pins below records committed after
+it. A read bounded there would complete while silently missing a newer owner's committed snapshots;
+with a second handover inside the window the next owner would recover stale state yet resume from the
+newer committed input offset — the corruption shape of
+[#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fence violated
+([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)).
 
 So the read target is the **high watermark**, captured up front by a short-lived `read_uncommitted`
 consumer (only when the read itself is `read_committed`; under `read_uncommitted` the consumer's own
-end offset already is the high watermark and nothing changes). The `read_committed` position cannot
-pass the LSO until the broker resolves the open transaction, so the read genuinely waits it out —
-bounded by the producer's `transaction.timeout.ms` plus the broker's abort scan
-(`transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s) — and completes only
-once everything below the target is decided: committed records included, aborted ones filtered.
-Kafka Streams' restore uses the same bound for the same reason
+end offset already is the high watermark). The `read_committed` position cannot pass the LSO until
+the broker resolves the open transaction, so the read genuinely waits it out and completes only once
+everything below the target is decided: committed records included, aborted ones filtered. Kafka
+Streams' restore uses the same bound for the same reason
 ([KAFKA-10167](https://issues.apache.org/jira/browse/KAFKA-10167)). The cost is availability, never
-correctness: a post-crash recovery inside the window is *delayed* until the broker aborts the
-leftover transaction, where it previously returned fast but wrong.
+correctness: a post-crash recovery is delayed until the broker aborts the leftover transaction.
 
-How long that delay can be is a producer setting, not a design constant: `transaction.timeout.ms`
-passes through `producerConfig` at the client default (1 min), putting the worst case near 70 s.
-Kafka Streams runs EOS with a 10 s default as compensation for an id scheme that cannot
-takeover-abort — the position this design is in by construction — and the same compensation applies
-here: lowering the timeout toward 10 s cuts the post-crash wait to ~10–20 s. It cannot cut it
-further — the broker's abort scan floors the wait whatever the timeout. Size it comfortably above
-the longest group-committed batch (see Write path): a commit that outlives the timeout is aborted by
-the coordinator and crashes the owner, so large snapshots may call for a lower
-`maxWritesPerTransaction` instead of a higher timeout.
+The wait is bounded by the producer's `transaction.timeout.ms` (a pass-through `producerConfig`
+setting, client default 1 min) plus the broker's abort scan
+(`transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s) — ~70 s at defaults.
+Nothing here can abort the transaction sooner: ids are unique per assignment, so no takeover ever
+inits the crashed id. Kafka Streams EOS is in the same position and compensates with a 10 s timeout
+default; the same compensation applies here — ~10–20 s post-crash, the abort scan being the floor no
+timeout gets under. Size the timeout comfortably above the longest group-committed batch (see Write
+path): a commit that outlives it is aborted by the coordinator and crashes the owner, so large
+snapshots may call for a lower `maxWritesPerTransaction` instead of a higher timeout.
 
 ## Consumer rebalance protocols
 
