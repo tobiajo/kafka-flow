@@ -303,7 +303,8 @@ Verbal cells; no scores. Evidence: the section named in the row.
 
 **Adopt both mechanics: B as the identity scheme, A's high-watermark read bound retained as the
 completeness backstop — the `recoveryread_both` corner: PR #853 and PR #852 combined, with the #849
-tripwire (#851) stacked last.**
+tripwire (#851) stacked last.** (Constrained to one mechanic, or staging the adoption: **B first**,
+A as triggered hardening — §5.1.)
 
 Under the rule: **(1)** eliminates B-only (the foreign-pin residual is silent). A and A+B both pass
 it — A trivially (no id discipline to regress; every misuse stalls loudly), A+B by conversion (the
@@ -341,6 +342,42 @@ the combined one.
   (predicates: roll complete + `T+S` elapsed; exact-id or prefixed ACLs in place), **and** — a
   judgement, not a predicate — the HW-capture path's coverage is deemed not worth co-maintaining,
   with the id-shape pin (`KafkaPersistenceModuleSpec`) trusted as the sole regression guard.
+
+### 5.1 If adopting only one: B first, A as staged hardening
+
+If the composed corner is not on the table — one mechanic now, the other at most later — adopt **B**
+and stage A, not the reverse.
+
+Owning the tension first: under the rule's *letter*, A-only outranks B-only on criterion (1) —
+A-only has no silent case at all, B-only has the foreign-pin residual. The staged recommendation
+weighs that residual by its precondition: a foreign writer on a snapshot topic that must be
+exclusive anyway (S-4) already mixes state on recovery — silent corruption under **either**
+mechanic. The read bound decides only *how* that broken topology fails (slow-and-loud vs silent),
+not whether it does; and the one *realistic* instance of the residual is B's own migration window —
+transient (roll + `T + S`), and exactly the exposure shipped today. Weighing a conditional residual
+inside an already-lost topology below an unconditional latency constant is a judgement; a reader who
+rejects it starts with A (the §5 drop-to-A predicates are then the guide).
+
+What makes B the right *first* mechanic rather than merely the better half:
+
+1. **B buys the prize the decision exists for.** The corpus reduced the whole choice to the latency
+   gap; A-only closes the correctness hole but keeps the ~70 s default tail, the `T` coupling, and
+   the tripwire arithmetic. B-only closes the same hole *and* deletes all three (R-849.2: "seconds
+   suffice" under B).
+2. **The ordering is asymmetric in cost.** B carries the only user-visible break — the id shape and
+   the cluster-scoped prefix obligation — and the mode is **EXPERIMENTAL**, explicitly free of
+   compatibility guarantees: the cheapest moment for that break is now, and it only gets more
+   expensive as users accrete. A is user-invisible (a reader-internal bound) and composes later at
+   any time (model-proven, §1). *B-then-maybe-A leaves the cheap step for later; A-then-maybe-B
+   saves the expensive one — the wrong order.*
+3. **A-first would still pay B's migration eventually** — plus the interim years of the wait tail —
+   whereas B-first may never need the second step at all.
+
+**Triggers for adding A later** (any one suffices; each is observable): a foreign-writer or
+prefix-collision event on a snapshot topic; snapshot topics on a cluster whose tenancy grows beyond
+the team's naming governance and has no `TransactionalId` ACLs; an audit or the removal of the
+EXPERIMENTAL marker calling for defense-in-depth; a planned id-shape change (its rolling window
+re-creates the old-format-orphan exposure that only A's bound covers).
 
 **Falsifiers — what would change this recommendation:**
 - Measurement showing `initTransactions` takeover-abort materially slower than sub-second at
