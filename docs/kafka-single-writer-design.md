@@ -132,8 +132,8 @@ lineage, so a committed snapshot never sits above an open transaction and the re
 `read_committed` end offset is a complete bound (a per-assignment unique id would leave that bound
 short — see Rejected alternatives). Takeover after a hard crash is immediate — nothing waits for
 `transaction.timeout.ms` — and the same init resolves the crashed owner's pending transactional
-offsets on `__consumer_offsets` (abort markers land there too), so the offset fetch, which must not
-see pending transactional commits, is equally unaffected.
+offsets on `__consumer_offsets` (abort markers land there too), so the new owner's offset fetch —
+which must not see pending transactional commits — starts clean as well.
 
 The shared id is deliberately **not** the fence. Fencing of stale writers stays with the consumer
 generation bound into every commit, never with producer-epoch order: the epoch order can diverge from

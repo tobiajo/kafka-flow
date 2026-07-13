@@ -88,7 +88,7 @@ val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[F, State](
 `producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
 The id is stable per partition (`"<prefix>-<partition>"`): every owner of a partition shares it, so a
 takeover's `initTransactions` fences the previous owner's producer and aborts any transaction it left
-open — a hard-crashed owner's leftovers do not outlive the handover. The input topic whose offsets are
+open. The input topic whose offsets are
 committed transactionally, and the consumer generation used to fence stale writers, are both supplied
 by the flow (from the assigned partition and the driving consumer), so neither is part of
 `TransactionalConfig`. One module serves one flow: snapshots are keyed by partition *number* alone, so

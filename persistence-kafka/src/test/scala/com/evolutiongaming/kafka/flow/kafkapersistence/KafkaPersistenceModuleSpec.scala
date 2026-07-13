@@ -15,7 +15,7 @@ import com.evolutiongaming.skafka.producer.{Producer, ProducerConfig, ProducerOf
 import com.evolutiongaming.skafka.{CommonConfig, FromBytes, Offset, Partition, TopicPartition}
 import munit.FunSuite
 
-/** The transactional module owns the producer settings that carry its design: the stable per-partition
+/** The transactional module owns the producer settings its design depends on: the stable per-partition
   * `transactional.id` (a takeover must abort a crashed owner's dangling transaction) and idempotence - applied over
   * whatever `producerConfig` carries.
   */
