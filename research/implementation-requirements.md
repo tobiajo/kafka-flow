@@ -30,14 +30,14 @@ Language: **MUST** / **MUST NOT** = the models or pinned external semantics show
 defective; **SHOULD** = strong recommendation with a recorded tradeoff. An implementation deviating
 from a MUST needs to refute the cited evidence, not argue around it.
 
-## Status snapshot (2026-07-12)
+## Status snapshot (2026-07-14)
 
 Corpus-level "is the research done?" lives in the report's [Open work](README.md#6-open-work)
 section; keep the two snapshot dates in step. This table is the per-arm implementation view.
 
 | Arm | Where it stands | Requirements met? |
 |---|---|---|
-| Kafka transactional (merged, #833, EXPERIMENTAL) | in master and this branch | K-1..K-6, K-8 yes; **K-7 only half-met on master** — the `read_committed` *isolation* half is tested, but the *completeness* half is R-850, so F-10 (high) is still unfixed on the merged/master branch; **R-850 / R-849 open** (issues #850/#849; code+tests on draft PRs — #852 remedy A / #853 remedy B for #850, #851 tripwire for #849, all branch-verified; the models branch expects to pull in #851 + #852, see the report's [Open work](README.md#6-open-work)) |
+| Kafka transactional (merged, #833, EXPERIMENTAL) | in master and this branch | K-1..K-6, K-8 yes; **K-7 only half-met on master** — the `read_committed` *isolation* half is tested, but the *completeness* half is R-850, so F-10 (high) is still unfixed on the merged/master branch; **R-850 / R-849 open** (issues #850/#849; code+tests on draft PRs — #852 remedy A / #853 remedy B for #850, #851 tripwire for #849, all branch-verified; the recommended combined corner is drafted as fork PR #14 with the tripwire stacked as fork PR #15 — see R-850-C below — and the models branch expects to pull in that stack if adopted, see the report's [Open work](README.md#6-open-work)) |
 | Cassandra full CAS (verified, deferred) | upstream PR #834 | C-1..C-9 implemented on the cassandra/models branches with their tests |
 | Cassandra persist-only (merged, #838) | in master | P-1..P-3 yes (P-3 is a documented residual, not code) |
 | Custom stores (`backedBy`) | user-side contract | X-1..X-3 are documentation obligations on the user, stated in [`persistence.md`](../docs/persistence.md) |
@@ -201,6 +201,33 @@ committed snapshots, and nothing aborts that transaction before `transaction.tim
   only the takeover-abort can pass that; the broker timeout cannot), then that recovery returns the
   committed snapshot and excludes the dangling record. *Currently on PR #853's branch, not here.*
 
+**R-850-C — the combined corner, A+B (fork PR #14; `recoveryread_both`; tripwire stacked as fork PR
+#15).**
+
+The recorded recommendation ([`850-remedy-decision.md`](850-remedy-decision.md) §5) is this corner:
+B as the identity scheme, A retained as the completeness backstop. Obligations are the union
+**A1–A3 ∪ B1–B3** (B4 as corrected above), with the division of labor the draft's docs state: the
+takeover-abort resolves the partition's own id lineage sub-second; the high-watermark bound waits
+out only what survives init — necessarily out-of-lineage (a prefix change's leftovers, a foreign
+producer), where waiting is the correct behavior. A3's arithmetic applies to those residual waits.
+Status of the composition-specific items against the drafts:
+
+- *A wait names its cause* — **done** (fork PR #14): the read warns when its captured target sits
+  above the LSO, naming the open-transaction wait and its `transaction.timeout.ms` + abort-scan
+  bound.
+- *Takeover-abort evidence* — **done** (fork PR #14): the module logs the `initTransactions`
+  duration at acquisition (the coordinator holds the call through an abort, so a slow init is the
+  proxy signal).
+- *Capture-before-init* (the report §2.7's direct orphan signal — the `read_uncommitted` vs
+  `read_committed` end-offset gap read **before** init erases it) — **open**: it conflicts with the
+  module-acquisition pin that acquisition opens no consumer (`KafkaPersistenceModuleSpec`; recovery
+  reads lazily), so it needs a deliberate design call — the init-duration proxy above is the
+  drafted-in substitute.
+- *R-b coexistence test* — **closed** (fork PR #15): the out-of-lineage wait IT runs with the stall
+  deadline armed just above the wait's bound.
+- *R-a lower-bound check* — **closed** (fork PR #15): module acquisition warns on both defeating
+  bounds (see R-849.2a).
+
 ### R-849 — bounded loud failure of the recovery read (issue #849, finding F-11) — **IMPLEMENTED + TESTED on draft PR #851, unmerged**
 
 **The theorem (two layers, both checked).** *Untimed* — with the environment honest (the log end can
@@ -244,6 +271,9 @@ are *checked invariants*, not prose.
   eviction. **Status on #851:** the **upper** bound is checked (a warn when `recoveryStallTimeout` is
   not below `max.poll.interval.ms`); the **lower** bound (> `transaction.timeout.ms` + abort scan) is
   scaladoc guidance + a safe default only, not a construction-time check — the open residual (O-2).
+  **Status on the stacked draft (fork PR #15):** both bounds are checked and warned at module
+  acquisition (warn, not fail-construction — the SHOULD's recorded tradeoff: a misconfiguration
+  should not take down a deployment whose reads never stall); O-2 / gap R-a closed at that grade.
 - **R-849.3.** On trip the read MUST raise an error that fails the flow through normal supervision
   (visible, restartable) and MUST NOT return partial data — fail-loud is abort-before-response,
   which is what keeps a failed read invisible to (and safe under) the atomic-read spec. *Evidence:*
@@ -260,7 +290,10 @@ are *checked invariants*, not prose.
   (`RecoveryReadStalledError`), armed only in transactional mode, default 2 min, with a
   misconfiguration warning when it exceeds `max.poll.interval.ms`. Its *time-since-last-advance*
   deadline satisfies R-849.1 (it resets on a position advance — no-progress, not total duration). The
-  models branch expects to pull it in (the report's [Open work](README.md#6-open-work)).
+  models branch expects to pull it in (the report's [Open work](README.md#6-open-work)). **Stacked on
+  the combined draft as fork PR #15**, which additionally warns on the lower bound (R-a), arms the
+  deadline in the wait IT (R-b), and diagnoses a trip by re-reading the log end (truncation — below
+  the captured target — vs an open transaction that outlived the deadline).
 
 ## C — Cassandra full compare-and-set mode (verified, deferred — upstream PR #834)
 
@@ -367,28 +400,38 @@ capability, no-plain-writes) — pinned by documentation and the external semant
 generation-fence tests, with no separate test of its own; and the two OPEN items (**R-850**, **R-849**)
 are open because they are **unmerged**, not unbuilt — each has code **and** a non-vacuous pinning test
 on its draft branch (A-test on #852, B-test on #853, R-849-test on #851), all verified by inspecting the
-branches this session. What is missing is the merge (and the A-vs-B decision), not the artifact.
+branches this session. What is missing is the merge, not the artifact — the A-vs-B decision input is now
+recorded ([`850-remedy-decision.md`](850-remedy-decision.md)) and the recommended combination drafted
+(R-850-C above).
 Everything else is implemented on its arm's branch with the named test.
 
 ## Integration gaps across the code branches (#851–#853)
 
 Each draft branch carries its code **and** a non-vacuous pinning test (R-849-test on #851; live + unit
 A-test on #852; takeover-abort B-test + id-shape pin on #853). These are gaps *in the combination / at the
-edges*, not defects in any single PR:
+edges*, not defects in any single PR. Status update (2026-07-14): the combination now exists as a draft
+stack — fork PR #14 (A+B composed) with fork PR #15 (the tripwire) on top — and R-a/R-b/R-c/R-d are
+closed on it; the entries keep their original statements as the record of what the combination owed.
 
 - **R-a (code): #851 should validate the tripwire's *lower* bound, not only the upper.** It warns when
   `recoveryStallTimeout >= max.poll.interval.ms` but not when it is `<= transaction.timeout.ms +
   transaction.abort.timed.out.transaction.cleanup.interval.ms` (~70 s at defaults) — the bound that
   matters under Remedy A, whose legitimate wait is no-progress (R-849.2a). Trivially met under B, load-bearing under A.
+  **Closed on fork PR #15** (both bounds warned at module acquisition).
 - **R-b (test): add the A×tripwire *coexistence* test** — that a genuine Remedy-A wait (an open transaction
   resolving within `transaction.timeout.ms`) completes **without** tripping the tripwire above it. Neither
   #851 nor #852 tests the two together; each pins only its own mechanism.
+  **Closed on fork PR #15** (the out-of-lineage wait IT arms the deadline just above the wait's bound).
 - **R-c (process): pick A-vs-B, then stack, don't parallel-merge.** #851 and #852 both edit `readPartition`
   and add `ReadSnapshotsSpec`; #851 and #853 both edit `KafkaPersistenceModule`. Land the chosen #850
   remedy first, rebase #851 on top, resolve in one place — avoids a three-way conflict.
+  **Followed** (with "the chosen remedy" read as the combined corner): fork PR #14 landed the
+  composition first, the tripwire was integrated on top as fork PR #15, conflicts resolved in one place.
 - **R-d (doc): surface Remedy A's recovery-latency tail** (~70 s pause while a crashed writer's transaction
   is aborted) in [`persistence.md`](../docs/persistence.md), so it is not mistaken for the #849 hang
   (R-850 A2). N/A under B.
+  **Closed on fork PR #14** (the limitations state the prefix-change/foreign wait and its
+  `transaction.timeout.ms` + ~10 s bound; the wait itself logs at warn, naming the bound).
 - **Not gaps (handled):** #853's `transaction.timeout` vs `maxWritesPerTransaction` — #853 keeps the
   client default (1 min; an earlier note here said 10 s — corrected, see B4) and the module scaladoc
   notes a group-committed batch commits in well under a second, far below it; #853's prefix-as-group-id

@@ -210,7 +210,7 @@ negative control.
   replay-of-a-reaped-tombstone is bounded/safe) were independently primary-source-verified — see
   [`external-semantics.md`](external-semantics.md) ext(C-F9).
 
-## F-10 (Kafka) — Recovery read bounded at its own `read_committed` end offset under-reads past an open transaction — **REMEDY PROVEN, DECISION OPEN (issue #850; two candidate fixes, PR #852 = remedy 1, PR #853 = remedy 2 — the suite proves the read violates with neither and either alone suffices)**
+## F-10 (Kafka) — Recovery read bounded at its own `read_committed` end offset under-reads past an open transaction — **REMEDY PROVEN, DECISION INPUT RECORDED (issue #850; PR #852 = remedy 1, PR #853 = remedy 2 — the suite proves the read violates with neither, either alone suffices, and both compose; the comparison recommends the composed corner — [`850-remedy-decision.md`](850-remedy-decision.md))**
 
 - **Defect.** The snapshot-topic recovery read bounded itself by its own `read_committed` consumer's
   `endOffsets` — which under `read_committed` is the Last Stable Offset, not the log end (ext(K2)). A
@@ -250,8 +250,11 @@ negative control.
   `RefAtomic`), *either alone* closes #850 (`recoveryread_hw_unique` HOLDS; `recoveryread_lso_stable`
   HOLDS), and the two **compose** (`recoveryread_both` HOLDS) — all including `RefAtomic`. The three
   passing corners are safety-equivalent but not cost-equivalent (A and "both" pay the broker-timeout
-  wait; B alone completes at the dangling transaction with no wait — the whole A-vs-B decision).** An
-  earlier
+  wait; B alone completes at the dangling transaction with no wait — the whole A-vs-B decision).**
+  That decision now has a recorded input: [`850-remedy-decision.md`](850-remedy-decision.md) compares
+  the mechanics and recommends the composed corner (staged A-first if sequenced), and a combined
+  draft exists — fork PR #14 (A+B), with the F-11 tripwire stacked as fork PR #15; adoption is still
+  pending (register: R-850-C). An earlier
   revision of this entry recorded (2) as adopted — an overstatement of a then-current working design,
   corrected here. The residual of (2) is a
   producer *outside* the id lineage pinning the topic (`recoveryread_lso_foreign` VIOLATES, the

@@ -2,8 +2,10 @@
 
 *Status: **in-progress.** The design and its verification are complete and internally consistent (TLA+
 suite 73/73) **modulo two disclosed generality residuals (C2/C3, [§6](#6-open-work))**; the two
-open-issue fixes are implemented on draft branches but **unmerged**; the #850 A-vs-B remedy is an
-**open** product decision; and a human arm's-length review is **outstanding**. Open items are tracked in
+open-issue fixes are implemented on draft branches but **unmerged**; the #850 remedy now has a recorded
+**decision input** ([`850-remedy-decision.md`](850-remedy-decision.md): adopt the composed corner,
+staged A-first if sequenced) and a drafted combined implementation, adoption itself **pending**; and a
+human arm's-length review is **outstanding**. Open items are tracked in
 [§6](#6-open-work), not hidden. **This file is the report**; the detailed files under `research/` and
 [`../models/`](../models/) are its sections and evidence, indexed in [§8](#8-sources). Each stands on its
 own; the report synthesizes and routes — it does not restate their detail.*
@@ -123,7 +125,7 @@ anchors (tests/configs), and the suite ledger are in [`findings.md`](findings.md
 | **F-9** | Cassandra | never-persisted-delete resurrection, invisible to `store.offset`-keyed invariants | *Key the invariant to the hazard's own observable* (committed-keyed). |
 | **F-4/F-5** | apparatus | a wiring gap and the TLC matcher/version mislabel — a green harness silently misclassifying | *Pin the verification toolchain too: a green run under the wrong tool version proves nothing, and a drifted label survives every self-audit.* |
 | **F-8** | Kafka | generation-lag *spurious* fence (availability); closed by the post-poll refresh, after which capture-on-assign proved redundant | *A token that lags but never leads only ever fences — the question is availability, not safety; and a dead defensive mechanism is dead weight.* |
-| **F-10** (#850) | Kafka | recovery read silently under-reads past a crashed writer's open transaction (LSO vs high-watermark) — **remedy open** | *A platform fact with two verdict-flipping readings is load-bearing; new prose forces the source lookup settled code never triggers* (found by chasing a fresh sentence to the `endOffsets` javadoc). |
+| **F-10** (#850) | Kafka | recovery read silently under-reads past a crashed writer's open transaction (LSO vs high-watermark) — **decision input recorded, adoption pending** | *A platform fact with two verdict-flipping readings is load-bearing; new prose forces the source lookup settled code never triggers* (found by chasing a fresh sentence to the `endOffsets` javadoc). |
 | **F-11** (#849) | Kafka | recovery read hangs → silent member eviction when its target outlives the log — **remedy on a draft branch** | *A silent failure is first-class severity: tripwire on no-progress (not duration), budgeted against the platform's timeouts; and an omitted environment action needs a knob.* |
 
 *Where safety-equivalent options exist (the two F-10/#850 remedies), the whole decision matrix is proven,
@@ -156,17 +158,26 @@ are all green. The register also carries the not-yet-merged status and the cross
 This report is **in-progress**; what remains is tracked, not hidden. The design and record are complete
 and internally consistent, modulo two disclosed generality residuals (C2/C3 below). Forward items:
 
-- **The F-10/#850 remedy — an open A-vs-B product decision.** Two remedies are each proven sufficient and
-  composable (the remedy 2×2 — neither → the read violates; either alone → holds; both → compose): **A**
-  bounds the recovery read at the high watermark and waits the open transaction out (a ~70 s tail); **B**
-  uses a stable per-partition `transactional.id` whose `initTransactions` aborts the predecessor (resolves
-  at init). Correctness does not choose between them — this report does not either.
+- **The F-10/#850 remedy — decision input recorded, adoption pending.** Two remedies are each proven
+  sufficient and composable (the remedy 2×2 — neither → the read violates; either alone → holds; both →
+  compose): **A** bounds the recovery read at the high watermark and waits the open transaction out (a
+  ~70 s tail); **B** uses a stable per-partition `transactional.id` whose `initTransactions` aborts the
+  predecessor (resolves at init). Correctness does not choose between them; the cost comparison now
+  does — [`850-remedy-decision.md`](850-remedy-decision.md) recommends the **composed corner** (B as the
+  identity scheme, A retained as the completeness backstop), staged **A first** if sequenced, with
+  operator-checkable flip conditions in both directions. A recommendation is an input to the product
+  decision, not the decision.
 - **The fixes are implemented but unmerged.** Code + a non-vacuous test exist on draft branches (the F-11
-  tripwire, Remedy A, Remedy B). This models branch carries `research/` + `models/` and *expects to pull
-  in* the tripwire + the chosen #850 remedy; the models already cover both remedy corners, so either drops
-  in without new modelling. The PR/branch mapping and the cross-branch integration gaps (a lower-bound
-  wiring check, an A×tripwire coexistence test, a stack-don't-parallel-merge sequence) are in the register
-  ([`implementation-requirements.md`](implementation-requirements.md)).
+  tripwire, Remedy A, Remedy B) — and the recommended combination is now drafted too: fork PR #14 merges
+  A+B with composed docs and observability (the recovery wait warns naming its cause and bound; the
+  `initTransactions` duration is logged as takeover-abort evidence), and fork PR #15 stacks the F-11
+  tripwire on it, closing two register gaps (the R-a lower-bound check, the R-b wait×tripwire coexistence
+  test) and adding a trip diagnosis. This models branch carries `research/` + `models/` and *expects to
+  pull in* that stack if adopted; the models already cover the combined corner (`recoveryread_both`, at
+  the disclosed one-handover cast — C2 below), so it drops in without new modelling. Remaining opens
+  beyond the merge itself: the capture-before-init orphan signal (the report §2.7's ordering requirement,
+  in tension with the module-acquisition pin — recorded in the register). The PR/branch mapping and gap
+  statuses are in the register ([`implementation-requirements.md`](implementation-requirements.md)).
 - **A human arm's-length review is outstanding.** Both arms have had fresh-context **AI** review at parity
   (the Cassandra committee that caught F-7; the Kafka-arm pass over `RecoveryRead ⇒ RecoveryReadAtomic`,
   `RecoveryDeadline`, and the register — both in [`advisory-review.md`](advisory-review.md)); a human
@@ -206,6 +217,7 @@ opens with a role banner.
 | [`model-fidelity.md`](model-fidelity.md) | Apparatus | TLA+ model↔code fidelity, non-vacuity, accepted coverage gaps. |
 | [`../models/`](../models/) (+ [`../models/README.md`](../models/README.md)) | Apparatus | the TLA+ suite: the refinement tower, the configs, `run.sh`. |
 | [`implementation-requirements.md`](implementation-requirements.md) | Forward | the normative register (§5) + the not-yet-merged backlog and cross-branch integration gaps. |
+| [`850-remedy-decision.md`](850-remedy-decision.md) | Forward | the #850 remedy comparison (A vs B vs composed): decision rule, criteria, matrix, recommendation with staged path and flip conditions; its own web-pinned external sources. |
 | [`advisory-review.md`](advisory-review.md) | Review | the external reviews (corpus-wide advisory pass + the Kafka-arm models/register pass). |
 
 **Where each arm lives inside the shared files.** Cassandra: `cassandra-*.md`; register S-/C-/P-/X-\*;
@@ -215,5 +227,5 @@ Kafka: `kafka-*.md`; findings F-8/F-10/F-11; ext(K1)–(K8); claims KF1–KF16; 
 models `Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `FlowsAlive`, `TokenSync`, `RecoveryRead ⇒
 RecoveryReadAtomic`, `RecoveryDeadline`.
 
-*Snapshot date: 2026-07-12 (keep in step with the [`implementation-requirements.md`](implementation-requirements.md)
+*Snapshot date: 2026-07-14 (keep in step with the [`implementation-requirements.md`](implementation-requirements.md)
 status snapshot and the [`advisory-review.md`](advisory-review.md) date).*

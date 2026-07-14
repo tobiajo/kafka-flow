@@ -266,7 +266,10 @@ without interference. The three HOLDS corners are *safety-equivalent* — each c
 cost-equivalent**: A (and therefore "both") pays the broker-timeout wait, while B alone completes at the
 dangling transaction with no wait (`recoveryread_lso_stable` reaches `Terminates` with no `TimeoutAbort`
 on the completion path; `recoveryread_hw_unique`/`recoveryread_both` need it). That latency gap is the
-whole of the A-vs-B decision — the models leave it a decision, not a correctness question.
+whole of the A-vs-B decision — the models leave it a decision, not a correctness question. The decision
+itself is analyzed in [`../research/850-remedy-decision.md`](../research/850-remedy-decision.md)
+(recommendation: the composed `recoveryread_both` corner, staged A-first if sequenced), which states
+this suite's one-handover cast (residual C2) as the composition claim's scope limit.
 
 Honest residuals: (1) *— closed.* The refinement now holds under `Truncation=TRUE` too, via the
 `FreezeObserved` **history variable**: `observed` freezes what the read saw at its linearization point,
