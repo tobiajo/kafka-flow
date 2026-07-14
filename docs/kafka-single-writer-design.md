@@ -122,7 +122,7 @@ fails loudly rather than committing ungated.
 
 ### Stable transactional.id: the takeover aborts leftovers
 
-Each partition's producer uses a **stable** `transactional.id`, `"{prefix}-{partition}"` — the EOS-v1
+Each partition's producer uses a **stable** `transactional.id`, `"<prefix>-<partition>"` — the EOS-v1
 Kafka Streams model, affordable here because the mode runs a producer per partition anyway. Every
 owner of a partition shares its id, so a new owner's mandatory `initTransactions` fences the previous
 owner's producer and aborts any transaction it left open, before the new owner may write.
@@ -131,9 +131,9 @@ Sharing the id is what makes recovery complete: the partition's transactions are
 lineage, so a committed snapshot never sits above an open transaction and the recovery read's own
 `read_committed` end offset is a complete bound (a per-assignment unique id would leave that bound
 short — see Rejected alternatives). Takeover after a hard crash is immediate — nothing waits for
-`transaction.timeout.ms` — and the same init resolves the crashed owner's pending transactional
-offsets on `__consumer_offsets` (abort markers land there too), so the new owner's offset fetch —
-which must not see pending transactional commits — starts clean as well.
+`transaction.timeout.ms`. The same init also resolves the crashed owner's pending transactional
+offsets on `__consumer_offsets`: the new owner's offset fetch, which must not see pending
+transactional commits, starts clean as well.
 
 The shared id is deliberately **not** the fence. Fencing of stale writers stays with the consumer
 generation bound into every commit, never with producer-epoch order: the epoch order can diverge from
@@ -142,13 +142,13 @@ and fence the partition's valid owner — one crash of a valid owner (availabili
 stale write still dies at the generation fence. What the stable id buys is only the takeover-abort
 above.
 
-The cost is a naming discipline: treat `transactionalIdPrefix` like a group id — one prefix per flow,
-unique on the cluster (e.g. `"<applicationId>-<inputTopic>"`) — or producers share ids and fence each
-other. `transaction.timeout.ms` remains only the backstop for leftovers no takeover reaches; skafka's
+The cost is a naming discipline: the prefix becomes cluster-scoped, like a group id — colliding
+applications fence each other's producers, loudly (the rule and its ACL note live in the persistence
+docs). `transaction.timeout.ms` remains only the backstop for leftovers no takeover reaches; skafka's
 default (1 min) is kept, since a group-committed batch typically commits in well under a second.
-(Kafka Streams EOS lowers it to 10 s to compensate for ids that cannot takeover-abort; the stable id
-takes over on init, so that compensation is unnecessary here.) Transaction-coordinator state is
-bounded by the partition count.
+(Kafka Streams EOS defaults it to 10 s, guarding cases a takeover-abort never reaches — e.g. a
+stalled but live producer; this mode accepts those under the 1-min default.)
+Transaction-coordinator state is bounded by the partition count.
 
 ## Consumer rebalance protocols
 
@@ -275,7 +275,7 @@ concurrent-write safety. The takeover-abort is pinned at the handover: a test cr
 mid-transaction under the partition's own stable id with a deliberately long transaction timeout, and
 asserts the last-stable-offset is back at the high watermark immediately after module acquisition —
 only the takeover-abort can pass that, never the broker's timeout — then that recovery returns the
-committed snapshot and excludes the dangling record, also pinning the `"{prefix}-{partition}"` id
+committed snapshot and excludes the leftover record, also pinning the `"<prefix>-<partition>"` id
 shape against regression. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
 with a recording in-memory producer (no broker). Two unit suites pin the client-side pieces the fence
 depends on: `TopicFlowSpec` that removing a partition awaits its flows' teardown, and `ConsumerSpec`
@@ -291,7 +291,7 @@ capturing `ProducerOf`.
   owner inits *latest* wins), spuriously fencing the true owner. The stable per-partition
   `transactional.id` is kept for its takeover-abort, never as the fence — that stays with the
   generation (see Stable transactional.id).
-- **Unique per-assignment `transactional.id`s** (`"{prefix}-{partition}-{uuid8}"`): no naming
+- **Unique per-assignment `transactional.id`s** (`"<prefix>-<partition>-<uuid8>"`): no naming
   discipline to observe — but nothing aborts a hard-crashed owner's open transaction before
   `transaction.timeout.ms` (no other producer ever inits its id), and until then it pins the snapshot
   topic's last-stable-offset below records committed after it, silently truncating a recovery read: a

@@ -107,9 +107,8 @@ write from a stale consumer generation is fenced by the broker
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics),
 brokers 2.5+) and surfaces as
 `CommitFailedException`. Recovery reads `read_committed`, so a fenced writer's aborted records are
-never recovered. After a hard crash the new owner takes over immediately and recovers everything that
-was committed — the crashed owner's unfinished transaction is aborted at takeover, before recovery
-reads.
+never recovered. After a hard crash the new owner takes over immediately (aborting the crashed
+owner's unfinished transaction) and recovers everything that was committed.
 
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
@@ -135,8 +134,8 @@ Limitations:
   nor committed, so the new owner replays those events — noise, not loss. Under the classic
   **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
   `flushOnRevoke` does not shrink the replay window there.
-- On rare takeover timing a stale previous owner can fence the current owner's producer once — the
-  owner crashes and recovers; never a wrong write (stale writes still die at the generation fence).
+- A stale owner's late `initTransactions` can fence the current owner's producer: that owner's flow
+  fails once and recovers (rebalance and replay); no wrong write can land.
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
   a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

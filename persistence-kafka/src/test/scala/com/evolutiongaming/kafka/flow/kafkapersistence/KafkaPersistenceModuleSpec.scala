@@ -16,7 +16,7 @@ import com.evolutiongaming.skafka.{CommonConfig, FromBytes, Offset, Partition, T
 import munit.FunSuite
 
 /** The transactional module owns the producer settings its design depends on: the stable per-partition
-  * `transactional.id` (a takeover must abort a crashed owner's dangling transaction) and idempotence - applied over
+  * `transactional.id` (a takeover must abort a crashed owner's leftover transaction) and idempotence - applied over
   * whatever `producerConfig` carries.
   */
 class KafkaPersistenceModuleSpec extends FunSuite {

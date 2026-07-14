@@ -455,14 +455,14 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     }
   }
 
-  test("a takeover aborts the crashed owner's dangling transaction (stable transactional.id)") {
+  test("a takeover aborts the crashed owner's leftover transaction (stable transactional.id)") {
     // Acquiring the module runs initTransactions on the partition's stable id, aborting whatever
     // transaction a crashed previous owner left open - the abort markers land before initTransactions
     // returns, so the last-stable-offset is back at the high watermark before recovery reads. The crashed
-    // producer's transaction.timeout.ms is deliberately long: the assertion right after acquisition can
-    // only pass through the takeover-abort, never the broker's timeout. This also pins the
-    // "<prefix>-<partition>" id shape - under a unique-suffix id the transaction would stay open and the
-    // assertion would fail.
+    // producer's transaction.timeout.ms is deliberately long (10 minutes): the assertion right after
+    // acquisition can only pass through the takeover-abort, never the broker's timeout. This also pins
+    // the "<prefix>-<partition>" id shape - under a unique-suffix id the transaction would stay open and
+    // the assertion would fail.
     val stateTopic = "tx-takeover-abort-state-topic"
     val inputTopic = s"input-$stateTopic"
 
@@ -485,8 +485,9 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     val crashedProducer =
       producerOf(
         producerConfig.copy(
-          transactionalId = s"$appId-${Partition.min.value}".some,
-          idempotence     = true,
+          transactionalId    = s"$appId-${Partition.min.value}".some,
+          idempotence        = true,
+          transactionTimeout = 10.minutes,
         )
       )
 
@@ -516,23 +517,23 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
           _ <- crashed.commitTransaction
           // the crash: a transaction left open - never committed, aborted or closed
           _    <- crashed.beginTransaction
-          _    <- crashed.send(record("key-dangling", "dangling")).flatten
+          _    <- crashed.send(record("key-leftover", "leftover")).flatten
           lso0 <- endOffset(IsolationLevel.ReadCommitted)
           hw0  <- endOffset(IsolationLevel.ReadUncommitted)
-          _     = assert(clue(lso0.value) < clue(hw0.value), "expected the dangling transaction to pin the LSO")
+          _     = assert(clue(lso0.value) < clue(hw0.value), "expected the leftover transaction to pin the LSO")
           // the takeover: acquiring the module runs initTransactions on the partition's stable id
           stored <- module.use { _ =>
             for {
               lso1 <- endOffset(IsolationLevel.ReadCommitted)
               hw1  <- endOffset(IsolationLevel.ReadUncommitted)
               // the pin is resolved by the init itself - recovery starts unpinned, nothing to wait out
-              _ = assertEquals(clue(lso1), clue(hw1), "expected the takeover's init to abort the dangling transaction")
+              _ = assertEquals(clue(lso1), clue(hw1), "expected the takeover's init to abort the leftover transaction")
               stored <- readSnapshots(stateTopic)
             } yield stored
           }
         } yield {
           assertEquals(clue(stored.get("key-committed")), utf8("committed"))
-          assertEquals(clue(stored.get("key-dangling")), none[ByteVector])
+          assertEquals(clue(stored.get("key-leftover")), none[ByteVector])
         }
       }
 
