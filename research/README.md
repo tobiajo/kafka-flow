@@ -175,9 +175,9 @@ and internally consistent, modulo two disclosed generality residuals (C2/C3 belo
   test) and adding a trip diagnosis. This models branch carries `research/` + `models/` and *expects to
   pull in* that stack if adopted; the models already cover the combined corner (`recoveryread_both`, at
   the disclosed one-handover cast — C2 below), so it drops in without new modelling. Remaining opens
-  beyond the merge itself: the capture-before-init orphan signal (the report §2.7's ordering requirement,
-  in tension with the module-acquisition pin — recorded in the register). The PR/branch mapping and gap
-  statuses are in the register ([`implementation-requirements.md`](implementation-requirements.md)).
+  beyond the merge itself: the capture-before-init orphan signal (the decision report's §2.7 ordering
+  requirement, in tension with the module-acquisition pin — recorded in the register). The PR/branch
+  mapping and gap statuses are in the register ([`implementation-requirements.md`](implementation-requirements.md)).
 - **A human arm's-length review is outstanding.** Both arms have had fresh-context **AI** review at parity
   (the Cassandra committee that caught F-7; the Kafka-arm pass over `RecoveryRead ⇒ RecoveryReadAtomic`,
   `RecoveryDeadline`, and the register — both in [`advisory-review.md`](advisory-review.md)); a human
@@ -217,7 +217,7 @@ opens with a role banner.
 | [`model-fidelity.md`](model-fidelity.md) | Apparatus | TLA+ model↔code fidelity, non-vacuity, accepted coverage gaps. |
 | [`../models/`](../models/) (+ [`../models/README.md`](../models/README.md)) | Apparatus | the TLA+ suite: the refinement tower, the configs, `run.sh`. |
 | [`implementation-requirements.md`](implementation-requirements.md) | Forward | the normative register (§5) + the not-yet-merged backlog and cross-branch integration gaps. |
-| [`850-remedy-decision.md`](850-remedy-decision.md) | Forward | the #850 remedy comparison (A vs B vs composed): decision rule, criteria, matrix, recommendation with staged path and flip conditions; its own web-pinned external sources. |
+| [`850-remedy-decision.md`](850-remedy-decision.md) | Forward | the #850 remedy comparison (A vs B vs composed): decision rule, criteria, matrix, recommendation with staged path and flip conditions; its external pins are homed as ext(K9)–(K13), its §6 routes to them. |
 | [`advisory-review.md`](advisory-review.md) | Review | the external reviews (corpus-wide advisory pass + the Kafka-arm models/register pass). |
 
 **Where each arm lives inside the shared files.** Cassandra: `cassandra-*.md`; register S-/C-/P-/X-\*;
@@ -228,4 +228,5 @@ models `Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `FlowsAlive`, `Token
 RecoveryReadAtomic`, `RecoveryDeadline`.
 
 *Snapshot date: 2026-07-14 (keep in step with the [`implementation-requirements.md`](implementation-requirements.md)
-status snapshot and the [`advisory-review.md`](advisory-review.md) date).*
+status snapshot; the [`advisory-review.md`](advisory-review.md) date records the last review pass —
+2026-07-12 — and moves only with a new review).*

@@ -1,6 +1,6 @@
 # External Cassandra semantics — verification results
 
-*Evidence (shared, sectioned by implementation) — primary-source verification of external facts the designs rest on (Cassandra ext(1)–(X2) and ext(C-F9); Kafka-broker ext(K1)–(K13)). Corpus index: [`README.md`](README.md).*
+*Evidence (shared, sectioned by implementation) — primary-source verification of external facts the designs rest on (Cassandra ext(1)–(X2) and ext(C-F9); Kafka ecosystem ext(K1)–(K13)). Corpus index: [`README.md`](README.md).*
 
 Claims the design rests on, verified against primary sources (Apache docs, Apache JIRA, Cassandra
 source, DataStax docs; corroborating expert material). Four research passes. Sources are cited by
@@ -457,8 +457,8 @@ Sources: `TransactionStateManagerConfig.java`, `TransactionStateManager.scala`,
 
 Grounds remedy B's "collision is ACL-preventable" claim (R-850 B2's governance class). The Kafka
 security docs list `TransactionalId` as an ACL resource type (Write/Describe operations), and
-prefixed resource patterns (KIP-290) cover suffixed ids — so an `"<applicationId>*"`-prefixed ACL
-authorizes the per-partition ids while excluding foreign producers from the namespace. Not
+prefixed resource patterns (KIP-290) cover suffixed ids — so a `"<transactionalIdPrefix>*"`-prefixed
+ACL authorizes the per-partition ids while excluding foreign producers from the namespace. Not
 independently source-verified (documentation-grade, like ext(K8)); nothing load-bearing rests on
 more than the resource type and prefix patterns existing.
 

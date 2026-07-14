@@ -145,7 +145,8 @@ it**: with the HW bound retained, an orphan B cannot abort turns back into a lou
 the longest batch (or the coordinator aborts legitimate commits and crashes the owner), the #849
 tripwire threshold must exceed `T + S` or every legitimate A-wait trips it as a false stall
 (R-849.2/A3 — and PR #851 today validates only the upper bound of that sandwich, gap R-a, with the
-A×tripwire coexistence test also missing, gap R-b). These are real standing obligations — but their
+A×tripwire coexistence test also missing, gap R-b; both since closed on the drafted stack — the §5
+status note). These are real standing obligations — but their
 failure modes are loud (aborted commits, spurious tripwire failures), never silent.
 
 ### 2.3 Handoff races, both directions
@@ -301,7 +302,7 @@ Verbal cells; no scores. Evidence: the section named in the row.
 | Reversibility (2.5) | — | cheap both directions | cheap; can later drop either half deliberately |
 | Ecosystem position (2.6) | Streams v2 restore — maintained default path | Flink-style abort-by-init — live mechanic; Streams' retirement reason inapplicable here | both maintained paths |
 | Resolution observability (2.7) | visible wait + tripwire | silent — needs added instrumentation | signal via capture-before-init (an ordering requirement, 2.7) |
-| Implementation cost | one PR (#852), exists | one PR (#853), exists | PRs exist as alternatives; the merged combination is unbuilt (composition model-proven only, C2) + the larger doc/test surface |
+| Implementation cost | one PR (#852), exists | one PR (#853), exists | PRs exist as alternatives; the merged combination is unbuilt (composition model-proven only, C2) + the larger doc/test surface — *since drafted, see the §5 status note* |
 
 ## 5. Recommendation
 
@@ -325,6 +326,14 @@ test today), write the R-b coexistence test (a genuine wait completing under the
 re-derive the R-849.2/A3 arithmetic against the shipped timeout default. The register's R-c
 ("pick, land, then rebase #851 on top") still governs the ordering, with "the chosen remedy" read as
 the combined one.
+
+*Status note (2026-07-14):* that price has since been paid as drafts — fork PR #14 combines the two
+branches (composed docs, the wait warning at its cause and bound, init-duration observability) and
+fork PR #15 stacks the #849 tripwire on it in R-c's order, closing R-a (both budget bounds warned at
+acquisition) and R-b (the wait IT runs under an armed deadline). The costs above are kept as written:
+they were the price, now paid, not avoided. Adoption — and capture-before-init below — remain open;
+per-item status lives in the register's R-850-C block
+([`implementation-requirements.md`](implementation-requirements.md)).
 
 **Required with adoption:**
 - Log the inferred orphan state at acquisition, capturing the `read_uncommitted` end offset

@@ -320,7 +320,7 @@ negative control.
   seam to the tower (that `OwnerRecover` and `RecoveryReadAtomic` state the same read) composes by
   implication transitivity and is documented, not TLC-checked — recorded as a residual in
   [`model-fidelity.md`](model-fidelity.md). The same rework models issue #849 — finding F-11, below.
-- **Update (Streams-timeout reading corrected).** Remedy 1's description above says Streams
+- **Update (2026-07-14, Streams-timeout reading corrected).** Remedy 1's description above says Streams
   "compensate with a forced 10 s transaction timeout". The fact stands; the causality is withdrawn:
   the override applies under both EOS modes since before eos-v2 existed (eos-v1's per-task stable ids
   *did* takeover-abort, under the same override), and its in-code rationale — quicker pending-offset

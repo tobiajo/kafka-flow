@@ -218,8 +218,8 @@ Status of the composition-specific items against the drafts:
 - *Takeover-abort evidence* — **done** (fork PR #14): the module logs the `initTransactions`
   duration at acquisition (the coordinator holds the call through an abort, so a slow init is the
   proxy signal).
-- *Capture-before-init* (the report §2.7's direct orphan signal — the `read_uncommitted` vs
-  `read_committed` end-offset gap read **before** init erases it) — **open**: it conflicts with the
+- *Capture-before-init* (the decision report's §2.7 direct orphan signal — the `read_uncommitted` vs
+  `read_committed` end-offset gap, which init erases unless read **before** it) — **open**: it conflicts with the
   module-acquisition pin that acquisition opens no consumer (`KafkaPersistenceModuleSpec`; recovery
   reads lazily), so it needs a deliberate design call — the init-duration proxy above is the
   drafted-in substitute.
@@ -258,7 +258,7 @@ are *checked invariants*, not prose.
   bound (threshold above the Remedy-A wait) is stated here + structurally consistent with the timing
   model (a no-progress span reaching the threshold trips), but is **not** its own dedicated config —
   the "a legitimate ~70 s Remedy-A wait must not trip the tripwire" coexistence is the combined A×tripwire
-  test neither PR carries yet (the one integration-test gap, noted in [`README.md`](README.md) and below).
+  test neither PR carries yet — since carried by fork PR #15 (see the R-849.2a status and gap R-b below).
 - **R-849.2b (scope boundary, from the timing model).** A no-progress tripwire does NOT bound a
   slow-but-*progressing* recovery that legitimately outruns `max.poll.interval.ms` (the two clocks
   diverge — total recovery time burns while no-progress resets). That "large restore" case is a
@@ -290,7 +290,7 @@ are *checked invariants*, not prose.
   (`RecoveryReadStalledError`), armed only in transactional mode, default 2 min, with a
   misconfiguration warning when it exceeds `max.poll.interval.ms`. Its *time-since-last-advance*
   deadline satisfies R-849.1 (it resets on a position advance — no-progress, not total duration). The
-  models branch expects to pull it in (the report's [Open work](README.md#6-open-work)). **Stacked on
+  models branch expects to pull it in if adopted (the report's [Open work](README.md#6-open-work)). **Stacked on
   the combined draft as fork PR #15**, which additionally warns on the lower bound (R-a), arms the
   deadline in the wait IT (R-b), and diagnoses a trip by re-reading the log end (truncation — below
   the captured target — vs an open transaction that outlived the deadline).
