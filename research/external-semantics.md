@@ -1,6 +1,6 @@
 # External Cassandra semantics — verification results
 
-*Evidence (shared, sectioned by implementation) — primary-source verification of external facts the designs rest on (Cassandra ext(1)–(X2) and ext(C-F9); Kafka-broker ext(K1)–(K8)). Corpus index: [`README.md`](README.md).*
+*Evidence (shared, sectioned by implementation) — primary-source verification of external facts the designs rest on (Cassandra ext(1)–(X2) and ext(C-F9); Kafka-broker ext(K1)–(K13)). Corpus index: [`README.md`](README.md).*
 
 Claims the design rests on, verified against primary sources (Apache docs, Apache JIRA, Cassandra
 source, DataStax docs; corroborating expert material). Four research passes. Sources are cited by
@@ -298,6 +298,14 @@ discharges the addendum's "analytical only" caveat for the exercised cases.
   [`findings.md`](findings.md); surfaced while drafting the remedy comparison
   ([`850-remedy-decision.md`](850-remedy-decision.md) §2.6 pins the retirement rationale it conflicts
   with).
+  *Addendum (eos-v1 lifecycle, pinned 2026-07-13 for the remedy decision):* KIP-447's stated reason
+  for retiring the per-task stable ids was producer-count scaling ("a separate producer for every
+  input partition … does not scale well"; one producer per thread instead) — not correctness. Id
+  shapes at source (`StreamsProducer`, 3.9): v1 `<applicationId>-<taskId>`, v2
+  `<applicationId>-<processId>-<threadIdx>` with `processId` a per-process UUID. Deprecated by
+  KIP-732 (3.0), removed by KAFKA-16331 (4.0). Load-bearing for remedy B's steelman: kafka-flow's
+  transactional mode runs a producer per partition under *any* id scheme, so the retirement reason
+  does not apply to it.
 
 Sources: KIP-447, KIP-848, KIP-1251, KafkaConsumer/KafkaProducer 4.0 javadoc, producer/broker configs,
 KAFKA-18060 / KAFKA-19779 / KAFKA-16285, group-coordinator `ClassicGroup` / `ConsumerGroup`
@@ -373,6 +381,88 @@ Sources: Kafka broker/topic configuration reference (`unclean.leader.election.en
 default; checked 2026-07); `kafka-leader-election` tool documentation (unclean election type);
 issue #849's premise (log truncation after an unclean leader election regressing the log end below
 a captured recovery target).
+
+## ext(K9) Flink's Kafka sink aborts leftovers by re-initializing deterministic ids — **CONFIRMED (source-level, flink-connector-kafka main; fetched 2026-07-13)**
+
+The live ecosystem precedent for remedy B's mechanic (takeover-abort through identity continuity),
+pinned because the remedy decision leans on it ([`850-remedy-decision.md`](850-remedy-decision.md)
+§2.6): abort-by-init is a maintained, current mechanic, not an abandoned eos-v1 relic.
+
+- Ids are deterministic by construction: `TransactionalIdFactory` builds
+  `<prefix>-<subtaskId>-<checkpointOffset>` — enumerable, never UUID-randomized.
+- On recovery the PROBING strategy of `TransactionAbortStrategyImpl` enumerates the deterministic id
+  space and cancels leftovers by producer initialization — in-code: "getTransactionalProducer
+  already calls initTransactions, which cancels the transaction" (`ExactlyOnceKafkaWriter`).
+- Disanalogies, stated: Flink aborts by *enumeration probing* across a checkpoint dimension
+  kafka-flow does not have (a stable per-partition id needs no probing — the takeover's own init
+  *is* the abort), its transactions are checkpoint-tied, and it carries no KIP-447 consumer fence.
+  The shared load-bearing fact is only ext(K5): `initTransactions` resolves the id's previous
+  transaction.
+
+Sources: `TransactionAbortStrategyImpl.java`, `TransactionalIdFactory.java`,
+`ExactlyOnceKafkaWriter.java` (flink-connector-kafka, main branch).
+
+## ext(K10) KIP-890 / transactions v2 leaves both remedy mechanics unchanged — **CONFIRMED (KIP text + broker source; v2 broker default since 4.0; fetched 2026-07-13)**
+
+Forward-compatibility pin for the remedy decision: neither mechanic rests on behavior v2 changes.
+
+- v2 (server-side defense) bumps the producer epoch on every transaction end and validates partition
+  adds server-side; `InitProducerId`'s abort-previous behavior is **unchanged** — remedy B's
+  takeover-abort survives v2 verbatim.
+- The timeout path is kept: the abort scan (ext(K2)'s
+  `transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s,
+  `TransactionStateManagerConfig`) still resolves hung transactions — remedy A's wait bound survives
+  v2 verbatim. What v2 removes is a class of *non-timeout* hangs (server-side partition-add
+  validation kills the dangling-partition variants) — narrowing, never widening, A's wait.
+- `INVALID_PID_MAPPING` becomes fatal for the producer (KIP text) — the failure shape of ext(K12)'s
+  mid-life expiration.
+
+Sources: KIP-890; kafka.apache.org transaction-protocol docs (v2 default since 4.0);
+`TransactionStateManagerConfig.java` (trunk).
+
+## ext(K11) KIP-939 (`keepPreparedTxn`) is opt-in and unshipped — **CONFIRMED (KIP text + release notes + trunk source; fetched 2026-07-13)**
+
+The one identified change-class that would break remedy B outright is abort-on-init becoming
+non-default (the remedy decision's falsifier). KIP-939 (participation in 2PC) is the existing shape
+of such a change — `initTransactions(keepPreparedTxn = true)` skips the abort — pinned at:
+
+- **opt-in by design**: default behavior explicitly unchanged (KIP text);
+- **unshipped as of 4.3**: the 4.2 release reverted its partial landing (KAFKA-19848 in the 4.2.0
+  release notes), and trunk's `TransactionCoordinator` answers `UNSUPPORTED_VERSION`.
+
+Sources: KIP-939; 4.2.0 release notes (KAFKA-19848); `TransactionCoordinator.scala` (trunk).
+
+## ext(K12) `transactional.id.expiration.ms` — idle id registrations expire; re-registration is fresh, only a mid-life producer fails — **CONFIRMED (source-level; fetched 2026-07-13)**
+
+Bounds remedy B's broker-state story ([`850-remedy-decision.md`](850-remedy-decision.md) §2.4) and
+one operational corner both id schemes share.
+
+- Default **7 days**; an id "will not expire while … still ongoing" (`TransactionStateManagerConfig`).
+- Expiry is an hourly sweep tombstoning idle-past-threshold ids in expiration-allowed states
+  (`TransactionStateManager.shouldExpire`).
+- After expiry the next `initTransactions` is a **fresh registration — no error**; only a producer
+  *mid-life* (holding a producer id whose mapping was expired) hits `INVALID_PRODUCER_ID_MAPPING`
+  (`TransactionCoordinator`), fatal under v2 (ext(K10)) — loud, never silent.
+- kafka-flow-side consequence, derived (not a broker fact): the transactional mode's offset-only
+  transactions fire only when the offset advanced (`PartitionFlow.offsetToCommit`), so a partition
+  idle past the threshold with its flow still assigned runs no transactions and can expire its id
+  mid-life; the next write then fails loudly and the flow restarts into a fresh registration.
+  Symmetric across id schemes (stable and per-assignment ids idle alike) — an operational footnote,
+  not a remedy discriminator.
+
+Sources: `TransactionStateManagerConfig.java`, `TransactionStateManager.scala`,
+`TransactionCoordinator.scala` (trunk).
+
+## ext(K13) `TransactionalId` is an ACL resource with prefixed patterns — **documentation-grade (fetched 2026-07-13)**
+
+Grounds remedy B's "collision is ACL-preventable" claim (R-850 B2's governance class). The Kafka
+security docs list `TransactionalId` as an ACL resource type (Write/Describe operations), and
+prefixed resource patterns (KIP-290) cover suffixed ids — so an `"<applicationId>*"`-prefixed ACL
+authorizes the per-partition ids while excluding foreign producers from the namespace. Not
+independently source-verified (documentation-grade, like ext(K8)); nothing load-bearing rests on
+more than the resource type and prefix patterns existing.
+
+Sources: kafka.apache.org security docs (authorization / resource types); KIP-290.
 
 ## ext(C-F9) The F-9 fix's Cassandra mechanics — **CONFIRMED (source-level)**
 

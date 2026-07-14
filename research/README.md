@@ -50,7 +50,7 @@ narratives.
 
 | Implementation | The fence (mechanism) | Guarantee (and residual) |
 |---|---|---|
-| **Kafka transactional** | the snapshot write and the input-offset commit ride one producer transaction, fenced by the consumer **generation** (KIP-447); a stale generation's commit is rejected and its transaction aborts. `read_committed` recovery, group-committed batches, a post-poll generation refresh. The recovery-read remedy for F-10 is **open** (two proven options — [§6](#6-open-work)). | a stale owner's commit is rejected and aborts; residual: the cross-partition flows-alive invariant rests on the documented rebalance contract (modelled, pinned by a teardown-coupling test). |
+| **Kafka transactional** | the snapshot write and the input-offset commit ride one producer transaction, fenced by the consumer **generation** (KIP-447); a stale generation's commit is rejected and its transaction aborts. `read_committed` recovery, group-committed batches, a post-poll generation refresh. The recovery-read remedy for F-10 is **pending adoption** (two proven options; decision input recorded — [§6](#6-open-work)). | a stale owner's commit is rejected and aborts; residual: the cross-partition flows-alive invariant rests on the documented rebalance contract (modelled, pinned by a teardown-coupling test). |
 | **Cassandra full** (verified, deferred upstream #834) | an **offset-conditional CAS** on `persist` (with a first-write compound and a guard-expiry repair) **plus** an offset-carrying tombstone delete (always written in fenced mode), a replay-window monotonic buffer, tombstone-floor recovery, and an events-recovery offset floor. | #732 closed for persists **and** deletes. |
 | **Cassandra persist-only** (merged upstream) | the persist CAS above; `delete` left a plain last-write-wins `DELETE`. | #732 closed **for persists**; documented residual: a stale writer can resurrect a *deleted* key. |
 
@@ -213,7 +213,7 @@ opens with a role banner.
 | [`kafka-rebalance-semantics.md`](kafka-rebalance-semantics.md) | Narrative (Kafka) | primary-source pin of rebalance mechanics; the KIP-848 addendum. |
 | [`findings.md`](findings.md) | Evidence | the defect ledger (F-1..F-11) with anchors, and the single reconciled suite-count ledger. |
 | [`claims.md`](claims.md) | Evidence | every design claim → evidence class → verdict (Cassandra families; Kafka KF-series). |
-| [`external-semantics.md`](external-semantics.md) | Evidence | primary-source verification of external facts (Cassandra ext(1)–(X2), ext(C-F9); Kafka ext(K1)–(K8)). |
+| [`external-semantics.md`](external-semantics.md) | Evidence | primary-source verification of external facts (Cassandra ext(1)–(X2), ext(C-F9); Kafka ext(K1)–(K13)). |
 | [`model-fidelity.md`](model-fidelity.md) | Apparatus | TLA+ model↔code fidelity, non-vacuity, accepted coverage gaps. |
 | [`../models/`](../models/) (+ [`../models/README.md`](../models/README.md)) | Apparatus | the TLA+ suite: the refinement tower, the configs, `run.sh`. |
 | [`implementation-requirements.md`](implementation-requirements.md) | Forward | the normative register (§5) + the not-yet-merged backlog and cross-branch integration gaps. |
@@ -223,7 +223,7 @@ opens with a role banner.
 **Where each arm lives inside the shared files.** Cassandra: `cassandra-*.md`; register S-/C-/P-/X-\*;
 findings F-1..F-7, F-9; ext(1)–(X2), ext(C-F9); claims Mechanism/Delete/Replay/Deleted-key/Consistency/
 TTL/Rejected; models `Cassandra`, `CasFirstWrite`, `FlushCell`, `SnapshotFlow`, `SingleWriterStore`.
-Kafka: `kafka-*.md`; findings F-8/F-10/F-11; ext(K1)–(K8); claims KF1–KF16; register S-/K-\*, R-850/R-849;
+Kafka: `kafka-*.md`; findings F-8/F-10/F-11; ext(K1)–(K13); claims KF1–KF16; register S-/K-\*, R-850/R-849;
 models `Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `FlowsAlive`, `TokenSync`, `RecoveryRead ⇒
 RecoveryReadAtomic`, `RecoveryDeadline`.
 

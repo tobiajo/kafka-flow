@@ -413,45 +413,15 @@ ext(K1, K2, K5, K6, K8); [`models/README.md`](../models/README.md) RecoveryRead 
 [`../docs/kafka-single-writer-design.md`](../docs/kafka-single-writer-design.md) (teardown coupling,
 group-committed writes, measurements).
 
-External pins (fetched 2026-07-13):
-1. **KIP-447 rationale + eos-v1 lifecycle** — [KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics)
-   ("a separate producer for every input partition … does not scale well"; "a single producer per
-   thread for EOS instead of a producer per task");
-   [`StreamsProducer.java` (3.9)](https://github.com/apache/kafka/blob/3.9/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamsProducer.java)
-   (v1 id `applicationId + "-" + taskId`; v2 id `applicationId-processId-threadIdx`, `processId` a UUID);
-   deprecation [KIP-732](https://cwiki.apache.org/confluence/display/KAFKA/KIP-732:+Deprecate+eos-alpha+and+replace+eos-beta+with+eos-v2)
-   (3.0); removal [KAFKA-16331](https://issues.apache.org/jira/browse/KAFKA-16331) (4.0).
-2. **KAFKA-10167** — [JIRA](https://issues.apache.org/jira/browse/KAFKA-10167) and
-   [`StoreChangelogReader.java`](https://github.com/apache/kafka/blob/trunk/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java)
-   ("we always use read_uncommitted to get log end offset since the last committed txn may have not
-   advanced the LSO for EOS").
-3. **Flink abort-by-init (current)** —
-   [`TransactionAbortStrategyImpl.java`](https://github.com/apache/flink-connector-kafka/blob/main/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/sink/internal/TransactionAbortStrategyImpl.java)
-   (PROBING enumerates deterministic ids),
-   [`TransactionalIdFactory.java`](https://github.com/apache/flink-connector-kafka/blob/main/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/sink/internal/TransactionalIdFactory.java)
-   (`prefix-subtaskId-checkpointOffset`),
-   [`ExactlyOnceKafkaWriter.java`](https://github.com/apache/flink-connector-kafka/blob/main/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/sink/ExactlyOnceKafkaWriter.java)
-   ("getTransactionalProducer already calls initTransactions, which cancels the transaction").
-4. **KIP-890 / transactions v2** — [KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)
-   (epoch bump per transaction end; server-side partition-add validation; InitProducerId
-   abort-previous unchanged; "INVALID_PID_MAPPING should be fatal");
-   [transaction protocol docs](https://kafka.apache.org/43/operations/transaction-protocol/)
-   (v2 broker default since 4.0);
-   [`TransactionStateManagerConfig.java`](https://github.com/apache/kafka/blob/trunk/transaction-coordinator/src/main/java/org/apache/kafka/coordinator/transaction/TransactionStateManagerConfig.java)
-   (abort scan default 10 s — the timeout path v2 keeps).
-5. **KIP-939** — [KIP-939](https://cwiki.apache.org/confluence/display/KAFKA/KIP-939%3A+Support+Participation+in+2PC)
-   (`keepPreparedTxn=true` skips abort-on-init; existing behavior unchanged); status: accepted,
-   unshipped as of 4.3 ([4.2 release notes](https://archive.apache.org/dist/kafka/4.2.0/RELEASE_NOTES.html)
-   KAFKA-19848 revert; trunk `TransactionCoordinator.scala` answers `UNSUPPORTED_VERSION`).
-6. **`transactional.id.expiration.ms`** —
-   [`TransactionStateManagerConfig.java`](https://github.com/apache/kafka/blob/trunk/transaction-coordinator/src/main/java/org/apache/kafka/coordinator/transaction/TransactionStateManagerConfig.java)
-   (default 7 d; "will not expire while … still ongoing");
-   [`TransactionStateManager.scala`](https://github.com/apache/kafka/blob/trunk/core/src/main/scala/kafka/coordinator/transaction/TransactionStateManager.scala)
-   (`shouldExpire`: idle past threshold, expiration-allowed states; hourly sweep, tombstoned);
-   [`TransactionCoordinator.scala`](https://github.com/apache/kafka/blob/trunk/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala)
-   (expired id: fresh registration on init, no error; missing metadata mid-life:
-   `INVALID_PRODUCER_ID_MAPPING`).
-7. **`TransactionalId` as an ACL resource** —
-   [Kafka security docs](https://kafka.apache.org/documentation/#security_authz)
-   (documentation-grade, not independently re-fetched: `TransactionalId` is a resource type with
-   Write/Describe operations; prefixed resource patterns per KIP-290 cover suffixed ids).
+External pins (fetched 2026-07-13; homed in [`external-semantics.md`](external-semantics.md) with the
+corpus's grade labels — one home per pin, this list only routes):
+1. **KIP-447 rationale + eos-v1 lifecycle** (id shapes at source; KIP-732 deprecation; 4.0 removal)
+   — ext(K6), eos-v1-lifecycle addendum.
+2. **KAFKA-10167** (Streams' restore fetches the end offset at `read_uncommitted`) — ext(K6),
+   *Restore*.
+3. **Flink abort-by-init** (`TransactionAbortStrategyImpl`, deterministic id factory) — ext(K9).
+4. **KIP-890 / transactions v2** (abort-on-init and the timeout path unchanged) — ext(K10).
+5. **KIP-939** (`keepPreparedTxn` opt-in, unshipped) — ext(K11).
+6. **`transactional.id.expiration.ms`** (7 d idle expiry; fresh re-registration; mid-life
+   `INVALID_PRODUCER_ID_MAPPING`) — ext(K12).
+7. **`TransactionalId` as an ACL resource** (prefixed patterns, documentation-grade) — ext(K13).
