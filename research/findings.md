@@ -317,6 +317,14 @@ negative control.
   seam to the tower (that `OwnerRecover` and `RecoveryReadAtomic` state the same read) composes by
   implication transitivity and is documented, not TLC-checked — recorded as a residual in
   [`model-fidelity.md`](model-fidelity.md). The same rework models issue #849 — finding F-11, below.
+- **Update (Streams-timeout reading corrected).** Remedy 1's description above says Streams
+  "compensate with a forced 10 s transaction timeout". The fact stands; the causality is withdrawn:
+  the override applies under both EOS modes since before eos-v2 existed (eos-v1's per-task stable ids
+  *did* takeover-abort, under the same override), and its in-code rationale — quicker pending-offset
+  expiration — targets a stalled-but-live producer's pin, which no takeover-abort reaches. The 10 s
+  value is a tuning lever for remedy 1's wait bound, not eos-v2 compensation. Correction trail:
+  [`external-semantics.md`](external-semantics.md) ext(K6); surfaced by the remedy comparison
+  ([`850-remedy-decision.md`](850-remedy-decision.md) §2.6).
 
 ## F-11 (Kafka, filed externally as issue #849) — Recovery read hangs forever when its target outlives the log end; the member is silently evicted — **REMEDY IMPLEMENTED + TESTED on draft PR #851, unmerged (modeled here)**
 

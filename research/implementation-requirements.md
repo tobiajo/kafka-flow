@@ -188,8 +188,13 @@ committed snapshots, and nothing aborts that transaction before `transaction.tim
 - **B3.** Safety MUST remain on the consumer-generation fence (K-6); epoch order gained from the
   stable id is takeover-abort hygiene, never the fence. The late-init epoch race under a stable id is
   availability-only and self-healing.
-- **B4.** `transaction.timeout.ms` SHOULD be set low (PR #853 uses 10 s) as the backstop for the
-  no-takeover case; with B1 the pin normally resolves at init, in milliseconds.
+- **B4.** `transaction.timeout.ms` stays the backstop for the no-takeover case; with B1 the pin
+  normally resolves at init, in milliseconds. *(Corrected 2026-07-14: an earlier revision said "PR
+  #853 uses 10 s" — #853's final form keeps the client default (1 min), its docs noting a
+  group-committed batch commits in well under a second and the takeover-abort, not the timeout,
+  carries the common case; forcing the timeout low is Option A's tuning lever (A2/A3), not a B
+  obligation. The Streams-timeout reading behind the 10 s guidance is likewise corrected —
+  [`external-semantics.md`](external-semantics.md) ext(K6).)*
 - **B-test.** A takeover-abort IT MUST crash an owner mid-transaction under the partition's own
   stable id with a deliberately long transaction timeout, and assert the pin is resolved
   **immediately after the successor's init** (`read_committed` = `read_uncommitted` end offsets —
@@ -217,7 +222,8 @@ are *checked invariants*, not prose.
   (10 s) < `recoveryStallTimeout` < `max.poll.interval.ms` (5 min)**. The lower bound is *threshold >
   any transaction's possible lifetime under the chosen R-850 option* (Option A: > 60 s + ~10 s ≈ 70 s,
   because A waits a hung txn out and that wait is no-progress — ext(K2); Option B: seconds suffice, the
-  pin resolves at init, and #853 sets `transaction.timeout.ms` to 10 s anyway); the upper bound is
+  pin resolves at init — an earlier note here said #853 forces the timeout to 10 s; corrected, see B4);
+  the upper bound is
   *worst-case recovery failure lands before `max.poll.interval.ms`* — fail loudly **before** the
   rebalance timeout evicts the member silently. PR #851's default `recoveryStallTimeout` = 2 min clears
   both at defaults (70 s < 120 s < 300 s). *Evidence:* the **upper** bound is `recoverydeadline_late`
@@ -383,8 +389,9 @@ edges*, not defects in any single PR:
 - **R-d (doc): surface Remedy A's recovery-latency tail** (~70 s pause while a crashed writer's transaction
   is aborted) in [`persistence.md`](../docs/persistence.md), so it is not mistaken for the #849 hang
   (R-850 A2). N/A under B.
-- **Not gaps (handled):** #853's 10 s `transaction.timeout` vs `maxWritesPerTransaction` — the module
-  scaladoc notes a group-committed batch commits in well under a second; #853's prefix-as-group-id
+- **Not gaps (handled):** #853's `transaction.timeout` vs `maxWritesPerTransaction` — #853 keeps the
+  client default (1 min; an earlier note here said 10 s — corrected, see B4) and the module scaladoc
+  notes a group-committed batch commits in well under a second, far below it; #853's prefix-as-group-id
   discipline (B2) is a documented obligation (unique prefix per app), not a runtime guard.
 
 ## Settled non-tasks (so the open list is not padded)

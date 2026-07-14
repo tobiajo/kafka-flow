@@ -288,6 +288,16 @@ discharges the addendum's "analytical only" caveat for the exercised cases.
   should not try to get end-offsets as read-committed", fixed in 2.6). I.e. Streams shipped the ext(K2)
   under-read themselves, and their restore is F-10's remedy (1) — the necessary form under an id scheme
   that cannot takeover-abort.
+  *Correction (2026-07-14, from the remedy-decision research):* corpus prose read the 10 s override as
+  Streams *compensating* for eos-v2's inability to takeover-abort. That causality is withdrawn: the
+  override applies under both EOS modes since before eos-v2 existed (eos-v1's per-task stable ids *did*
+  takeover-abort, under the same override), and its in-code rationale — quicker *pending offset
+  expiration* — targets the pin of a stalled-but-live producer, which no takeover-abort reaches (an
+  init fires only at takeover). The fact (10 s under EOS, validated against `commit.interval.ms`)
+  stands; the compensation reading does not. Trail: F-10's matching update in
+  [`findings.md`](findings.md); surfaced while drafting the remedy comparison
+  ([`850-remedy-decision.md`](850-remedy-decision.md) §2.6 pins the retirement rationale it conflicts
+  with).
 
 Sources: KIP-447, KIP-848, KIP-1251, KafkaConsumer/KafkaProducer 4.0 javadoc, producer/broker configs,
 KAFKA-18060 / KAFKA-19779 / KAFKA-16285, group-coordinator `ClassicGroup` / `ConsumerGroup`
