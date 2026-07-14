@@ -163,9 +163,9 @@ The wait is bounded by the producer's `transaction.timeout.ms` (a pass-through `
 setting, client default 1 min) plus the broker's abort scan
 (`transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s) — ~70 s at defaults.
 Nothing here can abort the transaction sooner: ids are unique per assignment, so no takeover ever
-inits the crashed id. Kafka Streams EOS is in the same position and compensates with a 10 s timeout
-default; the same compensation applies here — ~10–20 s post-crash, the abort scan being the floor no
-timeout gets under. Size the timeout comfortably above the longest group-committed batch (see Write
+inits the crashed id. Kafka Streams EOS also runs without a takeover-abort for migrated tasks and
+ships a 10 s timeout default; the same lever applies here — lowering the timeout cuts the post-crash
+wait to ~10–20 s, the abort scan being the floor no timeout gets under. Size the timeout comfortably above the longest group-committed batch (see Write
 path): a commit that outlives it is aborted by the coordinator and crashes the owner, so large
 snapshots may call for a lower `maxWritesPerTransaction` instead of a higher timeout.
 
