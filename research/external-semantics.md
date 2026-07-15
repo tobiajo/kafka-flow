@@ -406,8 +406,8 @@ Sources: `TransactionAbortStrategyImpl.java`, `TransactionalIdFactory.java`,
 
 Forward-compatibility pin for the remedy decision: neither mechanic rests on behavior v2 changes.
 
-- v2 (server-side defense) bumps the producer epoch on every transaction end and validates partition
-  adds server-side; `InitProducerId`'s abort-previous behavior is **unchanged** — remedy B's
+- v2 bumps the producer epoch on every transaction end and validates partition adds broker-side
+  (KIP-890's defense); `InitProducerId`'s abort-previous behavior is **unchanged** — remedy B's
   takeover-abort survives v2 verbatim.
 - The timeout path is kept: the abort scan (ext(K2)'s
   `transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s,
@@ -483,7 +483,7 @@ the one that breaks R-850 Option A's "bounded by `transaction.timeout.ms` + abor
   sends `WriteTxnMarkers` (v1+) directly to the partition leader with coordinator epoch −1, accepted
   only if an open transaction exists at the given start offset and the producer epoch matches — i.e.
   it writes the abort marker no timeout would.
-- **v2 prevents the class (ext(K10)).** KIP-890's server-side defense validates a produce against an
+- **v2 prevents the class (ext(K10)).** KIP-890's broker-side validation checks a produce against an
   ongoing transaction before the leader accepts it, so on the default transaction protocol of Kafka
   4.0+ brokers the class should not arise — leaving truncation as F-11's only environment cause there.
 - Version shipping the tool: not stated in the KIP; not independently pinned.

@@ -387,7 +387,7 @@ negative control.
   because it breaks R-850 Option A's "the wait is bounded by `transaction.timeout.ms` + abort scan"
   assumption (A2): under A (or a foreign pin under A+B) such a transaction hangs the read forever,
   and the R-849 deadline is the only client-side bound. It is broker-version-scoped, not remedy-
-  scoped: KIP-890's server-side defense (transactions v2, the 4.0+ default) prevents the class, so on
+  scoped: KIP-890's broker-side validation (transactions v2, the 4.0+ default) prevents the class, so on
   modern brokers truncation is again the only cause; `kafka-transactions.sh` (KIP-664) is the operator
   remedy on older ones. The tripwire covers both causes identically — no progress is no progress.
 
