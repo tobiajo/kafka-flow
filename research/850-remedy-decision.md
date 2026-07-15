@@ -227,8 +227,9 @@ licenses the default + escape-hatch shape of §5.
   Abort-on-init semantics unchanged; the orphan-resolution path for a legitimately open transaction
   remains `T + S` (pin §6.4). What v2 removes is the *non-timeout* hanging-transaction class (late
   writes resurrecting an LSO pin forever) — which retires the nightmare version of A's wait (a pin that
-  never resolves; pre-4.0 that is #849-tripwire territory under A, while under B the same pin is the
-  silent §2.2 residual — categorically worse).
+  never resolves; pre-4.0 that is #849-tripwire territory under A — or an operator's
+  `kafka-transactions` abort, KIP-664, pin §6.8 — while under B the same pin is the silent §2.2
+  residual, categorically worse).
 - **KIP-939 (2PC)** is accepted but unshipped (a 4.2 revert; trunk still rejects `keepPreparedTxn`,
   pin §6.5). Its relevance is a boundary marker: `keepPreparedTxn=true` *suspends* abort-on-init, so
   B's mechanic is incompatible with a hypothetical 2PC-coordinated snapshot store — which kafka-flow
@@ -434,3 +435,5 @@ corpus's grade labels — one home per pin, this list only routes):
 6. **`transactional.id.expiration.ms`** (7 d idle expiry; fresh re-registration; mid-life
    `INVALID_PRODUCER_ID_MAPPING`) — ext(K12).
 7. **`TransactionalId` as an ACL resource** (prefixed patterns, documentation-grade) — ext(K13).
+8. **KIP-664** (hanging transactions; `kafka-transactions.sh` detect/abort; the pre-v2 pin no timeout
+   resolves — where the #849 deadline is the only client-side bound) — ext(K14) (fetched 2026-07-15).

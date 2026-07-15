@@ -213,7 +213,7 @@ opens with a role banner.
 | [`kafka-rebalance-semantics.md`](kafka-rebalance-semantics.md) | Narrative (Kafka) | primary-source pin of rebalance mechanics; the KIP-848 addendum. |
 | [`findings.md`](findings.md) | Evidence | the defect ledger (F-1..F-11) with anchors, and the single reconciled suite-count ledger. |
 | [`claims.md`](claims.md) | Evidence | every design claim → evidence class → verdict (Cassandra families; Kafka KF-series). |
-| [`external-semantics.md`](external-semantics.md) | Evidence | primary-source verification of external facts (Cassandra ext(1)–(X2), ext(C-F9); Kafka ext(K1)–(K13)). |
+| [`external-semantics.md`](external-semantics.md) | Evidence | primary-source verification of external facts (Cassandra ext(1)–(X2), ext(C-F9); Kafka ext(K1)–(K14)). |
 | [`model-fidelity.md`](model-fidelity.md) | Apparatus | TLA+ model↔code fidelity, non-vacuity, accepted coverage gaps. |
 | [`../models/`](../models/) (+ [`../models/README.md`](../models/README.md)) | Apparatus | the TLA+ suite: the refinement tower, the configs, `run.sh`. |
 | [`implementation-requirements.md`](implementation-requirements.md) | Forward | the normative register (§5) + the not-yet-merged backlog and cross-branch integration gaps. |
@@ -223,7 +223,7 @@ opens with a role banner.
 **Where each arm lives inside the shared files.** Cassandra: `cassandra-*.md`; register S-/C-/P-/X-\*;
 findings F-1..F-7, F-9; ext(1)–(X2), ext(C-F9); claims Mechanism/Delete/Replay/Deleted-key/Consistency/
 TTL/Rejected; models `Cassandra`, `CasFirstWrite`, `FlushCell`, `SnapshotFlow`, `SingleWriterStore`.
-Kafka: `kafka-*.md`; findings F-8/F-10/F-11; ext(K1)–(K13); claims KF1–KF16; register S-/K-\*, R-850/R-849;
+Kafka: `kafka-*.md`; findings F-8/F-10/F-11; ext(K1)–(K14); claims KF1–KF16; register S-/K-\*, R-850/R-849;
 models `Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `FlowsAlive`, `TokenSync`, `RecoveryRead ⇒
 RecoveryReadAtomic`, `RecoveryDeadline`.
 

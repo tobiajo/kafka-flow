@@ -1,6 +1,6 @@
 # External Cassandra semantics — verification results
 
-*Evidence (shared, sectioned by implementation) — primary-source verification of external facts the designs rest on (Cassandra ext(1)–(X2) and ext(C-F9); Kafka ecosystem ext(K1)–(K13)). Corpus index: [`README.md`](README.md).*
+*Evidence (shared, sectioned by implementation) — primary-source verification of external facts the designs rest on (Cassandra ext(1)–(X2) and ext(C-F9); Kafka ecosystem ext(K1)–(K14)). Corpus index: [`README.md`](README.md).*
 
 Claims the design rests on, verified against primary sources (Apache docs, Apache JIRA, Cassandra
 source, DataStax docs; corroborating expert material). Four research passes. Sources are cited by
@@ -412,8 +412,10 @@ Forward-compatibility pin for the remedy decision: neither mechanic rests on beh
 - The timeout path is kept: the abort scan (ext(K2)'s
   `transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s,
   `TransactionStateManagerConfig`) still resolves hung transactions — remedy A's wait bound survives
-  v2 verbatim. What v2 removes is a class of *non-timeout* hangs (server-side partition-add
-  validation kills the dangling-partition variants) — narrowing, never widening, A's wait.
+  v2 verbatim. What v2 removes is the *hanging-transaction* class — an LSO pin no timeout resolves
+  (ext(K14)) — by validating a produce against an ongoing transaction before the leader accepts it;
+  this narrows, never widens, A's wait, and removes on 4.0+ the transaction-side cause of F-11's
+  permanent hang, leaving truncation.
 - `INVALID_PID_MAPPING` becomes fatal for the producer (KIP text) — the failure shape of ext(K12)'s
   mid-life expiration.
 
@@ -463,6 +465,32 @@ independently source-verified (documentation-grade, like ext(K8)); nothing load-
 more than the resource type and prefix patterns existing.
 
 Sources: kafka.apache.org security docs (authorization / resource types); KIP-290.
+
+## ext(K14) KIP-664 hanging transactions — a recovery-read pin no timeout resolves — **CONFIRMED (KIP text; fetched 2026-07-15)**
+
+The transaction-side instance of F-11's permanent hang: an LSO pin that never self-heals. Load-bearing
+because it is a *second* cause of the recovery read stalling forever besides truncation (ext(K8)), and
+the one that breaks R-850 Option A's "bounded by `transaction.timeout.ms` + abort scan" assumption
+(A2) — so it is the case where R-849's deadline is the only client-side bound there is.
+
+- **Hanging transaction** (KIP-664's term, also KIP-890's): the last stable offset cannot advance
+  because coordinator and replica state disagree — a transactional write sits on a partition with no
+  ongoing transaction the coordinator knows to time out. No timeout runs against it, so it pins the
+  LSO indefinitely (`read_committed` reads stick, compaction stalls). Arises from broker bugs (the KIP
+  cites KAFKA-9144).
+- **Tooling.** `kafka-transactions.sh` — `--list` / `--describe` / `--find-hanging` / `--abort`. An
+  administrative abort bypasses the coordinator (which has no record of the transaction to abort): it
+  sends `WriteTxnMarkers` (v1+) directly to the partition leader with coordinator epoch −1, accepted
+  only if an open transaction exists at the given start offset and the producer epoch matches — i.e.
+  it writes the abort marker no timeout would.
+- **v2 prevents the class (ext(K10)).** KIP-890's server-side defense validates a produce against an
+  ongoing transaction before the leader accepts it, so on the default transaction protocol of Kafka
+  4.0+ brokers the class should not arise — leaving truncation as F-11's only environment cause there.
+- Version shipping the tool: not stated in the KIP; not independently pinned.
+
+Sources: KIP-664 (title "Provide tooling to detect and abort hanging transactions", status Adopted;
+tool operations; `WriteTxnMarkers`-direct abort with coordinator epoch −1; hanging-transaction
+definition; KAFKA-9144); cross-ref KIP-890 (ext(K10)).
 
 ## ext(C-F9) The F-9 fix's Cassandra mechanics — **CONFIRMED (source-level)**
 

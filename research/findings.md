@@ -380,6 +380,16 @@ negative control.
   it drew no liveness attack. Generalizable, now in the models README: an *omitted environment
   action* is the "never happens" reading of a platform fact and deserves a knob whenever the primary
   source says it can happen — a model with no failure actions can prove any termination property.
+- **Update (2026-07-15, a second stall cause besides truncation).** The defect above is framed on
+  truncation (ext(K8)), but the same permanent stall has a second environment cause: a *hanging
+  transaction* — an LSO pin no timeout ever resolves (ext(K14)), from a broker bug that leaves a
+  transactional write with no ongoing transaction the coordinator knows to abort. It matters here
+  because it breaks R-850 Option A's "the wait is bounded by `transaction.timeout.ms` + abort scan"
+  assumption (A2): under A (or a foreign pin under A+B) such a transaction hangs the read forever,
+  and the R-849 deadline is the only client-side bound. It is broker-version-scoped, not remedy-
+  scoped: KIP-890's server-side defense (transactions v2, the 4.0+ default) prevents the class, so on
+  modern brokers truncation is again the only cause; `kafka-transactions.sh` (KIP-664) is the operator
+  remedy on older ones. The tripwire covers both causes identically — no progress is no progress.
 
 ## Documented, not fixed (dispositions)
 

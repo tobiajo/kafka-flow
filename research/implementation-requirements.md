@@ -240,6 +240,13 @@ budget against that deadline directly — `recoverydeadline_notrip` VIOLATES `IN
 unbounded loop is #849), `recoverydeadline_hang` HOLDS (the tripwire catches it) — so R-849.1/.2 below
 are *checked invariants*, not prose.
 
+**Two environment causes, one deadline.** Truncation (ext(K8)) is the modeled cause, but a *hanging
+transaction* (ext(K14)) — an LSO pin no timeout resolves, from a pre-v2 broker bug — stalls the read
+the same way, and is the case that breaks Option A's `T + S` wait bound (A2): the deadline is then
+the only client-side bound. The tripwire needs no distinction — no progress is no progress — so this
+does not change R-849; it widens *why* it is load-bearing (and narrows with brokers: KIP-890's
+transactions v2, the 4.0+ default, prevents the hanging class, leaving truncation).
+
 - **R-849.1.** `readPartition` MUST bound **no-progress** (the position not advancing across polls),
   not merely total duration — a large partition legitimately takes long while progressing.
   *Evidence:* `recoverydeadline_total` VIOLATES `INV_OnlyStalledFails` (a total-duration tripwire
