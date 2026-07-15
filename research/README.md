@@ -2,9 +2,9 @@
 
 *Status: **in-progress.** The design and its verification are complete and internally consistent (TLA+
 suite 73/73) **modulo two disclosed generality residuals (C2/C3, [§6](#6-open-work))**; the two
-open-issue fixes are implemented on draft branches but **unmerged**; the #850 remedy now has a recorded
-**decision input** ([`850-remedy-decision.md`](850-remedy-decision.md): adopt the composed corner,
-staged A-first if sequenced) and a drafted combined implementation, adoption itself **pending**; and a
+open-issue fixes exist as open upstream drafts but **unmerged**; the #850 remedy is decided in
+principle ([`850-remedy-decision.md`](850-remedy-decision.md): **A required for full safety, B
+optional for post-crash speed**), a combined implementation being downstream work; and a
 human arm's-length review is **outstanding**. Open items are tracked in
 [§6](#6-open-work), not hidden. **This file is the report**; the detailed files under `research/` and
 [`../models/`](../models/) are its sections and evidence, indexed in [§8](#8-sources). Each stands on its
@@ -50,7 +50,7 @@ narratives.
 
 | Implementation | The fence (mechanism) | Guarantee (and residual) |
 |---|---|---|
-| **Kafka transactional** | the snapshot write and the input-offset commit ride one producer transaction, fenced by the consumer **generation** (KIP-447); a stale generation's commit is rejected and its transaction aborts. `read_committed` recovery, group-committed batches, a post-poll generation refresh. The recovery-read remedy for F-10 is **pending adoption** (two proven options; decision input recorded — [§6](#6-open-work)). | a stale owner's commit is rejected and aborts; residual: the cross-partition flows-alive invariant rests on the documented rebalance contract (modelled, pinned by a teardown-coupling test). |
+| **Kafka transactional** | the snapshot write and the input-offset commit ride one producer transaction, fenced by the consumer **generation** (KIP-447); a stale generation's commit is rejected and its transaction aborts. `read_committed` recovery, group-committed batches, a post-poll generation refresh. The recovery-read remedy for F-10 is **decided in principle** (A required for safety, B optional for speed — [§6](#6-open-work)), adoption downstream. | a stale owner's commit is rejected and aborts; residual: the cross-partition flows-alive invariant rests on the documented rebalance contract (modelled, pinned by a teardown-coupling test). |
 | **Cassandra full** (verified, deferred upstream #834) | an **offset-conditional CAS** on `persist` (with a first-write compound and a guard-expiry repair) **plus** an offset-carrying tombstone delete (always written in fenced mode), a replay-window monotonic buffer, tombstone-floor recovery, and an events-recovery offset floor. | #732 closed for persists **and** deletes. |
 | **Cassandra persist-only** (merged upstream) | the persist CAS above; `delete` left a plain last-write-wins `DELETE`. | #732 closed **for persists**; documented residual: a stale writer can resurrect a *deleted* key. |
 
@@ -125,7 +125,7 @@ anchors (tests/configs), and the suite ledger are in [`findings.md`](findings.md
 | **F-9** | Cassandra | never-persisted-delete resurrection, invisible to `store.offset`-keyed invariants | *Key the invariant to the hazard's own observable* (committed-keyed). |
 | **F-4/F-5** | apparatus | a wiring gap and the TLC matcher/version mislabel — a green harness silently misclassifying | *Pin the verification toolchain too: a green run under the wrong tool version proves nothing, and a drifted label survives every self-audit.* |
 | **F-8** | Kafka | generation-lag *spurious* fence (availability); closed by the post-poll refresh, after which capture-on-assign proved redundant | *A token that lags but never leads only ever fences — the question is availability, not safety; and a dead defensive mechanism is dead weight.* |
-| **F-10** (#850) | Kafka | recovery read silently under-reads past a crashed writer's open transaction (LSO vs high-watermark) — **decision input recorded, adoption pending** | *A platform fact with two verdict-flipping readings is load-bearing; new prose forces the source lookup settled code never triggers* (found by chasing a fresh sentence to the `endOffsets` javadoc). |
+| **F-10** (#850) | Kafka | recovery read silently under-reads past a crashed writer's open transaction (LSO vs high-watermark) — **A required, B optional (decided in principle)** | *A platform fact with two verdict-flipping readings is load-bearing; new prose forces the source lookup settled code never triggers* (found by chasing a fresh sentence to the `endOffsets` javadoc). |
 | **F-11** (#849) | Kafka | recovery read hangs → silent member eviction when its target outlives the log — **remedy on a draft branch** | *A silent failure is first-class severity: tripwire on no-progress (not duration), budgeted against the platform's timeouts; and an omitted environment action needs a knob.* |
 
 *Where safety-equivalent options exist (the two F-10/#850 remedies), the whole decision matrix is proven,
@@ -158,26 +158,22 @@ are all green. The register also carries the not-yet-merged status and the cross
 This report is **in-progress**; what remains is tracked, not hidden. The design and record are complete
 and internally consistent, modulo two disclosed generality residuals (C2/C3 below). Forward items:
 
-- **The F-10/#850 remedy — decision input recorded, adoption pending.** Two remedies are each proven
-  sufficient and composable (the remedy 2×2 — neither → the read violates; either alone → holds; both →
-  compose): **A** bounds the recovery read at the high watermark and waits the open transaction out (a
-  ~70 s tail); **B** uses a stable per-partition `transactional.id` whose `initTransactions` aborts the
-  predecessor (resolves at init). Correctness does not choose between them; the cost comparison now
-  does — [`850-remedy-decision.md`](850-remedy-decision.md) recommends the **composed corner** (B as the
-  identity scheme, A retained as the completeness backstop), staged **A first** if sequenced, with
-  operator-checkable flip conditions in both directions. A recommendation is an input to the product
-  decision, not the decision.
-- **The fixes are implemented but unmerged.** Code + a non-vacuous test exist on draft branches (the F-11
-  tripwire, Remedy A, Remedy B) — and the recommended combination is now drafted too: fork PR #14 merges
-  A+B with composed docs and observability (the recovery wait warns naming its cause and bound; the
-  `initTransactions` duration is logged as takeover-abort evidence), and fork PR #15 stacks the F-11
-  tripwire on it, closing two register gaps (the R-a lower-bound check, the R-b wait×tripwire coexistence
-  test) and adding a trip diagnosis. This models branch carries `research/` + `models/` and *expects to
-  pull in* that stack if adopted; the models already cover the combined corner (`recoveryread_both`, at
-  the disclosed one-handover cast — C2 below), so it drops in without new modelling. Remaining opens
-  beyond the merge itself: the capture-before-init orphan signal (the decision report's §2.7 ordering
-  requirement, in tension with the module-acquisition pin — recorded in the register). The PR/branch
-  mapping and gap statuses are in the register ([`implementation-requirements.md`](implementation-requirements.md)).
+- **The F-10/#850 remedy — decided in principle, adoption downstream.** The remedy 2×2 proves both
+  candidates sufficient and composable (neither → the read violates; either alone → holds; both →
+  compose), but *not* equivalent: **A** (the high-watermark read bound) holds **unconditionally**,
+  while **B** (the stable per-partition `transactional.id`) leaves a silent foreign-pin residual
+  (`recoveryread_lso_foreign` VIOLATES). So the ranking is forced —
+  [`850-remedy-decision.md`](850-remedy-decision.md): **A is required for full safety; B is optional,
+  buying sub-second post-crash recovery in place of A's ~70 s wait tail.** A+B (with the #849 stall
+  deadline) is the end-state when that speed is wanted; A alone is the floor; B alone is ruled out.
+- **The remedies exist as open upstream drafts, unmerged; a combined implementation is downstream
+  work.** A (#852), B (#853), and the #849 stall deadline (#851) each carry code + a non-vacuous test
+  on their own branch. This models branch carries `research/` + `models/` and merges first; the
+  models already cover the combined corner (`recoveryread_both`, at the disclosed one-handover cast —
+  C2 below), so A / B / the deadline drop in without new modelling. What a combined A+B+deadline
+  implementation must additionally carry — the deadline's lower-bound check, the wait×deadline
+  coexistence test, and the capture-before-init orphan-signal design question — is the register's
+  R-850-C ([`implementation-requirements.md`](implementation-requirements.md)).
 - **A human arm's-length review is outstanding.** Both arms have had fresh-context **AI** review at parity
   (the Cassandra committee that caught F-7; the Kafka-arm pass over `RecoveryRead ⇒ RecoveryReadAtomic`,
   `RecoveryDeadline`, and the register — both in [`advisory-review.md`](advisory-review.md)); a human

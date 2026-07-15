@@ -1,10 +1,12 @@
 # The #850 remedy decision: takeover-abort vs bounded-wait
 
-*Status: **complete** — a decision input for the open A-vs-B choice recorded in
+*Status: **complete** — the A-vs-B choice for #850, also recorded in
 [`README.md`](README.md#6-open-work) §6 and [`implementation-requirements.md`](implementation-requirements.md)
-R-850. This report compares the two general mechanics and recommends; it proves nothing new — every
+R-850. Conclusion (§5): **A is required for full safety; B is optional, for post-crash recovery
+speed.** This report compares the two general mechanics and concludes; it proves nothing new — every
 safety claim is the corpus's (cited), every external fact is pinned to a primary source (§6). The
-recommendation binds nobody: §5 states the flip conditions and falsifiers under which it is wrong.*
+conclusion binds nobody: §5 states when to add B, and the falsifiers under which the ranking is
+wrong.*
 
 ## 1. The question
 
@@ -303,40 +305,44 @@ Verbal cells; no scores. Evidence: the section named in the row.
 | Reversibility (2.5) | — | cheap both directions | cheap; can later drop either half deliberately |
 | Ecosystem position (2.6) | Streams v2 restore — maintained default path | Flink-style abort-by-init — live mechanic; Streams' retirement reason inapplicable here | both maintained paths |
 | Resolution observability (2.7) | visible wait + tripwire | silent — needs added instrumentation | signal via capture-before-init (an ordering requirement, 2.7) |
-| Implementation cost | one PR (#852), exists | one PR (#853), exists | PRs exist as alternatives; the merged combination is unbuilt (composition model-proven only, C2) + the larger doc/test surface — *since drafted, see the §5 status note* |
+| Implementation cost | one upstream draft (#852) | one upstream draft (#853) | both drafts exist as alternatives; a combined implementation is unbuilt (composition model-proven only, C2) + the larger doc/test surface |
 
 ## 5. Recommendation
 
-**Adopt both mechanics: B as the identity scheme, A's high-watermark read bound retained as the
-completeness backstop — the `recoveryread_both` corner: PR #853 and PR #852 combined, with the #849
-tripwire (#851) stacked last.** (Constrained to one mechanic, or staging the adoption: **A first**,
-B added for the latency constant — §5.1.)
+**A is required for full safety; B is optional, for post-crash recovery speed.**
 
-Under the rule: **(1)** eliminates B-only (the foreign-pin residual is silent). A and A+B both pass
-it — A trivially (no id discipline to regress; every misuse stalls loudly), A+B by conversion (the
-HW bound turns B's residual loud). **(2)** is what separates them: A+B recovers at B's sub-second
-constant where A pays the `T`-coupled wait — the recommendation is a latency-and-decoupling win over
-A, not a safety win, and claiming more would overstate it. **(3)** is where A+B loses — both
-obligation sets, two co-maintained mechanisms — and the rule accepts that cost because each
-obligation's failure is loud and the composed surface stays test-pinned (below).
+A — the high-watermark read bound — closes the silent under-read *unconditionally*: it waits out any
+open transaction below the true high watermark, in or out of the partition's id lineage, so it holds
+with no assumption about naming, ACLs, or who else produces to the topic (`recoveryread_hw_unique`
+HOLDS `RefAtomic`). B — the stable per-partition `transactional.id` — also closes #850, but only
+within the partition's own lineage; a transaction from *outside* it re-pins the LSO and B's plain
+bound silently under-reads past it (`recoveryread_lso_foreign` VIOLATES). B is therefore **not a
+safety substitute** for A. What B buys is latency: its takeover-abort resolves a crashed owner's
+transaction at `initTransactions` — sub-second — where A waits out the broker timeout (~70 s worst
+case at defaults).
 
-**Honest costs.** The composition is proven at model level only (`recoveryread_both`, one-handover
-cast — C2); the #852×#853 **code** combination is unbuilt — the PRs were drafted as alternatives.
-Adopting A+B means building it: merge the branches (disjoint files, but the combined behavior has no
-test today), write the R-b coexistence test (a genuine wait completing under the tripwire), and
-re-derive the R-849.2/A3 arithmetic against the shipped timeout default. The register's R-c
-("pick, land, then rebase #851 on top") still governs the ordering, with "the chosen remedy" read as
-the combined one.
+So **adopt A**, and **add B when the post-crash recovery-latency tail matters** — the composed A+B
+corner (`recoveryread_both` HOLDS) is the end-state then, B supplying the sub-second constant while A
+stays the completeness backstop that keeps B's foreign-pin residual a loud wait rather than a silent
+miss. If only one ships it must be A; **B alone is ruled out** — its residual is silent, the class
+the decision rule ranks above all else. (A and B are the two open upstream recovery-read drafts; the
+#849 stall deadline is a third, orthogonal to the A-vs-B choice and required under either — it bounds
+the read's *other* way of hanging, §2.1.)
 
-*Status note (2026-07-14):* that price has since been paid as drafts — fork PR #14 combines the two
-branches (composed docs, the wait warning at its cause and bound, init-duration observability) and
-fork PR #15 stacks the #849 tripwire on it in R-c's order, closing R-a (both budget bounds warned at
-acquisition) and R-b (the wait IT runs under an armed deadline). The costs above are kept as written:
-they were the price, now paid, not avoided. Adoption — and capture-before-init below — remain open;
-per-item status lives in the register's R-850-C block
-([`implementation-requirements.md`](implementation-requirements.md)).
+Against the rule (§1.1): **(1) silent exposure** eliminates B-only and makes A the floor — A has no
+silent case at all. **(2) worst-event latency** is where B earns its place: A+B recovers at B's
+sub-second constant where A alone pays the timeout-coupled wait — a speed win, not a safety win, and
+claiming more would overstate it. **(3) standing obligations** is where A+B costs most — both
+mechanics' obligations, co-maintained — which is exactly why B is optional, not required.
 
-**Required with adoption:**
+**Honest costs of adding B.** The composition is proven at model level only (`recoveryread_both`,
+one-handover cast — C2); a combined implementation must be *built*, not just enabled — the two
+remedies were drafted as independent alternatives. Combining them means: land A, stack B and the
+#849 deadline on top (R-c), add the wait×deadline coexistence test (R-b — a genuine ~70 s wait must
+complete *without* the deadline firing), and re-derive the R-849.2/A3 timeout arithmetic against the
+shipped defaults. These are the price of B's speed, paid once.
+
+**Required when B is adopted (A+B):**
 - Log the inferred orphan state at acquisition, capturing the `read_uncommitted` end offset
   **before** `initTransactions` (§2.7 — after init the abort has erased the signal): B's abort must
   leave evidence, and a wait must name its cause.
@@ -345,24 +351,23 @@ per-item status lives in the register's R-850-C block
 - The prefix obligation ships as written in the B docs (one prefix per flow, unique on the cluster,
   ACL-floor note for secured clusters).
 
-**Flip conditions — operator-checkable, both directions:**
-- **Drop to A-only** if: cluster-scoped names demonstrably cannot be governed in this deployment —
-  a prefix collision or foreign snapshot-topic writer has actually occurred, or third parties can
-  produce to the snapshot topics — **and** the tuned wait (`T` sized to batches, 10–20 s) is within
-  the recovery SLO. (Predicates: an observed collision/foreign-writer event; SLO ≥ tuned bound. Mere
-  ACL-lessness does not qualify — group ids are governed by convention on ACL-less clusters
-  everywhere, and the prefix is the same class.)
-- **Drop to B-only** if: the migration window has passed and the snapshot topics are ACL-exclusive
-  (predicates: roll complete + `T+S` elapsed; exact-id or prefixed ACLs in place), **and** — a
-  judgement, not a predicate — the HW-capture path's coverage is deemed not worth co-maintaining,
-  with the id-shape pin (`KafkaPersistenceModuleSpec`) trusted as the sole regression guard.
+**When to add B (→ A+B), operator-checkable:** the post-crash wait tail (~70 s default, 10–20 s
+tuned) exceeds the recovery SLO; or operating the `T`/deadline arithmetic (R-849.2) is a burden; or
+per-assignment id churn matters at scale (§2.4). Absent these, A alone is the stable choice — no
+naming obligation, no migration, nothing user-visible.
 
-### 5.1 If adopting only one: A first, then B
+**B-only stays off the table.** It trades A's unconditional safety for the foreign-pin silent
+residual (§2.2), reachable on a single misconfiguration. The one governed exception — a single
+mechanic forever, a hard sub-second recovery requirement, and demonstrably sound topology governance
+(ACL-exclusive snapshot topics, no foreign producers, `KafkaPersistenceModuleSpec` trusted as the
+id-shape guard) — is a deliberate downgrade from full safety, taken knowingly, not a peer of A.
 
-If the composed corner is not landed at once — one mechanic now, the other at most later — adopt
-**A** first and add B for the latency constant, not the reverse. (An earlier revision of this
-section recommended B first; the correction and what refuted it are recorded at the end, per the
-corpus's convention for corrected over-claims.)
+### 5.1 Why B is the addition, never the start
+
+B is staged onto A, never adopted first or alone. (An earlier revision of this report recommended
+adopting *both* with B as the primary identity scheme and A as a backstop; the correction — A is the
+safety floor, B the optional speed layer — and what refuted the old framing are recorded at the end,
+per the corpus's convention for corrected over-claims.)
 
 Three things decide the order, and they all point the same way:
 
@@ -382,23 +387,20 @@ Three things decide the order, and they all point the same way:
    10–20 s tuned) for as long as B is deferred — an availability cost on a rare path, exactly the
    currency the rule spends last.
 
-**When to take the second step (B)** — now latency-driven, not safety-driven: the recovery SLO (or
-incident experience) makes the post-crash wait tail unacceptable; operating the `T`/tripwire
-arithmetic proves burdensome in practice; broker-state churn from per-assignment ids matters at the
-deployment's scale (§2.4). One scheduling note survives from the corrected revision: B carries the
-only user-visible break (the id shape and the cluster-scoped prefix obligation), and the mode is
-**EXPERIMENTAL**, explicitly free of compatibility guarantees — so if B is wanted at all, taking the
-step while the marker still stands is materially cheaper than after users accrete. Defer B, don't
-shelve it silently.
+**When to add B** is set out in §5 (latency SLO, arithmetic burden, id churn). One scheduling note:
+B carries the only user-visible break (the id shape and the cluster-scoped prefix obligation), and
+the mode is **EXPERIMENTAL**, explicitly free of compatibility guarantees — so if B is wanted at
+all, taking the step while the marker still stands is materially cheaper than after users accrete.
 
-**The correction, for the record.** The earlier B-first ordering rested on discounting B-only's
-silent residual by its precondition — "a foreign writer on a must-be-exclusive topic already
-corrupts silently under either mechanic" — plus the EXPERIMENTAL-window cost asymmetry. The
-discount has a counterexample (a foreign transaction that never commits mixes no state yet pins the
-LSO — §2.2), the cost asymmetry is a scheduling argument, not an ordering one (it survives above),
-and B-first ignored that A-first makes B's own roll windowless. B-first survives only as the §5
-drop-to-B judgement: a single mechanic forever, a hard sub-second recovery requirement, and
-demonstrably sound topology governance.
+**The correction, for the record.** An earlier revision recommended adopting *both* mechanics with B
+as the primary identity scheme, and (in an earlier form still) B *first*. Both over-stated B: they
+leaned on discounting B-only's silent residual by its precondition — "a foreign writer on a
+must-be-exclusive topic already corrupts silently under either mechanic" — which has a counterexample
+(a foreign transaction that never commits mixes no state yet pins the LSO, §2.2). Once that residual
+is load-bearing, the ranking is forced: A is the safety floor (unconditional), B is the optional
+speed layer, and B-only survives only as the §5 governed downgrade. The "adopt both" end-state is
+unchanged as a *destination* when B's speed is wanted — it is only demoted from *the* recommendation
+to *A, optionally plus B*.
 
 **Falsifiers — what would change this recommendation:**
 - Measurement showing `initTransactions` takeover-abort materially slower than sub-second at
