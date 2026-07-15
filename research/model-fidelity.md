@@ -4,7 +4,7 @@
 
 Method: every model action/definition mapped to the code construct it abstracts and verified by
 reading both; every config's constants/expectations checked; pairing discipline audited. Run results:
-all 73 configs replicated (the full suite — see the ledger in [`findings.md`](findings.md)), TLC
+all 75 configs replicated (the full suite — see the ledger in [`findings.md`](findings.md)), TLC
 2.15 (rev eb3ff99, release v1.7.0), matching declared outcomes. The audit below merges an independent full-read audit with the orchestrator's
 adversarial verification of its findings; dispositions state what was done.
 

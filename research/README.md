@@ -1,7 +1,7 @@
 # Single-writer snapshot correctness in kafka-flow — a verification report
 
 *Status: **in-progress.** The design and its verification are complete and internally consistent (TLA+
-suite 73/73) **modulo two disclosed generality residuals (C2/C3, [§6](#6-open-work))**; the two
+suite 75/75) **modulo two disclosed generality residuals (C2/C3, [§6](#6-open-work))**; the two
 open-issue fixes exist as open upstream drafts but **unmerged**; the #850 remedy is decided in
 principle ([`850-remedy-decision.md`](850-remedy-decision.md): **A required for full safety, B
 optional for post-crash speed**), a combined implementation being downstream work; and a
@@ -90,7 +90,7 @@ audited in [`model-fidelity.md`](model-fidelity.md); the suite itself is [`../mo
 
 **What holds.** #732 is verified across all three arms — each fence modelled so that removing it is a
 reachable refinement violation. The refinement tower is faithful at the audited grain; the suite is
-**73/73** (positive theorems hold, negative controls fail as declared); the recovery read is tied into
+**75/75** (positive theorems hold, negative controls fail as declared); the recovery read is tied into
 the tower as a checked refinement, not an assumed atomic step.
 
 **The recurring lessons.** The learnings are the interesting part of this study, and four patterns recur
@@ -128,7 +128,7 @@ anchors (tests/configs), and the suite ledger are in [`findings.md`](findings.md
 | **F-10** (#850) | Kafka | recovery read silently under-reads past a crashed writer's open transaction (LSO vs high-watermark) — **A required, B optional (decided in principle)** | *A platform fact with two verdict-flipping readings is load-bearing; new prose forces the source lookup settled code never triggers* (found by chasing a fresh sentence to the `endOffsets` javadoc). |
 | **F-11** (#849) | Kafka | recovery read hangs → silent member eviction when its target outlives the log — **remedy on a draft branch** | *A silent failure is first-class severity: tripwire on no-progress (not duration), budgeted against the platform's timeouts; and an omitted environment action needs a knob.* |
 
-*Where safety-equivalent options exist (the two F-10/#850 remedies), the whole decision matrix is proven,
+*Where the design admits more than one remedy (the two F-10/#850 mechanics), the whole decision matrix is proven — including the out-of-lineage asymmetry that makes A required and B optional,
 not a presumed winner — see [§6 Open work](#6-open-work).*
 
 ## 5. What the implementations require

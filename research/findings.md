@@ -248,19 +248,27 @@ negative control.
   (remedy 2, alternative B) — and the record proves the full 2×2, not a presumed winner: with
   *neither* remedy the read fails the refinement (`recoveryread_lso_unique` VIOLATES-REFINEMENT
   `RefAtomic`), *either alone* closes #850 (`recoveryread_hw_unique` HOLDS; `recoveryread_lso_stable`
-  HOLDS), and the two **compose** (`recoveryread_both` HOLDS) — all including `RefAtomic`. The three
-  passing corners are safety-equivalent but not cost-equivalent (A and "both" pay the broker-timeout
-  wait; B alone completes at the dangling transaction with no wait — the whole A-vs-B decision).**
+  HOLDS), and the two **compose** (`recoveryread_both` HOLDS) — all including `RefAtomic`. *Within the
+  id lineage* the three passing corners are safety-equivalent, differing only in cost (A and "both"
+  pay the broker-timeout wait; B alone completes at the dangling transaction with no wait); *out of
+  lineage* A holds and B silently under-reads (`recoveryread_hw_foreign` HOLDS vs
+  `recoveryread_lso_foreign` VIOLATES), so A is required and B optional.**
   That decision is now made in principle: [`850-remedy-decision.md`](850-remedy-decision.md) ranks the
   mechanics — **A is required for full safety, B optional for post-crash recovery speed** — because A
   holds *unconditionally* while B's holding is conditional (its `recoveryread_lso_foreign` residual,
   below, is a silent under-read on a single misconfiguration). A combined A+B is downstream work
   (register: R-850-C). An earlier
   revision of this entry recorded (2) as adopted — an overstatement of a then-current working design,
-  corrected here. The residual of (2) is a
-  producer *outside* the id lineage pinning the topic (`recoveryread_lso_foreign` VIOLATES, the
-  negative control): that is the shared-snapshot-topic misconfiguration the docs already exclude, since
-  sharing a snapshot topic mixes state on recovery regardless of any read bound. An orthogonal
+  corrected here. **Why B is not full safety, mechanized.** B's residual is a producer *outside* the
+  id lineage — a foreign producer, or a prefix change's leftovers — whose open transaction no takeover
+  aborts, re-pinning the LSO below committed records; reachable on a *single* misconfiguration (a
+  foreign transaction that never commits mixes no state under `read_committed`, yet pins the LSO). The
+  `Foreign` knob proves the asymmetry as a paired control at the *same* setting: A holds
+  (`recoveryread_hw_foreign` HOLDS `RefAtomic` — the high-watermark bound waits the foreign
+  transaction out) while B violates (`recoveryread_lso_foreign` VIOLATES-REFINEMENT — the LSO bound
+  under-reads past it). So A's safety is unconditional and B's is conditional on the lineage
+  assumption; the composition backstops B with A (`recoveryread_both_foreign` HOLDS). This is the
+  proof behind "A required, B optional." An orthogonal
   hazard both remedies share — a bounded read whose target outlives a log truncation stalls
   forever — is its own finding: **F-11 (issue #849)**, below. Implementation obligations for both
   issues: [`implementation-requirements.md`](implementation-requirements.md) (R-850, R-849).
@@ -439,7 +447,7 @@ The authoritative current counts, superseding any intermediate snapshot scattere
 | persistence-cassandra IT (real Cassandra) | **36/36** (incl. the F-9 never-persisted delete + zombie-rejection + idempotency) |
 | persistence-kafka IT (real Kafka) | **14/14** (incl. `RevokeTimeFlushSpec` — the revoke-time flush under a *real* second-member rebalance, cooperative-sticky fenced / eager-sticky control commits, claim KF14; a full-module run observes 17/17 with `Kip848ConsumerProtocolSpec` on a host that can pull the pinned 4.3.0 image) |
 | persistence-kafka / metrics unit | **14/14, 6/6** (incl. `Kip848ConfigSpec` — the forked-config bindings + the `group.remote.assignor` classic-omission pin) |
-| TLA+ (TLC 2.15 rev eb3ff99, pinned via tlaplus release v1.7.0; `models.yml` runs the suite in CI; a 2.18 re-run is open — unreachable in the sandbox) | **73/73** (40 negative controls: `tokensync_*` the capture-vs-refresh 2×2 + equivalence, `gclanes_*`, `*_mo4`, `flowsalive_*`, the `recoveryread*` read-refinement family — `RecoveryRead ⇒ RecoveryReadAtomic` with the `EndOffsetsIsLSO` fact-sweep (F-10/#850), the `Truncation`/`Tripwire` liveness pair (#849), the `FreezeObserved` truncation-safety pair — and the `recoverydeadline_*` timing family (the #849 tripwire-vs-eviction budget)) |
+| TLA+ (TLC 2.15 rev eb3ff99, pinned via tlaplus release v1.7.0; `models.yml` runs the suite in CI; a 2.18 re-run is open — unreachable in the sandbox) | **75/75** (40 negative controls: `tokensync_*` the capture-vs-refresh 2×2 + equivalence, `gclanes_*`, `*_mo4`, `flowsalive_*`, the `recoveryread*` read-refinement family — `RecoveryRead ⇒ RecoveryReadAtomic` with the `EndOffsetsIsLSO` fact-sweep (F-10/#850), the `Foreign` asymmetry (A holds / B violates — B not full safety), the `Truncation`/`Tripwire` liveness pair (#849), the `FreezeObserved` truncation-safety pair — and the `recoverydeadline_*` timing family (the #849 tripwire-vs-eviction budget)) |
 
 **Count scope (two branches).** The current column is the models branch, with capture removed in
 `Consumer.scala` (core 121/121, persistence-kafka unit 14/14). The standalone consumer-protocol

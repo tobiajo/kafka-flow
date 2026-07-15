@@ -22,10 +22,13 @@ each realized in a draft PR:
   predecessor's orphan before recovery reads. Resolution by **identity continuity**, at the
   **writer**.
 
-The corpus settles what it settles: A, B, and **A+B are safety-equivalent and composable** (the
-remedy 2×2, [`models/README.md`](../models/README.md): `recoveryread_{hw_unique,lso_stable,both}`
-HOLD, `recoveryread_lso_unique` VIOLATES — proven at the models' checked one-handover cast, residual
-C2 in [`advisory-review.md`](advisory-review.md)), and the empirical latency gap is recorded (F-10:
+The corpus settles what it settles: within the partition's id lineage, A, B, and **A+B all close
+#850 and compose** (the remedy 2×2, [`models/README.md`](../models/README.md):
+`recoveryread_{hw_unique,lso_stable,both}` HOLD, `recoveryread_lso_unique` VIOLATES); but **out of
+lineage they are not equivalent** — A still holds while B silently under-reads
+(`recoveryread_hw_foreign` HOLDS vs `recoveryread_lso_foreign` VIOLATES), the asymmetry that makes A
+required and B optional. Both proven at the models' checked one-handover cast (residual
+C2 in [`advisory-review.md`](advisory-review.md)); and the empirical latency gap is recorded (F-10:
 sub-second takeover-abort vs 6.8–12.5 s broker-timeout waits at a 5 s timeout; the default timeout
 is 60 s). This report is everything the 2×2 does not decide. A+B is evaluated as a peer alternative
 throughout, not an afterthought — composition is model-proven, so a report that only ranks A against
@@ -139,9 +142,12 @@ misconfiguration suffices for the pin alone: a foreign transactional producer th
 transaction on the topic and hangs without committing mixes no state (`read_committed` filters what
 never commits) yet pins the LSO, so the silent case does not require an already-corrupt topology.
 Under A the same situation is **slow, not silent**
-(the HW bound waits the foreign transaction out). This is the structural asymmetry of the whole
+(the HW bound waits the foreign transaction out) — mechanized as a paired control at the same
+`Foreign=TRUE` setting: `recoveryread_hw_foreign` HOLDS `RefAtomic` where `recoveryread_lso_foreign`
+VIOLATES. This is the structural asymmetry of the whole
 comparison: **A's misuse worst case is a stall; B's is the silent under-read** — and **A+B removes
-it**: with the HW bound retained, an orphan B cannot abort turns back into a loud wait.
+it**: with the HW bound retained, an orphan B cannot abort turns back into a loud wait
+(`recoveryread_both_foreign` HOLDS).
 
 **A's misuse surface** is not empty, only different: it is the tuning arithmetic. `T` must exceed
 the longest batch (or the coordinator aborts legitimate commits and crashes the owner), the #849
@@ -313,13 +319,16 @@ Verbal cells; no scores. Evidence: the section named in the row.
 
 A — the high-watermark read bound — closes the silent under-read *unconditionally*: it waits out any
 open transaction below the true high watermark, in or out of the partition's id lineage, so it holds
-with no assumption about naming, ACLs, or who else produces to the topic (`recoveryread_hw_unique`
-HOLDS `RefAtomic`). B — the stable per-partition `transactional.id` — also closes #850, but only
-within the partition's own lineage; a transaction from *outside* it re-pins the LSO and B's plain
-bound silently under-reads past it (`recoveryread_lso_foreign` VIOLATES). B is therefore **not a
-safety substitute** for A. What B buys is latency: its takeover-abort resolves a crashed owner's
-transaction at `initTransactions` — sub-second — where A waits out the broker timeout (~70 s worst
-case at defaults).
+with no assumption about naming, ACLs, or who else produces to the topic. B — the stable
+per-partition `transactional.id` — closes #850 only within its own lineage; a transaction from
+*outside* it re-pins the LSO and B's plain bound silently under-reads past it. **The models prove the
+asymmetry as a paired control at the same out-of-lineage setting** (`Foreign=TRUE`): A holds
+(`recoveryread_hw_foreign` HOLDS `RefAtomic`) where B violates (`recoveryread_lso_foreign`
+VIOLATES-REFINEMENT). B is therefore **not a safety substitute** for A — its safety is conditional on
+the lineage assumption, A's is not. What B buys is latency: its takeover-abort resolves a crashed
+owner's transaction at `initTransactions` — sub-second — where A waits out the broker timeout (~70 s
+worst case at defaults). The composition keeps A's safety and adds B's speed
+(`recoveryread_both_foreign` HOLDS: A backstops B's foreign residual).
 
 So **adopt A**, and **add B when the post-crash recovery-latency tail matters** — the composed A+B
 corner (`recoveryread_both` HOLDS) is the end-state then, B supplying the sub-second constant while A

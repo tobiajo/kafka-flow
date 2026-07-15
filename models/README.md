@@ -130,7 +130,7 @@ Each config declares its module and expected outcome inline:
 What makes the suite trustworthy is **pairing**: almost every theorem/invariant that should hold has a
 sibling config that flips one knob and makes it *fail* (a removed guard / tombstone / fence / fix /
 fairness), and the refinement check has its own control (`casfw_refines_vacuous`: a deliberately
-mismatched impl/spec pair must fail the mapping). The suite is **73 configs, 40 of them expected
+mismatched impl/spec pair must fail the mapping). The suite is **75 configs, 40 of them expected
 failures**. The most recent additions — the `tokensync_*` capture-vs-refresh 2×2 (+ equivalence), the
 `gclanes_*` two-lane GroupCommit controls, the two `*_mo4`
 higher-bound events configs, the `flowsalive_*` teardown-coupling controls, the `recoveryread*`
@@ -262,14 +262,25 @@ experiment — before any HOLDS is believed.
 | **StableId=TRUE (remedy B, PR #853)** | `recoveryread_lso_stable` — **HOLDS** (B alone) | `recoveryread_both` — **HOLDS** (both compose) |
 
 Reading: without a remedy the refinement fails; **either remedy alone** makes it hold; **both compose**
-without interference. The three HOLDS corners are *safety-equivalent* — each closes #850 — but **not
-cost-equivalent**: A (and therefore "both") pays the broker-timeout wait, while B alone completes at the
-dangling transaction with no wait (`recoveryread_lso_stable` reaches `Terminates` with no `TimeoutAbort`
-on the completion path; `recoveryread_hw_unique`/`recoveryread_both` need it). That latency gap is the
-whole of the A-vs-B decision — the models leave it a decision, not a correctness question. The decision
-itself is analyzed in [`../research/850-remedy-decision.md`](../research/850-remedy-decision.md)
-(recommendation: the composed `recoveryread_both` corner, staged A-first if sequenced), which states
-this suite's one-handover cast (residual C2) as the composition claim's scope limit.
+without interference. But the 2×2 is set *within the partition's id lineage* (`Foreign=FALSE`); there
+the three HOLDS corners are safety-equivalent — each closes #850 — differing only in cost: A (and
+"both") pays the broker-timeout wait, while B alone completes at the dangling transaction with no wait
+(`recoveryread_lso_stable` reaches `Terminates` with no `TimeoutAbort`; `recoveryread_hw_unique` /
+`recoveryread_both` need it). That latency gap would be the whole decision **were the lineage
+assumption free** — and it is not, which is what makes A required rather than a co-equal option:
+
+**Out of lineage the corners diverge — the mechanized proof that A is required and B is not.** Sweep
+the `Foreign` knob (a producer outside the partition's id lineage — reachable on a *single*
+misconfiguration, e.g. a foreign transaction that never commits, which no takeover aborts). Under the
+**same** `Foreign=TRUE` scenario the two remedies split: A holds (`recoveryread_hw_foreign` HOLDS
+`RefAtomic` — the high-watermark bound waits the foreign transaction out, safe) while B violates
+(`recoveryread_lso_foreign` VIOLATES-REFINEMENT — its LSO bound silently under-reads past the foreign
+pin). So A's safety is **unconditional**; B's is **conditional** on the lineage assumption. The
+composition backstops B with A (`recoveryread_both_foreign` HOLDS): A keeps B's foreign residual a
+correct wait, not a silent miss. This is the paired-control proof behind the decision, analyzed in
+[`../research/850-remedy-decision.md`](../research/850-remedy-decision.md) — **A required for full
+safety; B optional for post-crash speed**; this suite's one-handover cast (residual C2) is the
+composition claim's scope limit.
 
 Honest residuals: (1) *— closed.* The refinement now holds under `Truncation=TRUE` too, via the
 `FreezeObserved` **history variable**: `observed` freezes what the read saw at its linearization point,
@@ -293,7 +304,9 @@ composed by implication transitivity, not one TLC run.
 | `recoveryread_hw_unique` | remedy (1) (candidate PR #852): the high-watermark bound (an uncommitted-isolation lens, immune to the fact knob) makes the read *wait* the open transaction out — Kafka Streams' restore shape (KAFKA-10167, ext(K6)), mandatory under an id scheme that cannot takeover-abort | HOLDS (incl. `RefAtomic`) |
 | `recoveryread_lso_stable` | remedy (2) (candidate PR #853): with a stable per-partition id, B's mandatory init aborts A's transaction *before B writes*, so a committed record above an open transaction is unreachable in the lineage (`INV_LineageSerialized`) — the plain LSO bound linearizes with no wait and no reader-side ordering assumption | HOLDS (incl. `RefAtomic`) |
 | `recoveryread_both` | the 2×2's fourth corner: A **and** B together — the remedies compose, no interference | HOLDS (incl. `RefAtomic`) |
-| `recoveryread_lso_foreign` | remedy (2)'s residual as a negative control: an open transaction from *outside* the id lineage (the shared-snapshot-topic misconfiguration the docs exclude) re-pins the LSO below committed records — the one-topic-one-flow discipline is load-bearing, and no read-bound choice absorbs it (the HW bound would only turn silent into slow) | VIOLATES-REFINEMENT `RefAtomic` |
+| `recoveryread_lso_foreign` | **the proof B alone is not full safety**: an open transaction from *outside* the id lineage (reachable on a single misconfiguration — a foreign producer, or a prefix change's leftovers) re-pins the LSO below committed records, and B's own-`endOffsets`/LSO bound excludes them — a silent under-read no takeover reaches. Paired with `recoveryread_hw_foreign` below | VIOLATES-REFINEMENT `RefAtomic` |
+| `recoveryread_hw_foreign` | the **paired positive**: **A** under the *same* foreign open transaction — the high-watermark bound waits it out and linearizes complete, so A closes #850 with no lineage assumption. A holds where B violates ⇒ A's safety is unconditional, B's conditional | HOLDS (incl. `RefAtomic`, `Terminates`) |
+| `recoveryread_both_foreign` | **A+B** under the foreign open transaction: B's takeover aborts the own-lineage leftover, A's bound backstops the out-of-lineage one — the composition stays safe, which is why A is kept when B is adopted | HOLDS (incl. `RefAtomic`, `Terminates`) |
 | `recoveryread_truncate_stall` | issue #849: truncation leaves the captured target above the log end; `Complete` is disabled forever — the hang (silent eviction in the real system); safety untouched, pure liveness. Remedy-orthogonal: no bound choice fixes a bound that outlives the log | VIOLATES-TEMPORAL `Terminates` |
 | `recoveryread_truncate_tripwire` | the #849 remedy: the no-progress tripwire converts the hang into a loud failure; a healthy read still completes. Fail-loud is abort-before-response — invisible to, and safe under, the atomic spec | HOLDS (`TerminatesOrFails`) |
 | `recoveryread_trunc_safe` | safety-under-truncation, mechanized: with the `FreezeObserved` history variable the read refines the atomic read even as the log tail is lost (a completed read delivered a correct observation; a hung read fails loud, delivering nothing) | HOLDS (`RefAtomic` under `Truncation=TRUE`) |

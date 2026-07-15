@@ -94,7 +94,7 @@ tooling defects that every prior in-lineage pass had missed.
   checking crashed with `FileNotFoundException .../nodes_0` during implied-temporal checking, falsely
   failing genuinely-HOLDS temporal configs; and same-spec configs finishing within one wall-clock
   second collided on TLC's timestamped scratch dir. Fixed: single worker by default + a per-config
-  `-metadir`. The full suite now reproduces 73/73 serially.
+  `-metadir`. The full suite now reproduces 75/75 serially.
 
 **Confirmed sound (with recorded caveats, not defects):**
 - *RecoveryRead* — non-vacuous (the `EndOffsetsIsLSO` flip changes the verdict with the reader code

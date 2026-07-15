@@ -64,8 +64,11 @@ section; keep the two snapshot dates in step. This table is the per-arm implemen
   revoked/lost callback — pinned by `TopicFlowSpec` "remove awaits the flow teardown", which a
   fire-and-forget refactor fails.
 - **S-4: one snapshot topic / table per flow per application.** A co-writer outside the design's
-  fence lineage voids recovery guarantees regardless of any read-bound or guard choice
-  (`recoveryread_lso_foreign`; the shared-topic exclusion in both design docs).
+  fence lineage that *commits* state to the shared store voids recovery regardless of any read-bound
+  or guard choice — the read cannot tell foreign committed records from its own (the shared-topic
+  exclusion in both design docs). This is distinct from a foreign *open* transaction that only pins
+  the LSO: that one A's high-watermark bound *does* absorb (`recoveryread_hw_foreign` HOLDS) while B's
+  LSO bound does not (`recoveryread_lso_foreign` VIOLATES) — the R-850 B2 asymmetry, not an S-4 case.
 - **S-5: the deployment MUST provide the platform primitive each fence rests on** — these are
   assumptions the models verify *under*, not obligations they can check (models README,
   "Assumptions"). Kafka: a broker offering KIP-447 consumer-generation fencing on
@@ -140,8 +143,11 @@ exactly the committed set). The theorem is **false** for the code as shipped
 implementation MUST adopt **at least one**. The **remedy 2×2** over `{StableId, HwTarget}` confirms
 this mechanically — neither = VIOLATES, A only = HOLDS, B only = HOLDS, both = HOLDS
 (`recoveryread_{lso_unique, hw_unique, lso_stable, both}`): either alone suffices and the two
-**compose** without interference. They are *safety-equivalent, not cost-equivalent* — A (and "both")
-pays the broker-timeout wait; B alone completes at the dangling transaction with no wait. That latency
+**compose** without interference. *Within the id lineage* they are safety-equivalent, differing only
+in cost — A (and "both") pays the broker-timeout wait; B alone completes at the dangling transaction
+with no wait. Out of lineage they are **not** equivalent: A holds and B silently under-reads
+(`recoveryread_hw_foreign` HOLDS vs `recoveryread_lso_foreign` VIOLATES — the B2 asymmetry), which is
+why A is required and B optional, not co-equal. That latency
 gap is the whole A-vs-B decision (a product choice this register does not make), not a correctness
 difference.
 
@@ -183,8 +189,10 @@ committed snapshots, and nothing aborts that transaction before `transaction.tim
   `INV_LineageSerialized`.
 - **B2.** `transactionalIdPrefix` becomes cluster-scoped, like a group id: docs MUST require one
   prefix per application per snapshot topic. A writer outside the id lineage reintroduces the
-  under-read and no read-bound choice absorbs it (`recoveryread_lso_foreign`) — S-4, now
-  load-bearing for recovery completeness.
+  under-read, and B's own LSO bound does not absorb it (`recoveryread_lso_foreign` VIOLATES) — under
+  B *alone* this is S-4, load-bearing for recovery completeness. A's high-watermark bound *does*
+  absorb it (`recoveryread_hw_foreign` HOLDS at the same setting): that paired asymmetry is why B is
+  not a safety substitute for A, and why R-850-C keeps A under B.
 - **B3.** Safety MUST remain on the consumer-generation fence (K-6); epoch order gained from the
   stable id is takeover-abort hygiene, never the fence. The late-init epoch race under a stable id is
   availability-only and self-healing.
