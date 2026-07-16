@@ -1,13 +1,13 @@
 # Implementation review — the combined #850/#849 remedies as the initial implementation
 
 *Working document (TEMPORARY) — the advisory-review record for fork PR
-[tobiajo#14](https://github.com/tobiajo/kafka-flow/pull/14)
-([tobiajo#15](https://github.com/tobiajo/kafka-flow/pull/15) was joined into it); not a corpus
+[tobiajo#16](https://github.com/tobiajo/kafka-flow/pull/16) (`tj/recovery-read-complete-and-bounded`;
+reviewed as its precursors tobiajo#14 and tobiajo#15, since joined and renamed); not a corpus
 member and not indexed. Everything durable was absorbed into the corpus (2026-07-16): release
 standing, the R-a/R-b/R-c/R-d dispositions and the two R-849 warning/boundary nuances →
 [`implementation-requirements.md`](implementation-requirements.md); the two deadline divergences →
 [`model-fidelity.md`](model-fidelity.md); the capture-before-init reconciliation →
-[`850-remedy-decision.md`](850-remedy-decision.md). Delete when #14 merges.*
+[`850-remedy-decision.md`](850-remedy-decision.md). Delete when #16 merges.*
 
 ## Standing and stance
 
@@ -61,8 +61,9 @@ either" remedy, §5 of the decision report).
 Under the standing above, that coupling is **sequencing hygiene, not a safety requirement**: no
 released cut carries the waitable target, so an inter-merge window exposes no user.
 
-**Decided 2026-07-16: joined into one PR** (tobiajo#14, retitled "Recover transactional snapshots
-completely, with a bounded read"; tobiajo#15 closed into it). What settled it is overlap, not
+**Decided 2026-07-16: joined into one PR** ("Recover transactional snapshots completely, with a
+bounded read"; tobiajo#15 closed into tobiajo#14, then continued as tobiajo#16 on
+`tj/recovery-read-complete-and-bounded`). What settled it is overlap, not
 safety: 6 of each PR's 7 files were shared; the deadline's rework of
 `KafkaPartitionPersistence.scala` (+149/−40) exceeded the base PR's own change to it (+59/−28); the
 R-b coexistence check lived inside the base PR's wait-out IT test; and the design doc's three new
