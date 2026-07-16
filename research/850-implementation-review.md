@@ -56,10 +56,19 @@ hangs the poll thread into silent eviction. #15 is the corpus-mandated bound ("r
 either" remedy, §5 of the decision report).
 
 Under the standing above, that coupling is **sequencing hygiene, not a safety requirement**: no
-released cut carries the waitable target, so an inter-merge window exposes no user. Recommendation:
-**keep the two stacked single-commit PRs and merge sequentially — #14 then #15 (exactly R-c) — with
-one rule: no release between them.** A joint PR is not required; it becomes the right shape only if
-a release could intervene or #15's review could stall long enough to leave #14 exposed on master.
+released cut carries the waitable target, so an inter-merge window exposes no user.
+
+**Decided 2026-07-16: joined into one PR** (tobiajo#14, retitled "Recover transactional snapshots
+completely, with a bounded read"; tobiajo#15 closed into it). What settled it is overlap, not
+safety: 6 of each PR's 7 files were shared; the deadline's rework of
+`KafkaPartitionPersistence.scala` (+149/−40) exceeded the base PR's own change to it (+59/−28); the
+R-b coexistence check lived inside the base PR's wait-out IT test; and the design doc's three new
+sections are one narrative (the termination ladder). The split preserved the archaeology of the
+three upstream drafts (#851/#852/#853), not two separable changes — exactly what the
+initial-implementation stance retires. R-c's actual concern (don't parallel-merge conflicting
+independent drafts) is satisfied: the combination was built stacked and merges as one. The hazard
+above survives as a constraint on any future re-split: the high-watermark bound must never ship
+without the deadline.
 
 ## Findings (all advisory; ordered by residual weight)
 
@@ -127,6 +136,16 @@ the position past filtered data, so the captured target is reached); resource li
 starvation of the fail branch); diagnose laziness (never evaluated on the happy or unarmed path);
 the non-transactional `drain` semantically identical to master with `caching`'s public signatures
 byte-stable; empty-topic and exact-target edges; 2.13/3 cross-compilation of the changed code.
+
+### Disposition (2026-07-16, applied in the joint PR)
+
+Findings 1–5 and 7 are applied: the `transactionalIdPrefix` scaladoc carries the uniqueness
+obligation (mirroring `persistence.md`); the wait-warn says "normally resolves"; the wait-out IT's
+crashed producer uses a 15 s transaction timeout with the deadline armed at 45 s (both flake margins
+widened); `ReadSnapshotsSpec` bodies run under a 10 s timeout, so a hanging regression fails red;
+the poll-interval warning and the `recoveryStallTimeout` scaladoc name the snapshot-consumer-config
+stand-in; `persistence.md` says "well below" and "at module acquisition". Findings 6, 8 and 9 are
+accepted as recorded.
 
 ## Corpus reconciliation (edits owed to the corpus, not the code)
 
