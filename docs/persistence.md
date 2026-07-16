@@ -86,8 +86,10 @@ val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[F, State](
 
 `idempotence` and the per-partition `transactional.id` are set for you — don't configure them in
 `producerConfig` — and the snapshot `consumerConfig`'s isolation level is forced to `read_committed`.
-The id is regenerated per assignment, not stable per partition. The input topic whose offsets are
-committed transactionally, and the consumer generation used to fence stale writers, are both supplied
+The id is stable per partition (`"<prefix>-<partition>"`): every owner of a partition shares it, so a
+takeover's `initTransactions` fences the previous owner's producer and aborts any transaction it left
+open. The input topic whose offsets are committed transactionally, and the consumer generation used
+to fence stale writers, are both supplied
 by the flow (from the assigned partition and the driving consumer), so neither is part of
 `TransactionalConfig`. One module serves one flow: snapshots are keyed by partition *number* alone, so
 each input topic needs its own module with its own `snapshotTopic` — sharing a snapshot topic between
@@ -95,15 +97,20 @@ flows would mix their state on recovery.
 
 `transactionalIdPrefix` does not affect fencing (that is by consumer generation) — it is a readable
 label and, on an ACL-secured cluster, the `transactional.id` prefix your producer principal must be
-authorized for. Use your `applicationId`; an application running several flows can append any per-flow
-discriminator (e.g. the input topic) — an `"<applicationId>*"` prefixed ACL still covers it.
+authorized for. Because the id is now stable per partition, the prefix must be unique per flow: use
+your `applicationId`, and an application running several flows must append a per-flow discriminator
+(e.g. the input topic) or the flows share ids and fence each other — an `"<applicationId>*"` prefixed
+ACL still covers it.
 
 Snapshot writes and the input-offset commit run in one Kafka transaction per assigned partition; a
 write from a stale consumer generation is fenced by the broker
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics),
 brokers 2.5+) and surfaces as
 `CommitFailedException`. Recovery reads `read_committed`, so a fenced writer's aborted records are
-never recovered.
+never recovered. After a hard crash the new owner takes over immediately (aborting the crashed
+owner's unfinished transaction) and recovers everything that was committed. If an unfinished
+transaction belongs to some other `transactional.id` (see the limitations for when that happens),
+recovery waits until the broker aborts it instead — slower, but nothing committed is ever missed.
 
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
@@ -112,8 +119,17 @@ never recovered.
   own producer and transaction-coordinator state on the brokers.
 - **Tuning for transaction time** — a transaction must commit within `transaction.timeout.ms` (a
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
-  it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout. A
-  higher timeout widens the post-crash window (below).
+  it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout.
+  Raising it does not slow normal recovery (a takeover aborts this id's unfinished transactions
+  immediately); it only lengthens the prefix-change wait (below).
+- **Recovery fails loudly rather than hangs** — a recovery read that makes no progress for
+  `recoveryStallTimeout` (default 2 min) fails with `RecoveryReadStalledError` instead of hanging the
+  rebalance until the member is silently evicted at `max.poll.interval.ms`. The error names the
+  diagnosed cause: the snapshot log was truncated under the read (an unclean leader election lost
+  acknowledged records), or an unfinished transaction outlived the deadline. Keep the value well below
+  `max.poll.interval.ms` and above the legitimate wait for an unfinished transaction
+  (`transaction.timeout.ms` plus the broker's abort scan — the prefix-change wait below); the mode
+  warns at module acquisition if either bound is broken.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -128,12 +144,14 @@ Limitations:
   nor committed, so the new owner replays those events — noise, not loss. Under the classic
   **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
   `flushOnRevoke` does not shrink the replay window there.
-- After a hard crash, the broker reclaims the failed owner's in-flight transaction only after
-  `transaction.timeout.ms`; until then that open transaction pins the snapshot topic's
-  last-stable-offset, and a recovery in that window silently misses records beyond it — even committed
-  ones — while input offsets are not held back the same way, so a second handover inside the window
-  can recover stale state
-  ([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)).
+- A stale owner's late `initTransactions` can fence the current owner's producer: that owner's flow
+  fails once and recovers (rebalance and replay); no wrong write can land.
+- Changing `transactionalIdPrefix` needs care: if an old-prefix instance hard-crashes during the
+  rollout, its unfinished transaction belongs to an id no new instance will ever init, so recovery
+  waits until the broker times it out — up to ~70 s at the defaults (`transaction.timeout.ms` plus the
+  broker's abort scan), never a wrong read. Prefer a full stop over a rolling prefix change to avoid the wait
+  entirely. (A foreign producer's transaction on the snapshot topic is waited out the same way — but
+  the topic must be exclusive to the flow regardless.)
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
   a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols

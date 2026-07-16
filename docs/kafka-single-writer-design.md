@@ -86,7 +86,9 @@ Key points:
   transaction) when there are none.
 - The offset-to-commit is **seeded with the assigned offset**, so even the first snapshot flush (before
   the first commit tick) carries an offset and is gated.
-- Recovery is forced to `read_committed` so a fenced writer's aborted records are invisible.
+- Recovery is forced to `read_committed` so a fenced writer's aborted records are invisible, and its
+  read targets the high watermark, so an open transaction outside the writer's id lineage delays the
+  read instead of silently truncating it (see Recovery read below).
 - The ordinary consumer-group offset commit is **replaced**, not run alongside. In the default mode the
   committable offset is staged and the **consumer** commits it; in this mode that same offset-scheduling
   step is rerouted to the **producer**, so the offset is committed only inside the transaction (above).
@@ -120,22 +122,103 @@ The unknown (negative) pre-join generation is never published — the coordinato
 validation for a commit carrying it, so it would land unfenced; a flush before the first join instead
 fails loudly rather than committing ungated.
 
-### No epoch fencing
+### Stable transactional.id: the takeover aborts unfinished transactions
 
-Generation fencing is the sole mechanism; there is deliberately no producer-epoch fencing. Each
-producer gets a unique `transactional.id` (`"{prefix}-{partition}-{uuid8}"`), so old and new owners
-never share one. A *stable* per-partition id would add cross-owner epoch fencing: with a shared id
-each `initTransactions` bumps the epoch and fences the previous holder. That is redundant here — a
-stale owner's write is already rejected by the generation fence — and the epoch order can diverge from
-ownership order (whichever owner inits *latest* wins), spuriously fencing the true owner: a crash of a
-valid owner, never a stale write landing.
+Each partition's producer uses a **stable** `transactional.id`, `"<prefix>-<partition>"` — a scheme
+whose cost, a producer per partition, this mode pays anyway. Every
+owner of a partition shares its id, so a new owner's mandatory `initTransactions` fences the previous
+owner's producer and aborts any transaction it left open, before the new owner may write.
 
-The cost of unique ids — transaction-coordinator state expiring via `transactional.id.expiration.ms` —
-is accepted. A hard-crashed owner's in-flight transaction is, for the same reason, not aborted at
-takeover (a stable id would abort it through the new owner's `initTransactions`); the coordinator
-reclaims it only after `transaction.timeout.ms`, which bounds how long it pins the snapshot topic's
-last-stable-offset — the offset `read_committed` readers of that topic (recovery included) cannot
-see past.
+Sharing the id serializes the partition's own writes: within the lineage a committed snapshot never
+sits above an open transaction, so the recovery read's wait (next section) never engages for the
+module's own transactions. Takeover after a hard crash is immediate — nothing waits for
+`transaction.timeout.ms`. The same init also resolves the crashed owner's pending transactional
+offsets on `__consumer_offsets`: the new owner's offset fetch, which must not see pending
+transactional commits, starts clean as well.
+
+The shared id is deliberately **not** the fence. Fencing of stale writers stays with the consumer
+generation bound into every commit, never with producer-epoch order: the epoch order can diverge from
+ownership order (whichever owner inits *latest* wins), so a late-initing stale owner can win the epoch
+and fence the partition's valid owner — one crash of a valid owner (availability, not safety); its
+stale write still dies at the generation fence. What the stable id buys is only the takeover-abort
+above.
+
+The cost is a naming discipline: the prefix becomes cluster-scoped, like a group id — one prefix per
+flow, unique on the cluster, or colliding applications fence each other's producers, loudly; on an
+ACL-secured cluster the prefix is what the producer principal must be authorized for.
+`transaction.timeout.ms` remains only the backstop for unfinished transactions no takeover reaches —
+e.g. a stalled but live producer's — and skafka's default (1 min) is kept, since a group-committed
+batch typically commits in well under a second.
+Transaction-coordinator state is bounded by the partition count.
+
+### Recovery read: bounded by the high watermark
+
+The takeover-abort covers exactly one lineage — the partition's own id. An open transaction from
+outside it is aborted by nobody's init: a previous prefix's unfinished transactions while a `transactionalIdPrefix`
+change rolls out, or a producer misdirected at the snapshot topic. Such a transaction distorts what a
+`read_committed` reader may see: the consumer's own `endOffsets` is the **last-stable-offset** — the
+minimum of the high watermark and the first offset of any open transaction — so a read bounded by it
+completes while silently missing committed snapshots above the pin. With a second handover inside the
+window the next owner recovers stale state yet resumes from the newer committed input offset — the
+corruption shape of [#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fence
+violated ([kafka-flow#850](https://github.com/evolution-gaming/kafka-flow/issues/850)).
+
+So the read target is the **high watermark**, captured up front by a short-lived `read_uncommitted`
+consumer (only when the read itself is `read_committed`; under `read_uncommitted` the consumer's own
+end offset already is the high watermark). The `read_committed` position cannot pass the LSO until
+the broker resolves the open transaction, so the read genuinely waits it out and completes only once
+everything below the target is decided: committed records included, aborted ones filtered. On the
+ordinary path the bound is free: by the time recovery reads, the takeover's init has already aborted
+the lineage's own unfinished transactions, the captured target equals the LSO, and the read never
+waits. It waits only for an out-of-lineage transaction — where waiting is the only correct behavior —
+bounded by the *pinning* producer's `transaction.timeout.ms` plus the broker's abort scan
+(`transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s): ~70 s at Kafka's
+default timeout. The completeness of recovery thus rests on no naming assumption — the id discipline
+buys the sub-second common case, the read bound holds regardless.
+
+### Stalled read: a deadline instead of a silent hang
+
+If the log end regresses below the captured target — log truncation after an unclean leader
+election, i.e. the cluster lost acknowledged snapshot records
+([kafka-flow#849](https://github.com/evolution-gaming/kafka-flow/issues/849)) — the read can never
+reach it. Recomputing the target would unblock the read at the price of re-admitting the silent
+under-read the capture exists to prevent, so the target deliberately stays put — and the read,
+unbounded, hangs the poll thread inside the rebalance callback. Nothing crashes:
+`max.poll.interval.ms` evicts the member silently while process-level health checks stay green.
+
+A no-progress deadline (`recoveryStallTimeout`, default 2 min, measured from the last position
+advance) turns that hang into a `RecoveryReadStalledError`, after ~5 s stall log lines have already
+flagged it. It completes a termination ladder: the takeover-abort resolves the partition's own
+lineage sub-second; the bounded wait resolves everything the broker will eventually decide (~70 s
+worst case at defaults); the deadline converts what neither can resolve — a target above a truncated
+log end, or an open transaction whose producer's `transaction.timeout.ms` exceeds the deadline —
+into a loud failure instead of a silent hang. Failing also heals: eviction only replaces the
+partition's owner and never unwinds the stuck thread (the reading consumer is group-less), so
+without the deadline the member survives as a permanently wedged process — the error frees the
+thread, and the restarted recovery captures a fresh target, reachable again after a truncation, so
+the member returns to service.
+
+The failure is diagnosed by re-reading the log end, because the two causes need opposite responses:
+below the captured target names truncation, which no waiting or retry can fix — the records are
+gone, so recovery becomes an offset-reset or restore decision for an operator; at or above it names
+an open transaction that outlived the deadline. That last case usually self-heals — the broker
+aborts the transaction within its `transaction.timeout.ms` plus the abort scan — but Kafka has a
+known limitation where it does not: a *hanging* transaction, whose pin no timeout ever resolves
+([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions)
+added the `kafka-transactions.sh` tool to detect and abort these;
+[KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)
+has the broker validate a produce against an ongoing transaction — the default on Kafka 4.0+
+brokers — which prevents the class).
+Against one of those the deadline is the only client-side bound there is.
+
+The two bounds that make the deadline meaningful are checked and warned at module acquisition — it
+must sit below `max.poll.interval.ms` (or the silent eviction wins the race) and above the pinning
+producer's `transaction.timeout.ms` plus the abort scan (or it fires on a wait that would have healed on its
+own). Only the
+transactional mode arms the deadline: waiting is part of its read semantics (the target can
+legitimately sit above the readable end), so a wait that will never end is a reachable shape there
+and needs a bound. The truncation hazard is not unique to it — but plain caching has shipped its
+unbounded read for years, and changing a stable mode's failure semantics is a separate decision.
 
 ## Consumer rebalance protocols
 
@@ -207,6 +290,15 @@ Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current cod
   staged, it commits nothing (a no-op).
 - **Generation currency** — the `Consumer` wrapper holds `groupMetadata` in a `Ref`, refreshed after every
   poll.
+- **Log evidence** — an unfinished transaction resolves in one of two ways (aborted by the takeover's
+  init, or waited out by the recovery read), and each leaves a trace: the module logs the
+  `initTransactions` duration at acquisition (the coordinator holds the call until the abort
+  completes, so a slow init usually means one happened), and the recovery read warns when its target
+  sits above the last-stable-offset, naming the wait it is about to make and its bound.
+- **Stall deadline** — the read loop (`KafkaPartitionPersistence.readPartition`) measures progress by
+  elapsed wall clock, logs a stalled read every ~5 s, and fails it at `recoveryStallTimeout` with a
+  `RecoveryReadStalledError` diagnosed against a re-read log end; the deadline's two configuration
+  bounds are checked and warned at module acquisition.
 
 ## Measurements
 
@@ -257,19 +349,45 @@ real eager-recovery (every key recovered on assignment) and flush-on-revoke mach
 shows corruption with the plain shared producer (no offset binding); the prevention drives a stale owner
 with an *older consumer generation* and asserts the newer snapshot survives — isolating the offset
 binding as the cause, not incidental fencing. Other cases covered: first-flush gating (the seed), a
-fenced writer fails its next flush, an open transaction neither blocks nor leaks into recovery,
-concurrent-write safety. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test
-with a recording in-memory producer (no broker). Two unit suites pin the client-side pieces the fence
-depends on: `TopicFlowSpec` that removing a partition awaits its flows' teardown, and `ConsumerSpec`
-the post-poll generation tracking and the negative-generation guard.
+fenced writer fails its next flush, concurrent-write safety, and both resolutions of an unfinished
+transaction — the takeover-abort and the bounded wait. The takeover-abort is pinned at the handover: a test crashes an owner mid-transaction
+under the partition's own stable id with a deliberately long transaction timeout, and asserts the
+last-stable-offset is back at the high watermark immediately after module acquisition — only the
+takeover-abort can pass that, never the broker's timeout — then that recovery returns the committed
+snapshot and excludes the aborted record, also pinning the `"<prefix>-<partition>"` id shape against
+regression. The read bound is pinned on the residual path: a transaction kept genuinely open through
+the read (a unique out-of-lineage id, a short `transaction.timeout.ms`, and an asserted-active LSO
+pin when the read starts) makes the read wait, include the committed record and exclude the timed-out
+one — with the stall deadline armed above the wait's bound, so the same test pins that a
+legitimate wait completes under an armed deadline rather than tripping it. The group commit is
+exercised in isolation by `GroupCommitSpec`, a unit test with a recording
+in-memory producer (no broker). Unit suites pin the client-side pieces the mechanism depends on:
+`TopicFlowSpec` that removing a partition awaits its flows' teardown, `ConsumerSpec` the post-poll
+generation tracking and the negative-generation guard, `KafkaPersistenceModuleSpec` the module-owned
+producer settings (the stable id shape, idempotence, the suffixed client id) via a capturing
+`ProducerOf`, and `ReadSnapshotsSpec` the read target and the stall deadline — a target taken from
+the read consumer's own `endOffsets` stops at the LSO and fails the suite; a read parked below the
+target makes the deadline fire with the matching diagnosis (an outliving open transaction, or
+truncation when the log end moved below the target between capture and firing) and, with no deadline
+armed, keeps waiting indefinitely.
 
 ## Rejected alternatives
 
 - **Transactional snapshot read + snapshot write**: fence a stale writer with a compare-and-set on the
   stored offset. Kafka has no conditional produce primitive, so it cannot be atomic.
-- **Producer-epoch fencing (stable `transactional.id`)**: redundant with the generation fence, and
-  the epoch order can diverge from ownership order, spuriously fencing the true owner (see No epoch
-  fencing).
+- **Producer-epoch order as the fence**: epoch order can diverge from ownership order, spuriously
+  fencing the true owner — the stable id is kept for the takeover-abort, never as the fence (see
+  Stable transactional.id).
+- **Unique per-assignment `transactional.id`s** (`"<prefix>-<partition>-<uuid8>"`): no naming
+  discipline — but nothing ever aborts a crashed owner's unfinished transaction, so every post-crash recovery
+  waits out the full timeout the stable id resolves at init (see Recovery read), and coordinator
+  state accumulates per assignment until `transactional.id.expiration.ms`.
+- **The reader's own LSO as the bound (no high-watermark capture)**: complete only while every
+  transaction on the topic belongs to the partition's lineage; the captured target holds
+  unconditionally and turns the residual cases into a loud wait (see Recovery read).
+- **Recomputing the target on a stall** (lowering it to a re-read log end): silently completes an
+  under-read — exactly the miss the captured target exists to prevent; after a genuine truncation the
+  records are gone, and only a loud failure puts the decision with an operator (see Stalled read).
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
   reassignment, and safe *dynamic* assignment is the point of this design. (Static *membership*
