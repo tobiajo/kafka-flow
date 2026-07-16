@@ -20,10 +20,11 @@ import munit.FunSuite
 import scodec.bits.ByteVector
 
 import java.util.regex.Pattern
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.*
 
-/** Pins the recovery-read target against regression to the read consumer's own end offset (the last-stable-offset,
-  * which an open transaction pins below committed records).
+/** Pins the recovery-read behaviour of the transactional mode: the target is the high watermark, not the read
+  * consumer's own end offset, and a read making no progress for the whole stall deadline fails loudly instead of
+  * hanging.
   */
 class ReadSnapshotsSpec extends FunSuite {
 
@@ -60,8 +61,87 @@ class ReadSnapshotsSpec extends FunSuite {
         consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
         snapshotTopic  = topic,
         partition      = partition,
+        stall = KafkaPartitionPersistence.Stall(KafkaPartitionPersistence.defaultStallTimeout, IO.monotonic).some,
       )
     } yield assertEquals(stored.keys.toList.sorted, List("k0", "k1", "k2"), "the read must drain past its own LSO")
+
+    test.unsafeRunSync()
+  }
+
+  test("a read stalled past the deadline fails loudly instead of hanging") {
+    // The last-stable-offset pins the position at 1 while the high watermark stays 3: an open transaction
+    // outlived the deadline, which the diagnosis must name - the log end still covers the target, so this
+    // is not truncation.
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      readConsumer = consumer(endOffset = 1L, positionRef = positionRef, records = List(record(0, "k0")))
+      hwConsumer   = consumer(endOffset = 3L, positionRef = positionRef, records = Nil)
+      result <- KafkaPartitionPersistence
+        .readSnapshots[IO](
+          consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
+          consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
+          snapshotTopic  = topic,
+          partition      = partition,
+          stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
+        )
+        .attempt
+    } yield result match {
+      case Left(e: KafkaPartitionPersistence.RecoveryReadStalledError) =>
+        assertEquals(e.position, Offset.unsafe(1))
+        assertEquals(e.targetOffset, Offset.unsafe(3))
+        assert(e.diagnosis.contains("open transaction"), s"unexpected diagnosis: ${e.diagnosis}")
+      case other => fail(s"expected RecoveryReadStalledError, got $other")
+    }
+
+    test.unsafeRunSync()
+  }
+
+  test("a read stalled past the deadline with a regressed log end is diagnosed as truncation") {
+    // The high watermark is 3 at capture but 1 when the deadline fires (the log was truncated in
+    // between): the diagnosis must name truncation.
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      hwRef       <- Ref.of[IO, Long](3L)
+      readConsumer = consumer(endOffset = 1L, positionRef = positionRef, records = List(record(0, "k0")))
+      hwConsumer   = consumer(endOffset = hwRef.getAndSet(1L), positionRef = positionRef, records = Nil)
+      result <- KafkaPartitionPersistence
+        .readSnapshots[IO](
+          consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
+          consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
+          snapshotTopic  = topic,
+          partition      = partition,
+          stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
+        )
+        .attempt
+    } yield result match {
+      case Left(e: KafkaPartitionPersistence.RecoveryReadStalledError) =>
+        assert(e.diagnosis.contains("log truncation"), s"unexpected diagnosis: ${e.diagnosis}")
+      case other => fail(s"expected RecoveryReadStalledError, got $other")
+    }
+
+    test.unsafeRunSync()
+  }
+
+  test("with no deadline a stalled read keeps waiting instead of failing") {
+    // the non-transactional path passes no deadline; a stalled read must keep waiting, not fail
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      result <- KafkaPartitionPersistence
+        .readPartition[IO](
+          consumer          = consumer(endOffset = 3L, positionRef = positionRef, records = List(record(0, "k0"))),
+          snapshotPartition = tp,
+          targetOffset      = Offset.unsafe(3),
+          stall             = none,
+          diagnose          = IO.pure(""), // unused without a deadline
+        )
+        .timeout(500.millis)
+        .attempt
+    } yield result match {
+      case Left(_: KafkaPartitionPersistence.RecoveryReadStalledError) =>
+        fail("expected no stall failure when no deadline is set")
+      case Left(_)  => () // timed out from the outside while still polling - i.e. it kept waiting
+      case Right(_) => fail("expected the read to keep waiting, not to complete")
+    }
 
     test.unsafeRunSync()
   }
@@ -83,9 +163,18 @@ class ReadSnapshotsSpec extends FunSuite {
         )
   }
 
-  // serves `records` one per poll from `position`, advancing it; endOffsets is fixed (the isolation-dependent bound)
+  // serves `records` one per poll from `position`, advancing it; on an empty poll it sleeps the poll timeout, as a
+  // real blocking poll would, so elapsed wall time (the stall deadline) advances deterministically. endOffsets is
+  // fixed per consumer (the isolation-dependent bound) unless an effect is passed (to move it between captures)
   private def consumer(
     endOffset: Long,
+    positionRef: Ref[IO, Long],
+    records: List[ConsumerRecord[String, ByteVector]],
+  ): SkafkaConsumer[IO, String, ByteVector] =
+    consumer(endOffset.pure[IO], positionRef, records)
+
+  private def consumer(
+    endOffset: IO[Long],
     positionRef: Ref[IO, Long],
     records: List[ConsumerRecord[String, ByteVector]],
   ): SkafkaConsumer[IO, String, ByteVector] =
@@ -93,17 +182,22 @@ class ReadSnapshotsSpec extends FunSuite {
       private val delegate = SkafkaConsumer.empty[IO, String, ByteVector]
 
       override def endOffsets(partitions: NonEmptySet[TopicPartition]) =
-        Map(tp -> Offset.unsafe(endOffset)).pure[IO]
+        endOffset.map(end => Map(tp -> Offset.unsafe(end)))
 
       override def position(partition: TopicPartition) = positionRef.get.map(Offset.unsafe(_))
 
       override def poll(timeout: FiniteDuration) =
-        positionRef.modify { pos =>
-          records.find(_.offset.value == pos) match {
-            case Some(record) => (pos + 1, ConsumerRecords(Map(tp -> NonEmptyList.one(record))))
-            case None         => (pos, ConsumerRecords.empty[String, ByteVector])
+        positionRef
+          .modify { pos =>
+            records.find(_.offset.value == pos) match {
+              case Some(record) => (pos + 1, record.some)
+              case None         => (pos, none[ConsumerRecord[String, ByteVector]])
+            }
           }
-        }
+          .flatMap {
+            case Some(record) => ConsumerRecords(Map(tp -> NonEmptyList.one(record))).pure[IO]
+            case None         => IO.sleep(timeout).as(ConsumerRecords.empty[String, ByteVector])
+          }
 
       def assign(partitions: NonEmptySet[TopicPartition])                         = delegate.assign(partitions)
       def assignment                                                              = delegate.assignment

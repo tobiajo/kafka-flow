@@ -72,12 +72,16 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     * `read_committed` matches the transactional mode; it is equally correct for reading topics written without
     * transactions, where it behaves the same as `read_uncommitted`.
     */
-  private def readSnapshots(stateTopic: String): IO[BytesByKey] =
+  private def readSnapshots(
+    stateTopic: String,
+    stallTimeout: Option[FiniteDuration] = KafkaPartitionPersistence.defaultStallTimeout.some,
+  ): IO[BytesByKey] =
     KafkaPartitionPersistence.readSnapshots[IO](
       consumerOf     = consumerOf,
       consumerConfig = consumerConfig.copy(isolationLevel = IsolationLevel.ReadCommitted),
       snapshotTopic  = stateTopic,
       partition      = Partition.min,
+      stall          = stallTimeout.map(KafkaPartitionPersistence.Stall(_, IO.monotonic)),
     )
 
   private def utf8(value: String): Option[ByteVector] = ByteVector.encodeUtf8(value).toOption
@@ -589,8 +593,10 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
           lso <- endOffset(IsolationLevel.ReadCommitted)
           hw  <- endOffset(IsolationLevel.ReadUncommitted)
           _    = assert(clue(lso.value) < clue(hw.value), "expected an open-transaction pin at read start")
-          // A's transaction is still open here; the read must wait for the broker to time it out
-          stored <- readSnapshots(stateTopic).timeout(60.seconds)
+          // A's transaction is still open here; the read must wait for the broker to time it out. The stall
+          // deadline is armed just above the wait's self-healing bound (5s transaction timeout plus up to 10s
+          // abort scan): a legitimate wait must complete under an armed deadline, without firing it
+          stored <- readSnapshots(stateTopic, stallTimeout = 30.seconds.some).timeout(60.seconds)
         } yield {
           assertEquals(clue(stored.get("key-committed")), utf8("committed"))
           assertEquals(clue(stored.get("key-uncommitted")), none[ByteVector])

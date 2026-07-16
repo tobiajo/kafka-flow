@@ -176,6 +176,50 @@ bounded by the *pinning* producer's `transaction.timeout.ms` plus the broker's a
 default timeout. The completeness of recovery thus rests on no naming assumption — the id discipline
 buys the sub-second common case, the read bound holds regardless.
 
+### Stalled read: a deadline instead of a silent hang
+
+If the log end regresses below the captured target — log truncation after an unclean leader
+election, i.e. the cluster lost acknowledged snapshot records
+([kafka-flow#849](https://github.com/evolution-gaming/kafka-flow/issues/849)) — the read can never
+reach it. Recomputing the target would unblock the read at the price of re-admitting the silent
+under-read the capture exists to prevent, so the target deliberately stays put — and the read,
+unbounded, hangs the poll thread inside the rebalance callback. Nothing crashes:
+`max.poll.interval.ms` evicts the member silently while process-level health checks stay green.
+
+A no-progress deadline (`recoveryStallTimeout`, default 2 min, measured from the last position
+advance) turns that hang into a `RecoveryReadStalledError`, after ~5 s stall log lines have already
+flagged it. It completes a termination ladder: the takeover-abort resolves the partition's own
+lineage sub-second; the bounded wait resolves everything the broker will eventually decide (~70 s
+worst case at defaults); the deadline converts what neither can resolve — a target above a truncated
+log end, or an open transaction whose producer's `transaction.timeout.ms` exceeds the deadline —
+into a loud failure instead of a silent hang. Failing also heals: eviction only replaces the
+partition's owner and never unwinds the stuck thread (the reading consumer is group-less), so
+without the deadline the member survives as a permanently wedged process — the error frees the
+thread, and the restarted recovery captures a fresh target, reachable again after a truncation, so
+the member returns to service.
+
+The failure is diagnosed by re-reading the log end, because the two causes need opposite responses:
+below the captured target names truncation, which no waiting or retry can fix — the records are
+gone, so recovery becomes an offset-reset or restore decision for an operator; at or above it names
+an open transaction that outlived the deadline. That last case usually self-heals — the broker
+aborts the transaction within its `transaction.timeout.ms` plus the abort scan — but Kafka has a
+known limitation where it does not: a *hanging* transaction, whose pin no timeout ever resolves
+([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions)
+added the `kafka-transactions.sh` tool to detect and abort these;
+[KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)
+has the broker validate a produce against an ongoing transaction — the default on Kafka 4.0+
+brokers — which prevents the class).
+Against one of those the deadline is the only client-side bound there is.
+
+The two bounds that make the deadline meaningful are checked and warned at module acquisition — it
+must sit below `max.poll.interval.ms` (or the silent eviction wins the race) and above the pinning
+producer's `transaction.timeout.ms` plus the abort scan (or it fires on a wait that would have healed on its
+own). Only the
+transactional mode arms the deadline: waiting is part of its read semantics (the target can
+legitimately sit above the readable end), so a wait that will never end is a reachable shape there
+and needs a bound. The truncation hazard is not unique to it — but plain caching has shipped its
+unbounded read for years, and changing a stable mode's failure semantics is a separate decision.
+
 ## Consumer rebalance protocols
 
 The per-member fencing token is the **generation** under the classic protocol and the **member epoch**
@@ -251,6 +295,10 @@ Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current cod
   `initTransactions` duration at acquisition (the coordinator holds the call until the abort
   completes, so a slow init usually means one happened), and the recovery read warns when its target
   sits above the last-stable-offset, naming the wait it is about to make and its bound.
+- **Stall deadline** — the read loop (`KafkaPartitionPersistence.readPartition`) measures progress by
+  elapsed wall clock, logs a stalled read every ~5 s, and fails it at `recoveryStallTimeout` with a
+  `RecoveryReadStalledError` diagnosed against a re-read log end; the deadline's two configuration
+  bounds are checked and warned at module acquisition.
 
 ## Measurements
 
@@ -310,13 +358,18 @@ snapshot and excludes the aborted record, also pinning the `"<prefix>-<partition
 regression. The read bound is pinned on the residual path: a transaction kept genuinely open through
 the read (a unique out-of-lineage id, a short `transaction.timeout.ms`, and an asserted-active LSO
 pin when the read starts) makes the read wait, include the committed record and exclude the timed-out
-one. The group commit is exercised in isolation by `GroupCommitSpec`, a unit test with a recording
+one — with the stall deadline armed just above the wait's bound, so the same test pins that a
+legitimate wait completes under an armed deadline rather than tripping it. The group commit is
+exercised in isolation by `GroupCommitSpec`, a unit test with a recording
 in-memory producer (no broker). Unit suites pin the client-side pieces the mechanism depends on:
 `TopicFlowSpec` that removing a partition awaits its flows' teardown, `ConsumerSpec` the post-poll
 generation tracking and the negative-generation guard, `KafkaPersistenceModuleSpec` the module-owned
 producer settings (the stable id shape, idempotence, the suffixed client id) via a capturing
-`ProducerOf`, and `ReadSnapshotsSpec` the read target — a target taken from the read consumer's own
-`endOffsets` stops at the LSO and fails the suite.
+`ProducerOf`, and `ReadSnapshotsSpec` the read target and the stall deadline — a target taken from
+the read consumer's own `endOffsets` stops at the LSO and fails the suite; a read parked below the
+target makes the deadline fire with the matching diagnosis (an outliving open transaction, or
+truncation when the log end moved below the target between capture and firing) and, with no deadline
+armed, keeps waiting indefinitely.
 
 ## Rejected alternatives
 
@@ -332,6 +385,9 @@ producer settings (the stable id shape, idempotence, the suffixed client id) via
 - **The reader's own LSO as the bound (no high-watermark capture)**: complete only while every
   transaction on the topic belongs to the partition's lineage; the captured target holds
   unconditionally and turns the residual cases into a loud wait (see Recovery read).
+- **Recomputing the target on a stall** (lowering it to a re-read log end): silently completes an
+  under-read — exactly the miss the captured target exists to prevent; after a genuine truncation the
+  records are gone, and only a loud failure puts the decision with an operator (see Stalled read).
 - **Static partition assignment** (`assign()` instead of `subscribe()`): no consumer group, so no
   rebalance, no overlap window, no fence needed — but it gives up automatic failover and elastic
   reassignment, and safe *dynamic* assignment is the point of this design. (Static *membership*

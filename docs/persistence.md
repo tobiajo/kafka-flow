@@ -122,6 +122,14 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout.
   Raising it does not slow normal recovery (a takeover aborts this id's unfinished transactions
   immediately); it only lengthens the prefix-change wait (below).
+- **Recovery fails loudly rather than hangs** — a recovery read that makes no progress for
+  `recoveryStallTimeout` (default 2 min) fails with `RecoveryReadStalledError` instead of hanging the
+  rebalance until the member is silently evicted at `max.poll.interval.ms`. The error names the
+  diagnosed cause: the snapshot log was truncated under the read (an unclean leader election lost
+  acknowledged records), or an unfinished transaction outlived the deadline. Keep the value below
+  `max.poll.interval.ms` and above the legitimate wait for an unfinished transaction
+  (`transaction.timeout.ms` plus the broker's abort scan — the prefix-change wait below); the mode
+  warns at startup if either bound is broken.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
