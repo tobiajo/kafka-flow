@@ -352,9 +352,11 @@ complete *without* the deadline firing), and re-derive the R-849.2/A3 timeout ar
 shipped defaults. These are the price of B's speed, paid once.
 
 **Required when B is adopted (A+B):**
-- Log the inferred orphan state at acquisition, capturing the `read_uncommitted` end offset
-  **before** `initTransactions` (§2.7 — after init the abort has erased the signal): B's abort must
-  leave evidence, and a wait must name its cause.
+- B's abort must leave evidence, and a wait must name its cause. The direct signal — capturing the
+  `read_uncommitted` end offset **before** `initTransactions` (§2.7; after init the abort has erased
+  it) — conflicts with module acquisition opening no consumer, so the register leaves it open
+  (R-850-C) with the fallback the combined implementation uses: log the `initTransactions` duration
+  at acquisition, and warn at the read when the target sits above the last-stable-offset.
 - The tripwire threshold keeps the A-arithmetic (`> T + S`, R-849.2) — residual waits are foreign
   or mixed-window orphans, which are exactly the cases that must fail loud, not fast.
 - The prefix obligation ships as written in the B docs (one prefix per flow, unique on the cluster,

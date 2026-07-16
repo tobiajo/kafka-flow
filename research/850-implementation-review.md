@@ -1,10 +1,13 @@
 # Implementation review — the combined #850/#849 remedies as the initial implementation
 
-*Review (Kafka) — advisory review of the combined A+B+deadline implementation (fork PRs
-[tobiajo#14](https://github.com/tobiajo/kafka-flow/pull/14) and
-[tobiajo#15](https://github.com/tobiajo/kafka-flow/pull/15)) against the register
-([`implementation-requirements.md`](implementation-requirements.md)), the models, and the corpus.
-Corpus index: [`README.md`](README.md).*
+*Working document (TEMPORARY) — the advisory-review record for fork PR
+[tobiajo#14](https://github.com/tobiajo/kafka-flow/pull/14)
+([tobiajo#15](https://github.com/tobiajo/kafka-flow/pull/15) was joined into it); not a corpus
+member and not indexed. Everything durable was absorbed into the corpus (2026-07-16): release
+standing, the R-a/R-b/R-c/R-d dispositions and the two R-849 warning/boundary nuances →
+[`implementation-requirements.md`](implementation-requirements.md); the two deadline divergences →
+[`model-fidelity.md`](model-fidelity.md); the capture-before-init reconciliation →
+[`850-remedy-decision.md`](850-remedy-decision.md). Delete when #14 merges.*
 
 ## Standing and stance
 
@@ -155,13 +158,15 @@ accepted as recorded.
    open design question with the init-duration proxy as fallback — the fallback the implementation
    uses, since capture-before-init conflicts with the acquisition-opens-no-consumer pin
    (`KafkaPersistenceModuleSpec`). Reconcile the report to the register, or decide the capture.
+   *Done (2026-07-16): the report's bullet now defers to the register's fallback.*
 2. **`docs/persistence.md` wording**: the bounds are "warned at startup" → at module acquisition
-   (the design doc states it correctly).
+   (the design doc states it correctly). *Done (in the joint PR).*
 3. **On merge**: flip KF16 ⏳→✅; update the register's status snapshot and "Integration gaps" (R-a
    and R-b are carried by the combined implementation, not open); re-home the A-test/B-test/
    R-849-test citations from the upstream draft branches to the merged code.
 4. **Release standing**: the register's status table records the mode as "merged, #833,
    EXPERIMENTAL" without release standing; note that v9.0.0 is the only released cut (pre-#842
-   surface, F-10 live) so a reader does not assume the remedies shipped.
+   surface, F-10 live) so a reader does not assume the remedies shipped. *Done (2026-07-16): recorded
+   in the register's status snapshot.*
 
 *Snapshot date: 2026-07-16.*

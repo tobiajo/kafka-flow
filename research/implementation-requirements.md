@@ -30,14 +30,14 @@ Language: **MUST** / **MUST NOT** = the models or pinned external semantics show
 defective; **SHOULD** = strong recommendation with a recorded tradeoff. An implementation deviating
 from a MUST needs to refute the cited evidence, not argue around it.
 
-## Status snapshot (2026-07-14)
+## Status snapshot (2026-07-16)
 
 Corpus-level "is the research done?" lives in the report's [Open work](README.md#6-open-work)
 section; keep the two snapshot dates in step. This table is the per-arm implementation view.
 
 | Arm | Where it stands | Requirements met? |
 |---|---|---|
-| Kafka transactional (merged, #833, EXPERIMENTAL) | in master and this branch | K-1..K-6, K-8 yes; **K-7 only half-met on master** — the `read_committed` *isolation* half is tested, but the *completeness* half is R-850, so F-10 (high) is still unfixed on the merged/master branch; **R-850 / R-849 open** (issues #850/#849). The remedies are open upstream drafts: **A** = the high-watermark read bound (#852), **B** = the stable per-partition id (#853), the **#849 stall deadline** (#851), each branch-verified alone. **A is required for full safety; B is optional, for post-crash recovery speed** ([Recommendation](850-remedy-decision.md#5-recommendation)); a combined A+B implementation (R-850-C) is downstream work the models branch expects to pull in if adopted. |
+| Kafka transactional (merged, #833, EXPERIMENTAL) | in master and this branch | K-1..K-6, K-8 yes; **K-7 only half-met on master** — the `read_committed` *isolation* half is tested, but the *completeness* half is R-850, so F-10 (high) is still unfixed on the merged/master branch; **R-850 / R-849 open** (issues #850/#849). The remedies are open upstream drafts: **A** = the high-watermark read bound (#852), **B** = the stable per-partition id (#853), the **#849 stall deadline** (#851), each branch-verified alone. **A is required for full safety; B is optional, for post-crash recovery speed** ([Recommendation](850-remedy-decision.md#5-recommendation)); a combined A+B(+deadline) implementation (R-850-C) now exists as a single fork PR (tobiajo#14), carrying R-a and R-b below, unmerged — the models branch expects to pull it in if adopted. Release standing: **v9.0.0 is the only release carrying the mode** (the #833+#840 cut — F-10 live in it); #842, #854 and the remedies are unreleased. |
 | Cassandra full CAS (verified, deferred) | upstream PR #834 | C-1..C-9 implemented on the cassandra/models branches with their tests |
 | Cassandra persist-only (merged, #838) | in master | P-1..P-3 yes (P-3 is a documented residual, not code) |
 | Custom stores (`backedBy`) | user-side contract | X-1..X-3 are documentation obligations on the user, stated in [`persistence.md`](../docs/persistence.md) |
@@ -265,7 +265,10 @@ transactions v2, the 4.0+ default, prevents the hanging class, leaving truncatio
   the upper bound is
   *worst-case recovery failure lands before `max.poll.interval.ms`* — fail loudly **before** the
   rebalance timeout evicts the member silently. PR #851's default `recoveryStallTimeout` = 2 min clears
-  both at defaults (70 s < 120 s < 300 s). *Evidence:* the **upper** bound is `recoverydeadline_late`
+  both at defaults (70 s < 120 s < 300 s). The upper bound needs headroom: on trip, the R-849.3
+  diagnosis re-reads the log end before the error surfaces — up to the client's
+  `default.api.timeout.ms`, 60 s by default — so deadline plus diagnosis must still land under the
+  poll interval (defaults do: 120 s + 60 s < 300 s). *Evidence:* the **upper** bound is `recoverydeadline_late`
   VIOLATES `INV_NoSilentEviction` (a threshold not below the deadline lets eviction win). The **lower**
   bound (threshold above the Remedy-A wait) is stated here + structurally consistent with the timing
   model (a no-progress span reaching the threshold trips), but is **not** its own dedicated config —
@@ -276,7 +279,10 @@ transactions v2, the 4.0+ default, prevents the hanging class, leaving truncatio
   slow-but-*progressing* recovery that legitimately outruns `max.poll.interval.ms` (the two clocks
   diverge — total recovery time burns while no-progress resets). That "large restore" case is a
   separate operational concern: size `max.poll.interval.ms` for the expected snapshot volume, or bound
-  the restore. Out of #849 scope, stated so it is not mistaken as covered.
+  the restore. Out of #849 scope, stated so it is not mistaken as covered. A second boundary, same
+  purpose: the deadline is evaluated between *returning* client calls — a call that never returns is
+  outside it (the bounded client API timeouts keep that residual narrow, and the advertised stall
+  shapes, an LSO pin or truncation, keep polls returning).
 - **R-849.2a.** The implementation SHOULD validate the R-849.2 inequalities at wiring time (fail
   construction when `tripwire <= transaction.timeout.ms + transaction.abort.timed.out.transaction.cleanup.interval.ms`
   under Option A, or `tripwire >= max.poll.interval.ms`) — the budgets are config-derived, so the
@@ -286,7 +292,11 @@ transactions v2, the 4.0+ default, prevents the hanging class, leaving truncatio
   (> `transaction.timeout.ms` + abort scan) is scaladoc guidance + a safe default only, not a
   construction-time check. Adding the lower-bound check is the **R-a** obligation (below); warn —
   not fail-construction — is the SHOULD's recorded tradeoff: a misconfiguration should not take down
-  a deployment whose reads never stall.
+  a deployment whose reads never stall. A wiring-time limit found by the implementation review: the
+  module sees only the snapshot consumer's config, so the upper-bound check reads its
+  `maxPollInterval` as a **stand-in** for the driving consumer's `max.poll.interval.ms` (the consumer
+  actually evicted; its config is not visible at module wiring) — the warning must say so, and can
+  still miss a divergently-tuned driving consumer.
 - **R-849.3.** On trip the read MUST raise an error that fails the flow through normal supervision
   (visible, restartable) and MUST NOT return partial data — fail-loud is abort-before-response,
   which is what keeps a failed read invisible to (and safe under) the atomic-read spec. *Evidence:*
@@ -433,17 +443,21 @@ because no single draft carries them:
   `recoveryStallTimeout >= max.poll.interval.ms` but not when it is `<= transaction.timeout.ms +
   transaction.abort.timed.out.transaction.cleanup.interval.ms` (~70 s at defaults) — the bound that
   matters under A, whose legitimate wait is no-progress (R-849.2a). Trivially met under B alone,
-  load-bearing whenever A is present.
+  load-bearing whenever A is present. **Carried by the combined implementation** (both bounds warned
+  at module acquisition; unmerged).
 - **R-b (test): the A×deadline *coexistence* test** — a genuine A wait (an open transaction resolving
   within `transaction.timeout.ms`) completes **without** the deadline firing above it. #851 and #852
-  each pin only their own mechanism; the combination needs the joint test.
+  each pin only their own mechanism; the combination needs the joint test. **Carried by the combined
+  implementation** (the wait-out IT arms the deadline above the wait's bound; unmerged).
 - **R-c (process): land A first, then stack the deadline; don't parallel-merge.** #851 and #852 both
   edit `readPartition` and add `ReadSnapshotsSpec`; #851 and #853 both edit `KafkaPersistenceModule`.
   Land A, rebase the deadline on top, resolve in one place — avoids a three-way conflict. (B, if
-  adopted, stacks the same way.)
+  adopted, stacks the same way.) **Discharged by the combined implementation**: built stacked, then
+  joined into one PR (6 of each half's 7 files were shared), so nothing parallel-merges.
 - **R-d (doc): surface A's recovery-latency tail** (~70 s pause while a crashed writer's transaction
   is aborted) in [`persistence.md`](../docs/persistence.md), so it is not mistaken for the #849 hang
-  (R-850 A2). N/A under B alone.
+  (R-850 A2). N/A under B alone. **Carried by the combined implementation** (the ~70 s tail and the
+  prefix-change wait are documented).
 - **Not gaps (handled):** #853's `transaction.timeout` vs `maxWritesPerTransaction` — #853 keeps the
   client default (1 min; an earlier note here said 10 s — corrected, see B4) and the module scaladoc
   notes a group-committed batch commits in well under a second, far below it; #853's prefix-as-group-id

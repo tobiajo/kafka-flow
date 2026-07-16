@@ -215,7 +215,6 @@ opens with a role banner.
 | [`implementation-requirements.md`](implementation-requirements.md) | Forward | the normative register (§5) + the not-yet-merged backlog and cross-branch integration gaps. |
 | [`850-remedy-decision.md`](850-remedy-decision.md) | Forward | the #850 remedy comparison (A vs B vs composed): decision rule, criteria, matrix, recommendation with staged path and flip conditions; its external pins are homed as ext(K9)–(K13), its §6 routes to them. |
 | [`advisory-review.md`](advisory-review.md) | Review | the external reviews (corpus-wide advisory pass + the Kafka-arm models/register pass). |
-| [`850-implementation-review.md`](850-implementation-review.md) | Review | advisory review of the combined A+B+deadline implementation (fork PRs #14/#15) against the register and models, under the initial-implementation stance (v9.0.0 the only released cut); merge-shape recommendation and the on-merge corpus flips. |
 
 **Where each arm lives inside the shared files.** Cassandra: `cassandra-*.md`; register S-/C-/P-/X-\*;
 findings F-1..F-7, F-9; ext(1)–(X2), ext(C-F9); claims Mechanism/Delete/Replay/Deleted-key/Consistency/
@@ -224,6 +223,6 @@ Kafka: `kafka-*.md`; findings F-8/F-10/F-11; ext(K1)–(K14); claims KF1–KF16;
 models `Kafka`, `GroupCommit`, `GroupCommitLanes`, `Epoch`, `FlowsAlive`, `TokenSync`, `RecoveryRead ⇒
 RecoveryReadAtomic`, `RecoveryDeadline`.
 
-*Snapshot date: 2026-07-14 (keep in step with the [`implementation-requirements.md`](implementation-requirements.md)
+*Snapshot date: 2026-07-16 (keep in step with the [`implementation-requirements.md`](implementation-requirements.md)
 status snapshot; the [`advisory-review.md`](advisory-review.md) date records the last review pass —
 2026-07-12 — and moves only with a new review).*

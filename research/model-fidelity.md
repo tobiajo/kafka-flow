@@ -355,3 +355,14 @@ abstraction (no `RTBound`/Zeno machinery, which TLC handles poorly); the budgets
 counts, so the model checks the *structure* of the inequalities, not concrete millisecond values —
 those are the R-849.2a wiring-time validation's job. Adds **5 configs (2 HOLDS + 3 negative
 controls)**. Run in CI with the rest (the pinned TLC).
+
+Fidelity addendum from the implementation review (2026-07-16) — two divergences in the combined
+implementation's `drainWithDeadline`, both benign and accepted: (1) the code evaluates the trip
+condition only when it observes an *unchanged* position, so a stall that resolves between
+observations — even past the deadline — is forgiven, where the model, once `TripCondActive`, admits
+only `TripFail`; more permissive, never silent, and unreachable in the hang configs (no progress
+exists to forgive). (2) The code's progress test is *position changed* where the model's `Progress`
+is advance-only: a position regression (the `auto.offset.reset = earliest` re-read after truncation)
+restarts the deadline, so repeated truncation postpones the loud failure indefinitely, while a
+single truncation converges within one extra period and is then correctly diagnosed. Neither
+weakens `INV_NoSilentEviction` on the modeled causes; both are recorded here rather than modelled.
