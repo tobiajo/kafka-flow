@@ -5,6 +5,7 @@ import cats.effect.unsafe.IORuntime
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.{FromTry, Log, LogOf}
+import com.evolutiongaming.kafka.flow.kafka.Codecs.*
 import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
 import com.evolutiongaming.kafka.flow.registry.EntityRegistry
 import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
@@ -454,26 +455,146 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     }
   }
 
-  test("an open transaction of a fenced writer neither blocks nor leaks into recovery") {
-    val stateTopic = "tx-open-state-topic"
+  test("a takeover aborts the crashed owner's unfinished transaction (stable transactional.id)") {
+    // The crashed producer's transaction.timeout.ms is deliberately long (10 minutes): the
+    // last-stable-offset can be back at the high watermark right after module acquisition only through
+    // the takeover-abort of the stable "<prefix>-<partition>" id, never the broker's timeout - a
+    // unique-suffix id would leave the transaction open and fail the assertion.
+    val stateTopic = "tx-takeover-abort-state-topic"
+    val inputTopic = s"input-$stateTopic"
 
-    val record = new ProducerRecord(
+    def record(key: String, value: String) = new ProducerRecord(
       topic     = stateTopic,
       partition = Partition.min.some,
-      key       = "key-uncommitted".some,
-      value     = "uncommitted".some,
+      key       = key.some,
+      value     = value.some,
+    )
+
+    def endOffset(isolation: IsolationLevel): IO[Offset] = {
+      val tp = TopicPartition(stateTopic, Partition.min)
+      consumerOf
+        .apply[String, ByteVector](consumerConfig.copy(isolationLevel = isolation))
+        .use(_.endOffsets(cats.data.NonEmptySet.of(tp)).map(_.getOrElse(tp, Offset.min)))
+    }
+
+    // the module's own id for this partition - the crashed owner is a previous incarnation of its producer
+    val crashedProducer =
+      producerOf(
+        producerConfig.copy(
+          transactionalId    = s"$appId-${Partition.min.value}".some,
+          idempotence        = true,
+          transactionTimeout = 10.minutes,
+        )
+      )
+
+    val module = KafkaPersistenceModule.cachingTransactional[IO, String](
+      consumerOf = consumerOf,
+      producerOf = producerOf,
+      config = KafkaPersistenceModule.TransactionalConfig(
+        consumerConfig        = consumerConfig,
+        producerConfig        = producerConfig,
+        transactionalIdPrefix = appId,
+        snapshotTopic         = stateTopic,
+      ),
+      assignment = PartitionAssignment[IO](
+        topicPartition = TopicPartition(inputTopic, Partition.min),
+        assignedAt     = Offset.min,
+        groupMetadata  = IO.pure(none[ConsumerGroupMetadata]),
+      ),
     )
 
     val test = createTopic(stateTopic, 1) *>
-      transactionalProducer("tx-open").use { producerA =>
+      crashedProducer.use { crashed =>
+        for {
+          _ <- crashed.initTransactions
+          // a committed snapshot, so recovery has something real to return
+          _ <- crashed.beginTransaction
+          _ <- crashed.send(record("key-committed", "committed")).flatten
+          _ <- crashed.commitTransaction
+          // the crash: the transaction is left open
+          _    <- crashed.beginTransaction
+          _    <- crashed.send(record("key-unfinished", "unfinished")).flatten
+          lso0 <- endOffset(IsolationLevel.ReadCommitted)
+          hw0  <- endOffset(IsolationLevel.ReadUncommitted)
+          _     = assert(clue(lso0.value) < clue(hw0.value), "expected the unfinished transaction to pin the LSO")
+          // the takeover: acquiring the module runs initTransactions on the partition's stable id
+          stored <- module.use { _ =>
+            for {
+              lso1 <- endOffset(IsolationLevel.ReadCommitted)
+              hw1  <- endOffset(IsolationLevel.ReadUncommitted)
+              // the pin is resolved by the init itself - recovery starts unpinned, nothing to wait out
+              _ = assertEquals(
+                clue(lso1),
+                clue(hw1),
+                "expected the takeover's init to abort the unfinished transaction"
+              )
+              stored <- readSnapshots(stateTopic)
+            } yield stored
+          }
+        } yield {
+          assertEquals(clue(stored.get("key-committed")), utf8("committed"))
+          assertEquals(clue(stored.get("key-unfinished")), none[ByteVector])
+        }
+      }
+
+    test.unsafeRunSync()
+  }
+
+  test("recovery waits out an open transaction outside the id lineage") {
+    // An out-of-lineage transaction (a unique transactional.id no takeover ever inits) is aborted only by
+    // the broker's timeout, so it is genuinely open when the read starts: the read must wait it out, then
+    // include the committed record and exclude the timed-out one.
+    val stateTopic = "tx-open-state-topic"
+
+    def record(key: String, value: String) = new ProducerRecord(
+      topic     = stateTopic,
+      partition = Partition.min.some,
+      key       = key.some,
+      value     = value.some,
+    )
+
+    def endOffset(isolation: IsolationLevel): IO[Offset] = {
+      val tp = TopicPartition(stateTopic, Partition.min)
+      consumerOf
+        .apply[String, ByteVector](consumerConfig.copy(isolationLevel = isolation))
+        .use(_.endOffsets(cats.data.NonEmptySet.of(tp)).map(_.getOrElse(tp, Offset.min)))
+    }
+
+    // short transaction.timeout.ms so the broker times the "crashed" writer out quickly (plus its abort
+    // scan, up to ~10s)
+    val crashedProducer =
+      producerOf(
+        producerConfig.copy(
+          transactionalId    = "tx-open-crashed".some,
+          idempotence        = true,
+          transactionTimeout = 5.seconds,
+        )
+      )
+
+    val test = createTopic(stateTopic, 1) *>
+      crashedProducer.use { producerA =>
         for {
           _ <- producerA.initTransactions
           _ <- producerA.beginTransaction
-          _ <- producerA.send(record).flatten
-          // producerA's transaction is left open: initTransactions of the new producer aborts it
-          _      <- transactionalProducer("tx-open").use(_.initTransactions)
-          stored <- readSnapshots(stateTopic).timeout(30.seconds)
-        } yield assertEquals(clue(stored.get("key-uncommitted")), none[ByteVector])
+          _ <- producerA.send(record("key-uncommitted", "uncommitted")).flatten
+          // the next owner commits a NEWER snapshot above A's still-open transaction
+          _ <- transactionalProducer("tx-open-next").use { producerB =>
+            producerB.initTransactions *>
+              producerB.beginTransaction *>
+              producerB.send(record("key-committed", "committed")).flatten *>
+              producerB.commitTransaction
+          }
+          // the pin must still be active when the read starts, else a slow runner degrades this to the
+          // aborted case and the wait is never exercised
+          lso <- endOffset(IsolationLevel.ReadCommitted)
+          hw  <- endOffset(IsolationLevel.ReadUncommitted)
+          _    = assert(clue(lso.value) < clue(hw.value), "expected an open-transaction pin at read start")
+          // A's transaction is still open here; the read must wait for the broker to time it out
+          stored <- readSnapshots(stateTopic).timeout(60.seconds)
+        } yield {
+          assertEquals(clue(stored.get("key-committed")), utf8("committed"))
+          assertEquals(clue(stored.get("key-uncommitted")), none[ByteVector])
+        }
       }
 
     test.unsafeRunSync()
