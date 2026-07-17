@@ -151,6 +151,47 @@ the poll-interval warning and the `recoveryStallTimeout` scaladoc name the snaps
 stand-in; `persistence.md` says "well below" and "at module acquisition". Findings 6, 8 and 9 are
 accepted as recorded.
 
+### Addressed since, on tobiajo#16 (2026-07-16, the author's review round)
+
+Everything below post-dates the disposition; the mechanism is unchanged — the production deltas are
+structural or comment/doc-level, the rest is test coverage.
+
+- **Structural**: the read entry points were split — `readPartition` returned to its pre-deadline
+  three-parameter form (master's shape) and `readPartitionWithDeadline` requires the deadline and
+  its diagnosis together — dissolving the `Option`-plus-mandatory-parameter seam and the unarmed
+  caller's dummy diagnosis; the diagnosis is built only on the armed dispatch branch. `diagnose`
+  became `diagnoseStall`; `defaultStallTimeout` became `DefaultStallTimeout`, matching its sibling
+  constant's casing; the module's pure config derivation moved above its resource acquisitions
+  (dropping a `Resource.pure` fossil of the effectful uuid) and reads its clocks uniformly through
+  `Clock`.
+- **Honesty and scoping**: the init-duration log is now framed as the abort's only, *indefinite*
+  trace (the inverted "a slow init usually means one happened" corrected in the comment and the
+  design doc) — the R-850-C proxy-evidence framing stated at the code; "does not affect fencing"
+  scoped to "fencing **of stale writers**" in the scaladoc and `persistence.md`, matching the design
+  doc's term; the poll-interval stand-in is named in the warn text and scaladoc ("the module does
+  not receive" the driving consumer's config); `brokerAbortScanInterval` moved `private` into the
+  module beside its only consumer.
+- **Slop trims** (the author's review threads): the `RecoveryReadStalledError`, `Stall` and
+  `readPartition` scaladocs dropped — the message and the signatures carry them; comments cut to one
+  line where the warn messages or adjacency carry the content; the 5s stall-log dwell now explains
+  itself (a shorter pause is fetch latency at the 10ms poll cadence, not a stall).
+- **Test coverage completed**: the three gaps the coverage audit found beyond the findings above are
+  closed — R-849.1's no-progress-not-total-duration property (a slow but progressing read outlives
+  the deadline), the undetermined-diagnosis fallback (a failing re-read cannot mask the stall
+  error), and the acquisition warnings at their exact inclusive bounds (finding 5's stand-in is now
+  also test-pinned). Every register obligation now carries an implementation-side pin on this
+  branch.
+- **Determinism**: `ReadSnapshotsSpec` runs under `TestControl` virtual time (the `GroupCommitSpec`
+  pattern) — deadline arithmetic exact rather than margin-based, the no-deadline control still
+  waiting a virtual hour in, the real-time guard outside the simulation where it catches a
+  non-sleeping spin.
+- **Operator-signal pins**: the throttled stall log (exactly two lines, at 5s and 10s of stall,
+  before a 12s deadline fires) and the read-start wait-warn (one warn naming both offsets under a
+  pin, silence without one). The narration lines — read started/complete, the init duration — are
+  deliberately unpinned: no condition decides whether they fire.
+- **Vocabulary**: "trip(ping)" — this corpus's tripwire term — replaced in the code and the design
+  doc by the implementation's own terms: the deadline *fires*, the read *fails*.
+
 ## Corpus reconciliation (edits owed to the corpus, not the code)
 
 1. **Report vs register on capture-before-init.** [`850-remedy-decision.md`](850-remedy-decision.md)
