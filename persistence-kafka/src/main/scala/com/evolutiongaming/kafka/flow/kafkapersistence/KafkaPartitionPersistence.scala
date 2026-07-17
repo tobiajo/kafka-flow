@@ -184,12 +184,16 @@ object KafkaPartitionPersistence {
             bytesByKey <- stall match {
               case None        => readPartition(consumer, snapshotsPartition, targetOffset)
               case Some(stall) =>
-                // a stall's cause, re-read lazily only if the deadline fires; best-effort - a re-read that
-                // itself fails leaves the cause undetermined rather than masking the stall. The high watermark
-                // and the last-stable-offset (this consumer's read_committed end) separate the three shapes: a
-                // regressed log end is truncation; an LSO still short of the target is an open transaction pinning
-                // it; an LSO that already covers the target is no pin at all - the records are readable but the
-                // read is not advancing (a fetch-path stall)
+                // a stall's cause, re-read lazily only if the deadline fires; best-effort - a re-read that itself
+                // fails leaves the cause undetermined rather than masking the stall. Two offsets separate the three
+                // shapes: the high watermark (the true log end) and endOffset(consumer) - which under read_committed
+                // returns the last-stable-offset, not the log end. Both are ListOffsets metadata calls, so they
+                // return the current offsets even while the partition is pinned - no fetch, no deadlock (the pin
+                // blocks fetching past the LSO, not reading where it is); the cost is only a point-in-time read, so
+                // a pin resolving in the last poll cycle would read as "not a pin" (negligible against the deadline).
+                // A regressed log end is truncation; an LSO still short of the target is an open transaction pinning
+                // it; an LSO already covering the target is no pin - the records are readable but the read did not
+                // advance (a fetch-path stall).
                 val diagnoseStall = highWatermark
                   .flatMap { logEnd =>
                     endOffset(consumer).map { lastStableOffset =>
