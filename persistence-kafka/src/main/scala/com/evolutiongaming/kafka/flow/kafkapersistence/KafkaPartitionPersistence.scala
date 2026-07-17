@@ -184,29 +184,19 @@ object KafkaPartitionPersistence {
             bytesByKey <- stall match {
               case None        => readPartition(consumer, snapshotsPartition, targetOffset)
               case Some(stall) =>
-                // a stall's cause, re-read lazily only if the deadline fires; best-effort - a re-read that itself
-                // fails leaves the cause undetermined rather than masking the stall. The high watermark and the read
-                // consumer's last-stable-offset separate the three shapes: a regressed log end is truncation; an LSO
-                // still short of the target is an open transaction pinning it; an LSO already covering the target is
-                // no pin - the records are readable but the read did not advance (a fetch-path stall).
+                // a stall's cause, re-read lazily only if the deadline fires; best-effort - a re-read that
+                // itself fails leaves the cause undetermined rather than masking the stall
                 val diagnoseStall = highWatermark
-                  .flatMap { logEnd =>
-                    endOffset(consumer).map { lastStableOffset =>
-                      if (logEnd.value < targetOffset.value)
-                        s"the log end regressed to $logEnd, below the captured target: log truncation after an " +
-                          "unclean leader election - acknowledged snapshot records are lost"
-                      else if (lastStableOffset.value < targetOffset.value)
-                        s"the log end $logEnd covers the target but the last-stable-offset $lastStableOffset does " +
-                          "not: an open transaction outlived the deadline - a pinning producer whose " +
-                          "transaction.timeout.ms exceeds the deadline resolves on its own; a hanging transaction " +
-                          "does not - detect and abort it with kafka-transactions.sh"
-                      else
-                        s"the last-stable-offset $lastStableOffset already covers the target: the committed records " +
-                          "are readable but the read did not advance - not an open transaction, but a fetch-path " +
-                          "stall (e.g. quota throttling or an unfetchable partition)"
-                    }
+                  .map { logEnd =>
+                    if (logEnd.value < targetOffset.value)
+                      s"the log end regressed to $logEnd, below the captured target: log truncation after an " +
+                        "unclean leader election - acknowledged snapshot records are lost"
+                    else
+                      s"the log end $logEnd still covers the target: an open transaction outlived the deadline - " +
+                        "a pinning producer whose transaction.timeout.ms exceeds the deadline resolves on its own; " +
+                        "a hanging transaction does not - detect and abort it with kafka-transactions.sh"
                   }
-                  .handleError(_ => "the cause could not be determined: the offset re-read failed")
+                  .handleError(_ => "the cause could not be determined: the high-watermark re-read failed")
                 readPartitionWithDeadline(consumer, snapshotsPartition, targetOffset, stall, diagnoseStall)
             }
             _ <- Log[F].info(
