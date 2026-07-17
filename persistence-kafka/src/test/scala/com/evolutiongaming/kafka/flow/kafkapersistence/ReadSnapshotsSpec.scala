@@ -136,6 +136,32 @@ class ReadSnapshotsSpec extends FunSuite {
     TestControl.executeEmbed(test.timeout(1.minute)).unsafeRunSync()
   }
 
+  test("a read stalled past the deadline with the target already committed is diagnosed as not a pin") {
+    // The last-stable-offset (3) already covers the target (3) - the records are committed and readable -
+    // yet the position never advances: this is a fetch-path stall, not an open transaction, and the
+    // diagnosis must not blame a transaction.
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      readConsumer = consumer(endOffset = 3L, positionRef = positionRef, records = Nil)
+      hwConsumer   = consumer(endOffset = 3L, positionRef = positionRef, records = Nil)
+      result <- KafkaPartitionPersistence
+        .readSnapshots[IO](
+          consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
+          consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
+          snapshotTopic  = topic,
+          partition      = partition,
+          stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
+        )
+        .attempt
+    } yield result match {
+      case Left(e: KafkaPartitionPersistence.RecoveryReadStalledError) =>
+        assert(e.diagnosis.contains("not an open transaction"), s"unexpected diagnosis: ${e.diagnosis}")
+      case other => fail(s"expected RecoveryReadStalledError, got $other")
+    }
+
+    TestControl.executeEmbed(test.timeout(1.minute)).unsafeRunSync()
+  }
+
   test("a slow but progressing read outlives the deadline without failing") {
     // no progress is measured from the last advance, never from the start of the read: every stall is exactly
     // 90ms (nine 10ms empty polls per record), under the 300ms deadline, while the whole read takes 720ms -
