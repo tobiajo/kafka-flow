@@ -5,6 +5,7 @@ import cats.effect.unsafe.IORuntime
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.{FromTry, Log, LogOf}
+import com.evolutiongaming.kafka.flow.kafka.Codecs.*
 import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
 import com.evolutiongaming.kafka.flow.registry.EntityRegistry
 import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
@@ -43,6 +44,12 @@ import scala.concurrent.duration.*
   * first is still alive.
   */
 class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
+
+  // the wait-out test legitimately runs tens of seconds (a 15s transaction timeout plus the broker's abort
+  // scan, phase included); munit's 30s default would race it, so keep munit's bound above the test's own
+  // 45s stall deadline and 60s outer timeout - those fail first, with diagnostics
+  override def munitTimeout: Duration = 3.minutes
+
   implicit val ioRuntime: IORuntime = IORuntime.global
   implicit val logOf: LogOf[IO]     = LogOf.slf4j[IO].unsafeRunSync()
   implicit val log: Log[IO]         = logOf(this.getClass).unsafeRunSync()
@@ -71,13 +78,24 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     * `read_committed` matches the transactional mode; it is equally correct for reading topics written without
     * transactions, where it behaves the same as `read_uncommitted`.
     */
-  private def readSnapshots(stateTopic: String): IO[BytesByKey] =
+  private def readSnapshots(
+    stateTopic: String,
+    stallTimeout: Option[FiniteDuration] = KafkaPartitionPersistence.DefaultStallTimeout.some,
+  ): IO[BytesByKey] =
     KafkaPartitionPersistence.readSnapshots[IO](
       consumerOf     = consumerOf,
       consumerConfig = consumerConfig.copy(isolationLevel = IsolationLevel.ReadCommitted),
       snapshotTopic  = stateTopic,
       partition      = Partition.min,
+      stall          = stallTimeout.map(KafkaPartitionPersistence.Stall(_, IO.monotonic)),
     )
+
+  private def endOffset(stateTopic: String, isolation: IsolationLevel): IO[Offset] = {
+    val tp = TopicPartition(stateTopic, Partition.min)
+    consumerOf
+      .apply[String, ByteVector](consumerConfig.copy(isolationLevel = isolation))
+      .use(_.endOffsets(cats.data.NonEmptySet.of(tp)).map(_.getOrElse(tp, Offset.min)))
+  }
 
   private def utf8(value: String): Option[ByteVector] = ByteVector.encodeUtf8(value).toOption
 
@@ -237,9 +255,12 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       val stale = staleGeneration(current)
       staleFlushScenario(moduleOf, IO.pure(stale.some), moduleOf, IO.pure(current.some), stateTopic, key).map {
         case (staleFlush, stored) =>
-          // the release itself succeeds: the rejected write surfaces as a logged-and-swallowed cache entry release
-          // error ("scache: failed to release cache entry: ... CommitFailedException"), which is the desired
-          // outcome for a partition that is being given away anyway
+          // the release itself succeeds: the rejected write surfaces as a logged-and-swallowed cache entry
+          // release error ("scache: failed to release cache entry: ..."). Under the shared stable id B's init
+          // has already epoch-fenced A, so the broker rejects A's flush for its stale producer epoch (raised
+          // client-side as InvalidProducerEpochException or ProducerFencedException, depending on the
+          // transaction protocol version) before the flush ever reaches the offset commit - so it is not the
+          // generation fence's CommitFailedException; that fence is pinned by the fail-fast and offset-commit tests
           assertEquals(clue(staleFlush), Right(()))
           // the protection: the stale (older-generation) write did not land, the new owner's snapshot survived
           assertEquals(clue(stored.get(key)), utf8((1 to 10).map(i => s"e$i").mkString(",")))
@@ -291,7 +312,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
           _ <- gmRef.set(staleGeneration(current))
           // the next periodic flush must fail fast with the conflict
           staleResult <- flow_(inputRecords(inputTopic, key, List("e1", "e2", "e3", "e4")).drop(3)).attempt
-          _           <- release.attempt // the fenced writer's flush-on-revoke error is logged and swallowed
+          _           <- release.attempt // cleanup only: nothing flushes on revoke in this flow's configuration
         } yield staleResult match {
           case Left(e) =>
             assert(
@@ -454,26 +475,134 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     }
   }
 
-  test("an open transaction of a fenced writer neither blocks nor leaks into recovery") {
-    val stateTopic = "tx-open-state-topic"
+  test("a takeover aborts the crashed owner's unfinished transaction (stable transactional.id)") {
+    // The crashed producer's transaction.timeout.ms is deliberately long (10 minutes): the
+    // last-stable-offset can be back at the high watermark right after module acquisition only through
+    // the takeover-abort of the stable "<prefix>-<partition>" id, never the broker's timeout - a
+    // unique-suffix id would leave the transaction open and fail the assertion.
+    val stateTopic = "tx-takeover-abort-state-topic"
+    val inputTopic = s"input-$stateTopic"
 
-    val record = new ProducerRecord(
+    def record(key: String, value: String) = new ProducerRecord(
       topic     = stateTopic,
       partition = Partition.min.some,
-      key       = "key-uncommitted".some,
-      value     = "uncommitted".some,
+      key       = key.some,
+      value     = value.some,
+    )
+
+    // the module's own id for this partition - the crashed owner is a previous incarnation of its producer
+    val crashedProducer =
+      producerOf(
+        producerConfig.copy(
+          transactionalId    = s"$appId-${Partition.min.value}".some,
+          idempotence        = true,
+          transactionTimeout = 10.minutes,
+        )
+      )
+
+    val module = KafkaPersistenceModule.cachingTransactional[IO, String](
+      consumerOf = consumerOf,
+      producerOf = producerOf,
+      config = KafkaPersistenceModule.TransactionalConfig(
+        consumerConfig        = consumerConfig,
+        producerConfig        = producerConfig,
+        transactionalIdPrefix = appId,
+        snapshotTopic         = stateTopic,
+      ),
+      assignment = PartitionAssignment[IO](
+        topicPartition = TopicPartition(inputTopic, Partition.min),
+        assignedAt     = Offset.min,
+        groupMetadata  = IO.pure(none[ConsumerGroupMetadata]),
+      ),
     )
 
     val test = createTopic(stateTopic, 1) *>
-      transactionalProducer("tx-open").use { producerA =>
+      crashedProducer.use { crashed =>
+        for {
+          _ <- crashed.initTransactions
+          // a committed snapshot, so recovery has something real to return
+          _ <- crashed.beginTransaction
+          _ <- crashed.send(record("key-committed", "committed")).flatten
+          _ <- crashed.commitTransaction
+          // the crash: the transaction is left open
+          _    <- crashed.beginTransaction
+          _    <- crashed.send(record("key-unfinished", "unfinished")).flatten
+          lso0 <- endOffset(stateTopic, IsolationLevel.ReadCommitted)
+          hw0  <- endOffset(stateTopic, IsolationLevel.ReadUncommitted)
+          _     = assert(clue(lso0.value) < clue(hw0.value), "expected the unfinished transaction to pin the LSO")
+          // the takeover: acquiring the module runs initTransactions on the partition's stable id
+          stored <- module.use { _ =>
+            for {
+              lso1 <- endOffset(stateTopic, IsolationLevel.ReadCommitted)
+              hw1  <- endOffset(stateTopic, IsolationLevel.ReadUncommitted)
+              // the pin is resolved by the init itself - recovery starts unpinned, nothing to wait out
+              _ = assertEquals(
+                clue(lso1),
+                clue(hw1),
+                "expected the takeover's init to abort the unfinished transaction"
+              )
+              stored <- readSnapshots(stateTopic)
+            } yield stored
+          }
+        } yield {
+          assertEquals(clue(stored.get("key-committed")), utf8("committed"))
+          assertEquals(clue(stored.get("key-unfinished")), none[ByteVector])
+        }
+      }
+
+    test.unsafeRunSync()
+  }
+
+  test("recovery waits out an open transaction outside the id lineage") {
+    // An out-of-lineage transaction (a unique transactional.id no takeover ever inits) is aborted only by
+    // the broker's timeout, so it is genuinely open when the read starts: the read must wait it out, then
+    // include the committed record and exclude the timed-out one.
+    val stateTopic = "tx-open-state-topic"
+
+    def record(key: String, value: String) = new ProducerRecord(
+      topic     = stateTopic,
+      partition = Partition.min.some,
+      key       = key.some,
+      value     = value.some,
+    )
+
+    // short transaction.timeout.ms so the broker times the "crashed" writer out quickly (plus its abort
+    // scan, up to ~10s)
+    val crashedProducer =
+      producerOf(
+        producerConfig.copy(
+          transactionalId    = "tx-open-crashed".some,
+          idempotence        = true,
+          transactionTimeout = 15.seconds,
+        )
+      )
+
+    val test = createTopic(stateTopic, 1) *>
+      crashedProducer.use { producerA =>
         for {
           _ <- producerA.initTransactions
           _ <- producerA.beginTransaction
-          _ <- producerA.send(record).flatten
-          // producerA's transaction is left open: initTransactions of the new producer aborts it
-          _      <- transactionalProducer("tx-open").use(_.initTransactions)
-          stored <- readSnapshots(stateTopic).timeout(30.seconds)
-        } yield assertEquals(clue(stored.get("key-uncommitted")), none[ByteVector])
+          _ <- producerA.send(record("key-uncommitted", "uncommitted")).flatten
+          // the next owner commits a NEWER snapshot above A's still-open transaction
+          _ <- transactionalProducer("tx-open-next").use { producerB =>
+            producerB.initTransactions *>
+              producerB.beginTransaction *>
+              producerB.send(record("key-committed", "committed")).flatten *>
+              producerB.commitTransaction
+          }
+          // the pin must still be active when the read starts, else a slow runner degrades this to the
+          // aborted case and the wait is never exercised
+          lso <- endOffset(stateTopic, IsolationLevel.ReadCommitted)
+          hw  <- endOffset(stateTopic, IsolationLevel.ReadUncommitted)
+          _    = assert(clue(lso.value) < clue(hw.value), "expected an open-transaction pin at read start")
+          // A's transaction is still open here; the read must wait for the broker to time it out. The stall
+          // deadline is armed above the wait's self-healing bound (15s transaction timeout plus up to 10s
+          // abort scan): a legitimate wait must complete under an armed deadline, without firing it
+          stored <- readSnapshots(stateTopic, stallTimeout = 45.seconds.some).timeout(60.seconds)
+        } yield {
+          assertEquals(clue(stored.get("key-committed")), utf8("committed"))
+          assertEquals(clue(stored.get("key-uncommitted")), none[ByteVector])
+        }
       }
 
     test.unsafeRunSync()
