@@ -12,6 +12,7 @@ import com.evolutiongaming.skafka.consumer.{ConsumerConfig, ConsumerGroupMetadat
 import com.evolutiongaming.smetrics.CollectorRegistry
 import munit.FunSuite
 import org.apache.kafka.clients.admin.{AdminClient, AdminClientConfig, NewTopic}
+import org.testcontainers.utility.DockerImageName
 
 import java.util.Properties
 import java.util.concurrent.TimeUnit
@@ -22,7 +23,9 @@ import scala.jdk.CollectionConverters.*
 abstract class ForAllKafkaSuite extends FunSuite with TestContainersFixtures {
   import cats.effect.unsafe.implicits.global
 
-  val kafka = ForAllContainerFixture(KafkaContainer())
+  // pinned so the broker constants the tests' arithmetic assumes (the abort scan, transaction defaults, the
+  // group protocol) cannot drift under an unpinned :latest
+  val kafka = ForAllContainerFixture(KafkaContainer(DockerImageName.parse("apache/kafka:4.3.1")))
 
   def createTopic(topic: String, partitions: Int): IO[Unit] = {
     val props = new Properties
