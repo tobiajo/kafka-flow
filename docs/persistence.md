@@ -126,16 +126,16 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   immediately); it only lengthens the prefix-change wait (below).
 - **Recovery fails loudly rather than hangs** — a recovery read that makes no progress for
   `recoveryStallTimeout` (default 2 min) fails with `RecoveryReadStalledError` instead of hanging the
-  rebalance until the member is silently evicted at `max.poll.interval.ms`. The deadline exists for
-  Kafka's known limitation of *hanging* transactions, whose pin never clears on its own: detect and
-  abort one with the `kafka-transactions.sh` tool
+  rebalance until the member is silently evicted at `max.poll.interval.ms`. The error names its
+  diagnosed cause. Truncation: the snapshot log lost acknowledged records under the read (an
+  unclean leader election or an equivalent disaster) — the records are gone, an offset-reset or
+  restore decision. An outlived transaction: one whose producer's `transaction.timeout.ms` merely
+  exceeds the deadline heals on its own once the broker aborts it; a *hanging* transaction, whose
+  pin never clears, is detected and aborted with the `kafka-transactions.sh` tool
   ([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions));
   brokers 4.0+ prevent them arising
   ([KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)).
-  A transaction whose producer's `transaction.timeout.ms` merely exceeds the deadline heals on its
-  own once the broker aborts it. The error also distinguishes the one other diagnosable cause: the
-  snapshot log was truncated under the read (an unclean leader election lost acknowledged records —
-  an offset-reset or restore decision). Keep the value well below `max.poll.interval.ms` and above
+  Keep the value well below `max.poll.interval.ms` and above
   the legitimate wait for an unfinished transaction (`transaction.timeout.ms` plus the broker's
   abort scan — the prefix-change wait below); the mode warns at module acquisition if either bound
   is broken.

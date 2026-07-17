@@ -180,28 +180,36 @@ common case, the read bound (previous section) holds regardless.
 
 ### Stalled read: a deadline instead of a silent hang
 
-The recovery read waits by design, and Kafka has a known limitation that can make the wait
-infinite: a *hanging* transaction, whose pin no timeout ever clears
-([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions)
-added the `kafka-transactions.sh` tool to detect and abort these;
-[KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)
-brokers, Kafka 4.0+, prevent the class). Against one a deadline is the only client-side bound there is,
-and the hang it bounds is otherwise silent: the unbounded read hangs the poll thread inside the
-rebalance callback, nothing crashes, and `max.poll.interval.ms` evicts the member while
-process-level health checks stay green.
+The recovery read waits by design, and two rare causes can make the wait infinite. The first is
+**truncation**: the log end regresses below the captured target — a leader election lost
+acknowledged snapshot records — so the target is permanently unreachable. Kafka has closed the
+routine paths to this
+([KIP-101](https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation)
+and
+[KIP-279](https://cwiki.apache.org/confluence/display/KAFKA/KIP-279%3A+Fix+log+divergence+between+leader+and+follower+after+fast+leader+fail+over)
+fixed clean-election truncation, and unclean election is off by default), leaving an opted-in
+unclean election or a genuine disaster — rare, but no broker version or configuration removes it
+entirely. Recomputing the target would unblock the read at the price of re-admitting the silent
+under-read the capture exists to prevent, so the target deliberately stays put.
 
-Truncation hangs the read the same way, with no transaction involved: if the log end regresses
-below the captured target — an unclean leader election lost acknowledged snapshot records — the
-target itself is no longer reachable. Recomputing it would unblock the read at the price of
-re-admitting the silent under-read the capture exists to prevent, so the target deliberately stays
-put.
+The second is a **hanging transaction**, a known Kafka limitation: an LSO pin no timeout ever
+clears
+([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions)
+added the `kafka-transactions.sh` tool to detect and abort these);
+[KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)
+brokers, Kafka 4.0+, prevent the class, confining this cause to older brokers.
+
+Both are rare, and silent when they hit: the unbounded read hangs the poll thread inside the
+rebalance callback, nothing crashes, and `max.poll.interval.ms` evicts the member while
+process-level health checks stay green. The high-watermark bound is what makes the read willing to
+wait at all, so bounding that wait is part of shipping it.
 
 A no-progress deadline (configurable, default 2 min, measured from the last position advance) turns
 either hang into a `RecoveryReadStalledError`. It completes a termination ladder: the takeover-abort
 resolves the partition's own unfinished transactions sub-second; the bounded wait resolves
 everything the broker will eventually decide (~70 s worst case at defaults); the deadline converts
-what neither can resolve — an open transaction that outlives the deadline, or a target above a
-truncated log end — into a loud failure instead of a silent hang. Failing also heals: eviction only
+what neither can resolve — a target above a truncated log end, or an open transaction that
+outlives the deadline — into a loud failure instead of a silent hang. Failing also heals: eviction only
 replaces the partition's owner and never unwinds the stuck thread (the reading consumer is
 group-less) — the error frees it. After a truncation the restarted recovery captures a fresh,
 reachable target; behind a hanging transaction it fails loudly again until the pin is cleared,
