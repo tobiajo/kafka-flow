@@ -183,8 +183,31 @@ structural or comment/doc-level, the rest is test coverage.
   branch.
 - **Determinism**: `ReadSnapshotsSpec` runs under `TestControl` virtual time (the `GroupCommitSpec`
   pattern) — deadline arithmetic exact rather than margin-based, the no-deadline control still
-  waiting a virtual hour in, the real-time guard outside the simulation where it catches a
-  non-sleeping spin.
+  waiting a virtual hour in. *(Corrected by the test review below: the real-time guard first placed
+  outside the simulation was illusory — `tickAll` is one uncancelable block — and was replaced by
+  virtual-time timeouts inside each program; munit's watchdog is the real-time backstop.)*
+
+### Test review round (2026-07-16, two adversarial passes + a mutation audit)
+
+A deep review of the tests themselves. Its highs, all fixed: the module's recovery wiring was
+unpinned — dropping the `read_committed` forcing, the `earliest` offset-reset forcing, or the stall
+arming survived the whole build — now pinned by one module-level test driving a parked recovery
+through `keysOf.all` with a capturing `consumerOf` (isolation, offset reset, both client-id
+suffixes, and the stall error under the configured deadline); and the wait-out IT's healthy worst
+case (~25–29 s) raced munit's uncancelable 30 s default — munit now allows 3 minutes so the test's
+own deadlines fail first, with diagnostics. Also fixed: the illusory real-time `executeEmbed` guard
+(above); the no-deadline test moved up to `readSnapshots`, pinning the `None` dispatch (waiting, as
+`TimeoutException` specifically) and that `read_uncommitted` opens no capture consumer; record
+values made distinct from keys with the tombstone and keyless fold branches exercised and stored
+values asserted; the broker image pinned (the dimafeng default is tag-less `apache/kafka`); and two
+IT comments corrected (the flush-on-revoke swallowed error is `ProducerFencedException` under the
+shared stable id — an outcome-level pin, the generation fence carried by the fail-fast and
+offset-commit tests; the fail-fast release flushes nothing). Accepted with rationale: the fake's
+structural limits (real-client contract is the IT suite's job), one-poll boundary mutants,
+private-constant coupling in the timing tests, the shared `app-id-0` id under munit's sequential
+execution, and the fixture teardown ordering (harness noise only). The review also verified airtight
+what it could not fault: the takeover test's init-happens-after-markers reasoning, the
+stale-generation fixture down to the generation-0 edge, and the throttle arithmetic.
 - **Operator-signal pins**: the throttled stall log (exactly two lines, at 5s and 10s of stall,
   before a 12s deadline fires) and the read-start wait-warn (one warn naming both offsets under a
   pin, silence without one). The narration lines — read started/complete, the init duration — are
