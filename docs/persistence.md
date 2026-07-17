@@ -135,7 +135,11 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   ([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions));
   brokers 4.0+ prevent them arising
   ([KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)).
-  Keep the value well below `max.poll.interval.ms` and above
+  Cluster-side, the matching broker alerts are `PartitionsWithLateTransactionsCount > 0` (hanging
+  transactions) and `UncleanLeaderElectionsPerSec > 0` (truncation risk); brokers 4.1+ close the
+  remaining routine paths to both causes. Consumer lag metrics read zero during the wait or stall
+  (lag is measured to the last-stable-offset, where the read parks), so alert on this mode's log
+  signals, not on lag. Keep the value well below `max.poll.interval.ms` and above
   the legitimate wait for an unfinished transaction (`transaction.timeout.ms` plus the broker's
   abort scan — the prefix-change wait below); the mode warns at module acquisition if either bound
   is broken.
