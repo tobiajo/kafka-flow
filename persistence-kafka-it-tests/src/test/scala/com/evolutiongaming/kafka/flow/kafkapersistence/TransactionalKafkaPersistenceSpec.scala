@@ -46,7 +46,7 @@ import scala.concurrent.duration.*
 class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
 
   // the wait-out test legitimately runs tens of seconds (a 15s transaction timeout plus the broker's abort
-  // scan, phase included); munit's 30s default would race it, so keep munit's bound above the test's own
+  // scan); munit's 30s default would race it, so keep munit's bound above the test's own
   // 45s stall deadline and 60s outer timeout - those fail first, with diagnostics
   override def munitTimeout: Duration = 3.minutes
 
