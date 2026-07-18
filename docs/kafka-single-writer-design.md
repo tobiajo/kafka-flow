@@ -139,7 +139,7 @@ settled on the same shape — the end offset fetched `read_uncommitted`, the res
 ([KAFKA-10167](https://issues.apache.org/jira/browse/KAFKA-10167)).
 
 On the ordinary path the bound is free: the partition's own unfinished transactions are aborted at
-takeover, before recovery reads (next section), so the captured target equals the LSO and the read
+takeover by the shared `transactional.id`, before recovery reads (next section), so the captured target equals the LSO and the read
 never waits. It waits only for a transaction no takeover aborts — a previous prefix's unfinished
 transactions while a prefix change rolls out, or a producer misdirected at the snapshot topic — and
 there waiting is the only correct behavior, bounded by the *pinning* producer's
