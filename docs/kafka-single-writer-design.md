@@ -150,7 +150,7 @@ default timeout.
 ### Stable transactional.id: the takeover aborts unfinished transactions
 
 Each partition's producer uses a **stable** `transactional.id`, `"<prefix>-<partition>"` — a scheme
-whose cost, a producer per partition, this mode pays anyway. Every owner of a partition shares its
+whose cost — a producer per partition — this mode pays anyway. Every owner of a partition shares its
 id, so a new owner's mandatory `initTransactions` fences the previous owner's producer and aborts
 any transaction it left open, before the new owner may write.
 
