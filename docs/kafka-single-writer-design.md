@@ -180,10 +180,10 @@ common case, the read bound (previous section) holds regardless.
 
 ### Stalled read: a deadline instead of a silent hang
 
-The recovery read waits by design, and two known Kafka limitations can make the wait infinite. The
-first is **truncation**: the log end regresses below the captured target — a leader election lost
-acknowledged snapshot records — so the target is permanently unreachable. Kafka has closed the
-routine paths to this
+The recovery read waits by design, and two known Kafka limitations can keep it from ever reaching its
+target. The first is **truncation**: the log end regresses below the captured target — a leader
+election lost acknowledged snapshot records — so the target is permanently unreachable. Kafka has
+closed the routine paths to this
 ([KIP-101](https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation)
 and
 [KIP-279](https://cwiki.apache.org/confluence/display/KAFKA/KIP-279%3A+Fix+log+divergence+between+leader+and+follower+after+fast+leader+fail+over)
@@ -201,19 +201,18 @@ brokers, Kafka 4.0+, prevent the class, confining this cause to older brokers.
 
 Both are rare, and silent when they hit: the unbounded read hangs the poll thread inside the
 rebalance callback, nothing crashes, and `max.poll.interval.ms` evicts the member while
-process-level health checks stay green. The high-watermark bound is what makes the read willing to
-wait at all, so bounding that wait is part of shipping it.
+process-level health checks stay green.
 
-A no-progress deadline (`recoveryStallTimeout`, default 3 min, measured from the last position
-advance) is that bound. It is the last of three defenses: the takeover-abort
-resolves the partition's own unfinished transactions sub-second; the bounded wait resolves
-everything the broker will eventually decide (~70 s worst case at defaults); the deadline converts
-what neither can resolve — a target above a truncated log end, or an open transaction that
-outlives the deadline — into a loud failure instead of a silent hang. Failing also heals: eviction only
-replaces the partition's owner and never unwinds the stuck thread (the reading consumer is
-group-less) — the error frees it. After a truncation the restarted recovery captures a fresh,
-reachable target; behind a hanging transaction it fails loudly again until the pin is cleared,
-never silently.
+The read drains toward the target; when the position stops advancing, a no-progress deadline
+(`recoveryStallTimeout`, default 3 min, measured from the last position advance) fails the read
+loudly. The wait it must outlast is bounded — an open transaction resolves within ~70 s at defaults,
+which the takeover-abort collapses to sub-second for the partition's own — so the deadline sits above
+that wait and below `max.poll.interval.ms`:
+high enough not to fire during a legitimate wait, low enough to fire before the member is evicted. It
+is the fallback for a wait that never resolves. Failing also heals: the reading consumer is
+group-less, so eviction never unwinds the stuck thread but the error frees it, and the restarted
+recovery captures a fresh, reachable target — behind a hanging transaction, loudly again until the
+pin is cleared.
 
 The failure is diagnosed by re-reading the log end, because the two causes need opposite responses:
 below the captured target names truncation — the records are gone, so recovery becomes an
