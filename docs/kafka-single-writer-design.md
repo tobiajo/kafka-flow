@@ -192,7 +192,7 @@ unclean election or a genuine disaster — rare, but no broker version or config
 entirely. Recomputing the target would unblock the read at the price of re-admitting the silent
 under-read the capture exists to prevent, so the target deliberately stays put.
 
-The second is a **hanging transaction**: an LSO pin no timeout ever
+The second is a **hanging transaction**: an LSO pin that no timeout ever
 clears
 ([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions)
 added the `kafka-transactions.sh` tool to detect and abort these);
