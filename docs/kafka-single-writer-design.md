@@ -205,9 +205,8 @@ Both are rare, and silent when they hit: the unbounded read hangs the poll threa
 rebalance callback, nothing crashes, and `max.poll.interval.ms` evicts the member while
 process-level health checks stay green.
 
-The read drains toward the target; when the position stops advancing, a no-progress deadline
-(`recoveryStallTimeout`, default 3 min, measured from the last position advance) fails the read
-loudly. The wait it must outlast is bounded — an open transaction resolves within ~70 s at defaults,
+When the read's position stops advancing, a no-progress deadline (`recoveryStallTimeout`, default 3
+min, measured from the last position advance) fails the read loudly. The wait it must outlast is bounded — an open transaction resolves within ~70 s at defaults,
 which the takeover-abort collapses to sub-second for the partition's own — so the deadline sits above
 that wait and below `max.poll.interval.ms`: high enough not to fire during a legitimate wait, low
 enough to fire before the member is evicted. It is the fallback for a wait that never resolves.
