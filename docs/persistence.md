@@ -139,8 +139,7 @@ that happens) - recovery waits until the broker aborts it instead — slower, bu
   and `PartitionsWithLateTransactionsCount > 0` (hanging transactions). Consumer lag metrics read
   zero during the wait or stall (lag is measured to the last-stable-offset, where the read parks),
   so alert on this mode's log signals, not on lag. Keep the value well below `max.poll.interval.ms` and above
-  the legitimate wait for an unfinished transaction (`transaction.timeout.ms` plus the broker's
-  abort scan — the prefix-change wait below); the mode warns at module acquisition if either bound
+  the legitimate wait for an unfinished transaction (the prefix-change wait below); the mode warns at module acquisition if either bound
   is broken.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
