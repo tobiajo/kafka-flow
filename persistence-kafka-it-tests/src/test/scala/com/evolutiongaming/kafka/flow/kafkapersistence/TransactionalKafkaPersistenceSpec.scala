@@ -256,7 +256,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       staleFlushScenario(moduleOf, IO.pure(stale.some), moduleOf, IO.pure(current.some), stateTopic, key).map {
         case (staleFlush, stored) =>
           // the release itself succeeds: the rejected write surfaces as a logged-and-swallowed cache entry
-          // release error ("scache: failed to release cache entry: ..."). Under the shared stable id B's init
+          // release error ("scache: failed to release cache entry: ..."). Under the shared stable id, B's init
           // has already epoch-fenced A, so the broker rejects A's flush for its stale producer epoch (raised
           // client-side as InvalidProducerEpochException or ProducerFencedException, depending on the
           // transaction protocol version) before the flush ever reaches the offset commit - so it is not the
