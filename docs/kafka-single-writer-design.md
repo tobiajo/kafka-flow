@@ -131,7 +131,7 @@ committed snapshots above the pin. With a second handover inside the window the 
 stale state yet resumes from the newer committed input offset — the corruption shape of
 [#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fence violated.
 
-So the read target is the **high watermark**, captured up front by a short-lived `read_uncommitted`
+So the read target is the **high watermark**, captured up front by a short-lived, group-less `read_uncommitted`
 consumer. The `read_committed` position cannot pass the LSO until the broker resolves the open
 transaction, so the read genuinely waits it out. Kafka Streams' exactly-once changelog restore
 settled on the same shape — the end offset fetched `read_uncommitted`, the restore read
