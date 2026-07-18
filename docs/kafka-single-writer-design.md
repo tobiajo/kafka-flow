@@ -205,7 +205,7 @@ process-level health checks stay green. The high-watermark bound is what makes t
 wait at all, so bounding that wait is part of shipping it.
 
 A no-progress deadline (`recoveryStallTimeout`, default 2 min, measured from the last position
-advance) is that bound. It is the last of three: the takeover-abort
+advance) is that bound. It is the last of three defenses: the takeover-abort
 resolves the partition's own unfinished transactions sub-second; the bounded wait resolves
 everything the broker will eventually decide (~70 s worst case at defaults); the deadline converts
 what neither can resolve — a target above a truncated log end, or an open transaction that
