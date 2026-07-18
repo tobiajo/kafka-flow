@@ -297,8 +297,8 @@ Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current cod
 - **Recovery read** — `KafkaPartitionPersistence.readSnapshots` (the high-watermark capture, the
   drain to target, the start-of-read wait warn).
 - **Stall deadline** — the read loop `KafkaPartitionPersistence.readPartitionWithDeadline`, failing
-  with `RecoveryReadStalledError` at `recoveryStallTimeout`; the configuration-bound warns run at
-  module acquisition.
+  with `RecoveryReadStalledError` at `recoveryStallTimeout`; `KafkaPersistenceModule` warns at its
+  acquisition if either bound is broken.
 
 ## Measurements
 
