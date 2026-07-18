@@ -209,7 +209,7 @@ advance) is that bound. It is the last of three defenses: the takeover-abort
 resolves the partition's own unfinished transactions sub-second; the bounded wait resolves
 everything the broker will eventually decide (~70 s worst case at defaults); the deadline converts
 what neither can resolve — a target above a truncated log end, or an open transaction that
-outlives the deadline — into a loud failure instead of a silent hang. Failing also heals: eviction only
+outlives the deadline — into a loud failure instead of a silent hang. Failing also recovers on its own: eviction only
 replaces the partition's owner and never unwinds the stuck thread (the reading consumer is
 group-less) — the error frees it. After a truncation the restarted recovery captures a fresh,
 reachable target; behind a hanging transaction it fails loudly again until the pin is cleared,
