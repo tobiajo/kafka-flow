@@ -216,8 +216,7 @@ reachable target; behind a hanging transaction it fails loudly again until the p
 never silently.
 
 The failure is diagnosed by re-reading the log end, because the two causes need opposite responses:
-below the captured target names truncation — the records are gone, so recovery becomes an
-offset-reset or restore decision for an operator; at or above it names an open transaction that
+below the captured target names truncation — the records are gone; at or above it names an open transaction that
 outlived the deadline — a hanging one, or one whose timeout simply exceeds the deadline and will
 heal on its own.
 
