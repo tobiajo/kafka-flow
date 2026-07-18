@@ -359,8 +359,8 @@ real eager-recovery (every key recovered on assignment) and flush-on-revoke mach
   last-stable-offset is back at the high watermark immediately after module acquisition, which only
   the abort passes, never the broker's timeout; the `"<prefix>-<partition>"` id shape pinned with
   it), and the bounded wait on the residual path (a foreign transaction held genuinely open through
-  the read, its LSO pin asserted active, waited out under a deadline armed above the wait — so the
-  safety deadline and a legitimate wait coexist, the deadline never cutting the wait short).
+  the read, its LSO pin asserted active, waited out under a deadline set above the wait, which never
+  cuts a legitimate wait short).
 
 Unit suites pin the client-side pieces the mechanism depends on:
 
