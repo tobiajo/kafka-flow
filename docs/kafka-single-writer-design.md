@@ -298,7 +298,7 @@ Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current cod
   drain to target, the start-of-read wait warn).
 - **Stall deadline** — the read loop `KafkaPartitionPersistence.readPartitionWithDeadline`, failing
   with `RecoveryReadStalledError` at `recoveryStallTimeout`; `KafkaPersistenceModule` warns at its
-  acquisition if the deadline falls outside that range (see Stalled read).
+  acquisition if the deadline is not between the legitimate wait and `max.poll.interval.ms`.
 
 ## Measurements
 
