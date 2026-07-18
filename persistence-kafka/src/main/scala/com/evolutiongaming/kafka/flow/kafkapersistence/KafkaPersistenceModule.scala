@@ -43,12 +43,9 @@ object KafkaPersistenceModule {
     *   base config for the snapshot producer; `transactionalId` and `idempotence` are overridden per producer and
     *   `clientId` is suffixed with `-snapshot-<partition>`
     * @param transactionalIdPrefix
-    *   prefix for `transactional.id` (the partition number is appended; stable per partition). It does not affect
-    *   fencing of stale writers (that is by consumer generation) - it is a readable label and, on an ACL-secured
-    *   cluster, the `transactional.id` prefix the producer principal must be authorized for. Because the id is stable
-    *   per partition, the prefix must be unique per flow: use your `applicationId`, and an application running several
-    *   flows must append a per-flow discriminator (e.g. the input topic) or the flows share ids and fence each other's
-    *   producers - an `"<applicationId>*"` prefixed ACL still covers it.
+    *   prefix for `transactional.id` (the partition number is appended; stable per partition). Not the fence (that is
+    *   the consumer generation) - a readable label and, on an ACL-secured cluster, the prefix the producer principal
+    *   must be authorized for. Must be unique per flow; see the persistence guide for the naming discipline.
     * @param snapshotTopic
     *   snapshot topic name (should be configured as a 'compacted' topic) to read/write snapshots
     * @param maxWritesPerTransaction
