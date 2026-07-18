@@ -175,7 +175,7 @@ ACL-secured cluster the prefix is what the producer principal must be authorized
 e.g. a stalled but live producer's — and skafka's default (1 min) is kept, since a group-committed
 batch typically commits in well under a second.
 
-The completeness of recovery rests on no naming assumption: the id discipline buys the sub-second
+The completeness of recovery does not depend on any naming assumption: the id discipline buys the sub-second
 common case, the read bound (previous section) holds regardless.
 
 ### Stalled read: a deadline instead of a silent hang
