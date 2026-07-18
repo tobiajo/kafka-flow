@@ -124,7 +124,7 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout.
   Raising it does not slow normal recovery (a takeover aborts this id's unfinished transactions
   immediately); it only lengthens the prefix-change wait (below).
-- **Recovery fails loudly rather than hangs** — a recovery read that makes no progress for
+- **Recovery fails loudly rather than hanging** — a recovery read that makes no progress for
   `recoveryStallTimeout` (default 2 min) fails with `RecoveryReadStalledError` instead of hanging the
   rebalance until the member is silently evicted at `max.poll.interval.ms`. The error names its
   diagnosed cause. Truncation: the snapshot log lost acknowledged records under the read (an
