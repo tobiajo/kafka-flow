@@ -46,7 +46,7 @@ import scala.concurrent.duration.*
 class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
 
   // the wait-out test legitimately runs tens of seconds (a 15s transaction timeout plus the broker's abort
-  // scan, phase included); munit's 30s default would race it, so keep munit's bound above the test's own
+  // scan); munit's 30s default would race it, so keep munit's bound above the test's own
   // 45s stall deadline and 60s outer timeout - those fail first, with diagnostics
   override def munitTimeout: Duration = 3.minutes
 
@@ -256,7 +256,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       staleFlushScenario(moduleOf, IO.pure(stale.some), moduleOf, IO.pure(current.some), stateTopic, key).map {
         case (staleFlush, stored) =>
           // the release itself succeeds: the rejected write surfaces as a logged-and-swallowed cache entry
-          // release error ("scache: failed to release cache entry: ..."). Under the shared stable id B's init
+          // release error ("scache: failed to release cache entry: ..."). Under the shared stable id, B's init
           // has already epoch-fenced A, so the broker rejects A's flush for its stale producer epoch (raised
           // client-side as InvalidProducerEpochException or ProducerFencedException, depending on the
           // transaction protocol version) before the flush ever reaches the offset commit - so it is not the
@@ -596,8 +596,8 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
           hw  <- endOffset(stateTopic, IsolationLevel.ReadUncommitted)
           _    = assert(clue(lso.value) < clue(hw.value), "expected an open-transaction pin at read start")
           // A's transaction is still open here; the read must wait for the broker to time it out. The stall
-          // deadline is armed above the wait's self-healing bound (15s transaction timeout plus up to 10s
-          // abort scan): a legitimate wait must complete under an armed deadline, without firing it
+          // deadline is set above the wait's self-healing bound (15s transaction timeout plus up to 10s
+          // abort scan): a legitimate wait must complete with the deadline enabled, without firing it
           stored <- readSnapshots(stateTopic, stallTimeout = 45.seconds.some).timeout(60.seconds)
         } yield {
           assertEquals(clue(stored.get("key-committed")), utf8("committed"))

@@ -23,7 +23,7 @@ import scala.concurrent.duration.*
 /** The transactional module owns the producer settings its design depends on: the stable per-partition
   * `transactional.id` (a takeover must abort a crashed owner's unfinished transaction) and idempotence - applied over
   * whatever `producerConfig` carries. Its recovery read is wired `read_committed` from earliest with the configured
-  * deadline armed, and acquisition warns when the deadline's bounds are broken.
+  * deadline enabled, and acquisition warns when the deadline's bounds are broken.
   */
 class KafkaPersistenceModuleSpec extends FunSuite {
 
@@ -70,7 +70,7 @@ class KafkaPersistenceModuleSpec extends FunSuite {
     test.unsafeRunSync()
   }
 
-  test("the module's recovery read is read_committed from earliest, suffixed, and deadline-armed") {
+  test("the module's recovery read is read_committed from earliest, suffixed, and deadline-enabled") {
     // a parked recovery driven through keysOf.all: the captured configs and the stall error pin the wiring
     val tp    = TopicPartition("state-topic", Partition.min)
     val fakes = new FakeConsumers(tp)
@@ -112,7 +112,7 @@ class KafkaPersistenceModuleSpec extends FunSuite {
     } yield {
       result match {
         case Left(_: KafkaPartitionPersistence.RecoveryReadStalledError) => ()
-        case other => fail(s"expected the armed deadline to fail the parked recovery, got $other")
+        case other => fail(s"expected the enabled deadline to fail the parked recovery, got $other")
       }
       val read =
         configs.find(_.common.clientId.contains("client-snapshot-0")).getOrElse(fail(s"no read consumer: $configs"))

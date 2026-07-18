@@ -131,7 +131,7 @@ committed snapshots above the pin. With a second handover inside the window the 
 stale state yet resumes from the newer committed input offset — the corruption shape of
 [#732](https://github.com/evolution-gaming/kafka-flow/issues/732) with no fence violated.
 
-So the read target is the **high watermark**, captured up front by a short-lived `read_uncommitted`
+So the read target is the **high watermark**, captured up front by a short-lived, group-less `read_uncommitted`
 consumer. The `read_committed` position cannot pass the LSO until the broker resolves the open
 transaction, so the read genuinely waits it out. Kafka Streams' exactly-once changelog restore
 settled on the same shape — the end offset fetched `read_uncommitted`, the restore read
@@ -139,7 +139,7 @@ settled on the same shape — the end offset fetched `read_uncommitted`, the res
 ([KAFKA-10167](https://issues.apache.org/jira/browse/KAFKA-10167)).
 
 On the ordinary path the bound is free: the partition's own unfinished transactions are aborted at
-takeover, before recovery reads (next section), so the captured target equals the LSO and the read
+takeover by the shared `transactional.id`, before recovery reads (next section), so the captured target equals the LSO and the read
 never waits. It waits only for a transaction no takeover aborts — a previous prefix's unfinished
 transactions while a prefix change rolls out, or a producer misdirected at the snapshot topic — and
 there waiting is the only correct behavior, bounded by the *pinning* producer's
@@ -175,7 +175,7 @@ ACL-secured cluster the prefix is what the producer principal must be authorized
 e.g. a stalled but live producer's — and skafka's default (1 min) is kept, since a group-committed
 batch typically commits in well under a second.
 
-The completeness of recovery rests on no naming assumption: the id discipline buys the sub-second
+The completeness of recovery does not depend on any naming assumption: the id discipline buys the sub-second
 common case, the read bound (previous section) holds regardless.
 
 ### Stalled read: a deadline instead of a silent hang
@@ -192,7 +192,7 @@ unclean election or a genuine disaster — rare, but no broker version or config
 entirely. Recomputing the target would unblock the read at the price of re-admitting the silent
 under-read the capture exists to prevent, so the target deliberately stays put.
 
-The second is a **hanging transaction**: an LSO pin no timeout ever
+The second is a **hanging transaction**: an LSO pin that no timeout ever
 clears
 ([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions)
 added the `kafka-transactions.sh` tool to detect and abort these);
@@ -205,7 +205,7 @@ process-level health checks stay green. The high-watermark bound is what makes t
 wait at all, so bounding that wait is part of shipping it.
 
 A no-progress deadline (`recoveryStallTimeout`, default 2 min, measured from the last position
-advance) is that bound. It is the last of three: the takeover-abort
+advance) is that bound. It is the last of three defenses: the takeover-abort
 resolves the partition's own unfinished transactions sub-second; the bounded wait resolves
 everything the broker will eventually decide (~70 s worst case at defaults); the deadline converts
 what neither can resolve — a target above a truncated log end, or an open transaction that
@@ -221,7 +221,7 @@ offset-reset or restore decision for an operator; at or above it names an open t
 outlived the deadline — a hanging one, or one whose timeout simply exceeds the deadline and will
 heal on its own.
 
-Only the transactional mode arms the deadline: waiting is part of its read semantics, so an
+Only the transactional mode enables the deadline: waiting is part of its read semantics, so an
 unbounded wait is reachable there. Plain caching's unbounded read is long-shipped behaviour;
 changing a stable mode's failure semantics is a separate decision.
 
@@ -298,8 +298,8 @@ Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current cod
 - **Recovery read** — `KafkaPartitionPersistence.readSnapshots` (the high-watermark capture, the
   drain to target, the start-of-read wait warn).
 - **Stall deadline** — the read loop `KafkaPartitionPersistence.readPartitionWithDeadline`, failing
-  with `RecoveryReadStalledError` at `recoveryStallTimeout`; the configuration-bound warns run at
-  module acquisition.
+  with `RecoveryReadStalledError` at `recoveryStallTimeout`; `KafkaPersistenceModule` warns at its
+  acquisition if the deadline is not between the legitimate wait and `max.poll.interval.ms`.
 
 ## Measurements
 
@@ -359,8 +359,8 @@ real eager-recovery (every key recovered on assignment) and flush-on-revoke mach
   last-stable-offset is back at the high watermark immediately after module acquisition, which only
   the abort passes, never the broker's timeout; the `"<prefix>-<partition>"` id shape pinned with
   it), and the bounded wait on the residual path (a foreign transaction held genuinely open through
-  the read, its LSO pin asserted active, waited out under a deadline armed above the wait — so the
-  safety deadline and a legitimate wait coexist, the deadline never cutting the wait short).
+  the read, its LSO pin asserted active, waited out under a deadline set above the wait, which never
+  cuts a legitimate wait short).
 
 Unit suites pin the client-side pieces the mechanism depends on:
 
@@ -369,10 +369,10 @@ Unit suites pin the client-side pieces the mechanism depends on:
 - **`TopicFlowSpec`** — removing a partition awaits its flows' teardown.
 - **`ConsumerSpec`** — the post-poll generation tracking and the negative-generation guard.
 - **`KafkaPersistenceModuleSpec`** — the module's wiring: the producer settings, the
-  `read_committed`-from-earliest read with the deadline armed, the acquisition warnings.
+  `read_committed`-from-earliest read with the deadline enabled, the acquisition warnings.
 - **`ReadSnapshotsSpec`** — the read itself: the high-watermark target (a read bounded at the
   reader's own `endOffsets` fails the suite), the deadline with its diagnosis, a progressing read
-  outliving it, and the control: with no deadline armed, the read stays unbounded.
+  outliving it, and the control: with no deadline set, the read stays unbounded.
 
 ## Rejected alternatives
 

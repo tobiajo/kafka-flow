@@ -23,7 +23,7 @@ import scala.jdk.CollectionConverters.*
 abstract class ForAllKafkaSuite extends FunSuite with TestContainersFixtures {
   import cats.effect.unsafe.implicits.global
 
-  // pinned so the broker constants the tests' arithmetic assumes (the abort scan, transaction defaults, the
+  // pinned so the broker constants that the tests' arithmetic assumes (the abort scan, transaction defaults, the
   // group protocol) cannot drift under an unpinned :latest
   val kafka = ForAllContainerFixture(KafkaContainer(DockerImageName.parse("apache/kafka:4.3.1")))
 
