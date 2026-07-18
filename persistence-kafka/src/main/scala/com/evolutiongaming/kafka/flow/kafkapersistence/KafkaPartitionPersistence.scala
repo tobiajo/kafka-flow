@@ -45,7 +45,7 @@ object KafkaPartitionPersistence {
 
   private[kafkapersistence] final case class Stall[F[_]](timeout: FiniteDuration, monotonic: F[FiniteDuration])
 
-  // poll once (waiting up to the poll timeout) and fold the batch into the accumulator
+  // poll once; poll blocks up to the timeout
   private def pollFold[F[_]: FlatMap](
     consumer: SkafkaConsumer[F, String, ByteVector],
     acc: BytesByKey,
