@@ -111,8 +111,8 @@ already fenced the stale producer; rejected either way. Recovery reads `read_com
 fenced writer's aborted records are
 never recovered. After a hard crash the new owner takes over immediately (aborting the crashed
 owner's unfinished transaction) and recovers everything that was committed. If an unfinished
-transaction belongs to some other `transactional.id` (see the limitations for when that happens),
-recovery waits until the broker aborts it instead — slower, but nothing committed is ever missed.
+transaction is *foreign* - under a `transactional.id` no takeover inits (see the limitations for when
+that happens) - recovery waits until the broker aborts it instead — slower, but nothing committed is ever missed.
 
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
