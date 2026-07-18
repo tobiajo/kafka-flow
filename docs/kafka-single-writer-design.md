@@ -181,8 +181,9 @@ common case, the read bound (previous section) holds regardless.
 
 ### Stalled read: a deadline instead of a silent hang
 
-The recovery read waits by design, and two known Kafka limitations can keep it from ever reaching its
-target. The first is **truncation**: the log end regresses below the captured target — a leader
+The recovery read waits by design: it keeps polling until its `read_committed` position reaches the
+captured high-watermark target (Recovery read, above). Two known Kafka limitations can keep that
+position from ever reaching it. The first is **truncation**: the log end regresses below the captured target — a leader
 election lost acknowledged snapshot records — so the target is permanently unreachable. Kafka has
 closed the routine paths to this
 ([KIP-101](https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation)
