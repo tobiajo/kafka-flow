@@ -1,0 +1,185 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page { size: A4 landscape; margin: 6mm 7mm; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font: 7.5pt/1.15 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: #111; -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1 { font-size: 11.5pt; margin: 0 0 0.3mm; letter-spacing: .2px; }
+  .sub { font-size: 7.2pt; color: #444; margin: 0 0 1.3mm; }
+  .sub code { color: #222; }
+  h2 {
+    font-size: 7.8pt; margin: 1.5mm 0 .6mm; text-transform: uppercase;
+    letter-spacing: .6px; color: #333; border-bottom: 1px solid #b9b9b9; padding-bottom: .3mm;
+  }
+  h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: #777; font-size: 7pt; }
+  .mono, code { font-family: "SF Mono","DejaVu Sans Mono",Menlo,Consolas,monospace; }
+
+  /* colour utilities (shared) */
+  .ok   { color:#0a7d17; font-weight:700; }
+  .bad  { color:#b00020; font-weight:700; }
+  .warnc{ color:#b06a00; font-weight:700; }
+  .ev   { color:#7c3aed; font-weight:700; }
+  .adv  { color:#1d63c4; font-weight:700; }
+  .wait { color:#c07a00; font-weight:700; }
+  .loop { color:#555;    font-weight:700; }
+  .dim  { color:#666; }
+
+  /* control-flow pseudocode */
+  .flow {
+    font-family: "SF Mono","DejaVu Sans Mono",Menlo,Consolas,monospace;
+    font-size: 6.9pt; line-height: 1.24; color: #1a1a1a;
+    background: #f7f8fa; border: .5pt solid #cfd3d8; border-radius: 3px;
+    padding: 1.3mm 2.2mm; margin: 0; white-space: pre; overflow: hidden;
+  }
+  .flow .sec { color:#0a3d91; font-weight:700; }
+  .flow .bp  { color:#111; font-weight:700; }
+  .flow .k   { color:#7a3fa0; }
+  .flow .cm  { color:#6b7280; }
+  .flow .adv  { color:#1d63c4; font-weight:700; }
+  .flow .wait { color:#c07a00; font-weight:700; }
+  .flow .ok   { color:#0a7d17; font-weight:700; }
+  .flow .bad  { color:#b00020; font-weight:700; }
+  .flow .warn { color:#c07a00; font-weight:700; }
+  .flow .loop { color:#555; font-weight:700; }
+
+  /* timeline table */
+  .key { font-size:7pt; color:#333; margin:.5mm 0 .8mm; }
+  .key b{color:#000}
+  table.t { width:100%; border-collapse:collapse; table-layout:fixed; }
+  table.t th, table.t td { border:.4pt solid #b9b9b9; padding:.58mm 1mm; vertical-align:top; text-align:left; }
+  table.t th { background:#ececec; font-weight:600; font-size:7.2pt; }
+  table.t col.c0{width:16mm}
+  table.t td.tc { font-weight:700; white-space:nowrap; }
+  table.t td.tc .s { display:block; font-weight:400; color:#666; font-size:6.8pt; }
+  .hD{background:#eef3fb}.hA{background:#eaf7ec}.hB{background:#fdf1e2}.hC{background:#fbecec}
+  .cD{background:#f4f8fe}.cA{background:#f5fbf6}.cB{background:#fefaf4}.cC{background:#fdf5f5}
+
+  /* logs */
+  table.log { width:100%; border-collapse:collapse; table-layout:fixed; }
+  table.log th, table.log td { border:.4pt solid #b9b9b9; padding:.55mm 1mm; vertical-align:top; text-align:left; }
+  table.log th { background:#ececec; font-weight:600; font-size:7.2pt; }
+  table.log col.l0{width:16mm} table.log col.l1{width:15mm}
+  .lvl { font-size:6.8pt; font-weight:700; padding:0 1.2mm; border-radius:2px; color:#fff; white-space:nowrap; }
+  .lvl.w{background:#b06a00}.lvl.i{background:#5a6572}.lvl.e{background:#b00020}.lvl.d{background:#8a8f98}
+  .logmsg { font-family:"DejaVu Sans Mono",monospace; font-size:6.7pt; color:#1a1a1a; }
+  .logmsg em { color:#0a55c4; font-style:normal; }
+
+  .note { font-size:7pt; line-height:1.14; color:#2a2a2a; margin:1.1mm 0 0; padding:0; list-style:none; }
+  .note li { margin:0 0 .3mm; padding-left:3.4mm; text-indent:-3.4mm; }
+  .note b{color:#000}
+</style>
+</head>
+<body>
+  <h1>Transactional recovery read — stall cheat sheet</h1>
+  <p class="sub">
+    <code>KafkaPartitionPersistence</code> · <code>read_committed</code> drain to the captured high&#8209;watermark ·
+    poll <b>10&nbsp;ms</b> · deadline <b>3&nbsp;min</b> · legit wait <b>~70&nbsp;s</b> (txn.timeout&nbsp;60&nbsp;s + abort&nbsp;scan&nbsp;10&nbsp;s) ·
+    worked example <b>HW&nbsp;=&nbsp;1000</b>
+  </p>
+
+  <h2>Control flow <span class="hint">one loop, two kinds of turn, two exits</span></h2>
+<pre class="flow"><span class="sec">SETUP</span> (once, before the loop)
+  <span class="bp">B1</span>  highWatermark    = endOffsets(<span class="k">read_uncommitted</span>)      <span class="cm">· the high watermark</span>
+  <span class="bp">B2</span>  lastStableOffset = endOffsets(<span class="k">read_committed</span>)        <span class="cm">· the LSO (reader's own end)</span>
+  <span class="bp">B3</span>  if lastStableOffset &lt; highWatermark   →  <span class="warn">WARN</span> "recovery waits for open transaction(s)"
+  <span class="bp">B4</span>  targetOffset     = highWatermark                <span class="cm">· the target: captured once, fixed for the read (never the LSO)</span>
+
+<span class="sec">LOOP</span>  (tailRecM · one turn ≈ 10 ms)
+  <span class="bp">B5</span>  offset = position()
+      └─ if offset ≥ targetOffset ───────────────────►  <span class="ok">EXIT ✓  read complete</span>
+  <span class="bp">B6</span>  advanced?  (offset ≠ last.position)
+      ├─ <b>YES</b> → <span class="adv">ADVANCING turn</span> · reset clock (progressAt = now)
+      └─ <b>NO</b>  → <span class="wait">WAITING turn</span> · <span class="bp">B7</span> if now − progressAt ≥ 3 min ──►  <span class="bad">EXIT ✗  B8 RecoveryReadStalledError</span>
+                                                    <span class="cm">B9 logEnd &lt; target ? truncation : outlived</span>
+                              else · every 5 s → INFO "no progress …"
+  <span class="loop">↻</span>   both turns end:  poll(10.millis) ; fold batch ──────────►  <span class="loop">back to B5</span>
+</pre>
+
+  <h2>Timeline — four scenarios side by side <span class="hint">a walk through the loop above</span></h2>
+  <p class="key">
+    <b>target</b> = high watermark, captured once at B1/B4 and held constant ·
+    <span class="loop">↻</span> = the loop, one per ~10&nbsp;ms turn ·
+    <span class="adv">advancing turn (B6)</span> poll→batch, position climbs ·
+    <span class="wait">waiting turn (B7)</span> poll→empty, position frozen, clock ticks
+  </p>
+  <table class="t">
+    <colgroup><col class="c0"><col><col><col><col></colgroup>
+    <thead><tr>
+      <th>wall clock</th>
+      <th class="hD">D — no wait <span class="dim">(takeover-abort)</span></th>
+      <th class="hA">A — awaiting open txn <span class="dim">(resolves)</span></th>
+      <th class="hB">B — hanging transaction</th>
+      <th class="hC">C — truncation</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td class="tc">0<span class="s">entry</span></td>
+        <td class="cD">B1–B4: LSO 1000 = HW → <b>no warn</b>, target 1000 <span class="dim">(own txn aborted at takeover)</span></td>
+        <td class="cA">B1–B4: LSO 950 <code>&lt;</code> HW 1000 → <span class="warnc">WARN</span>, target 1000</td>
+        <td class="cB">same: LSO 950 → <span class="warnc">WARN</span>, target 1000</td>
+        <td class="cC">LSO 1000 = HW → <b>no warn</b>, target 1000</td>
+      </tr>
+      <tr>
+        <td class="tc">0–~50 ms<span class="s">climb</span></td>
+        <td class="cD"><span class="loop">↻</span> <span class="adv">advancing turns (B6)</span> · <code>position</code> 0→1000 → <b>B5 exit</b> <span class="ok">✓ complete @1000</span> <span class="dim">(only advancing turns — never B7)</span></td>
+        <td class="cA"><span class="loop">↻</span> <span class="adv">advancing turns (B6)</span> · <code>position</code> 0→950, each poll a batch</td>
+        <td class="cB"><span class="loop">↻</span> <span class="adv">advancing turns (B6)</span> · <code>position</code> 0→950</td>
+        <td class="cC"><span class="loop">↻</span> <span class="adv">advancing turns (B6)</span> · climbing… <span class="ev">⚡ election → log end 900</span></td>
+      </tr>
+      <tr>
+        <td class="tc">first stall<span class="s">(no log yet)</span></td>
+        <td class="cD dim">— done —</td>
+        <td class="cA"><span class="wait">waiting turn (B7)</span> begins · stuck@950, <code>stalledFor</code>=0</td>
+        <td class="cB"><span class="wait">waiting turn (B7)</span> · stuck@950</td>
+        <td class="cC"><span class="wait">waiting turn (B7)</span> · stuck@900 (nothing past 900)</td>
+      </tr>
+      <tr>
+        <td class="tc">5 s → 70 s<span class="s">steady loop</span></td>
+        <td class="cD dim">— done —</td>
+        <td class="cA"><span class="loop">↻</span> <span class="wait">waiting turns (B7)</span> ≈500×/5 s · <code>poll(10ms)</code> empty, <code>position</code> frozen, B8 false · every 5 s → INFO "… Ns"</td>
+        <td class="cB">same @950</td>
+        <td class="cC">same @900</td>
+      </tr>
+      <tr>
+        <td class="tc">≈70 s</td>
+        <td class="cD dim">— done —</td>
+        <td class="cA"><span class="ev">⚡ txn resolves</span> → <span class="adv">advancing turn</span>: poll returns 950–999 → <code>position</code> 1000 → <b>B5 exit</b> <span class="ok">✓ complete @1000</span></td>
+        <td class="cB">still <span class="wait">waiting</span> @950 &nbsp;<span class="dim">(↻ INFO every 5 s, B8 false)</span></td>
+        <td class="cC">still <span class="wait">waiting</span> @900 &nbsp;<span class="dim">(↻ INFO every 5 s)</span></td>
+      </tr>
+      <tr>
+        <td class="tc">180 s<span class="s">deadline</span></td>
+        <td class="cD dim">— done —</td>
+        <td class="cA dim">— done —</td>
+        <td class="cB"><span class="wait">waiting turn</span> · <code>stalledFor&#8805;3min</code> → <b>B8</b> <span class="bad">✗</span> → B9 <code>logEnd 1000 &#8805; target</code> → <b>"outlived deadline"</b> → <code>RecoveryReadStalledError@950</code></td>
+        <td class="cC">→ <b>B8</b> <span class="bad">✗</span> → B9 <code>logEnd 900 &lt; target</code> → <b>"truncation"</b> → <code>…@900</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>What you see in the logs <span class="hint">verbatim; <em style="color:#0a55c4">blue</em> = interpolated values</span></h2>
+  <table class="log">
+    <colgroup><col class="l0"><col class="l1"><col></colgroup>
+    <thead><tr><th>at</th><th>level</th><th>message</th></tr></thead>
+    <tbody>
+      <tr><td><b>B3</b> start</td><td><span class="lvl w">WARN</span></td><td class="logmsg">Snapshot topic <em>&lt;t&gt;</em> partition <em>&lt;p&gt;</em> recovery waits for open transaction(s): last-stable-offset <em>&lt;LSO&gt;</em> below target <em>&lt;HW&gt;</em>; normally resolves within the pinning producer's transaction.timeout.ms plus the broker's abort scan</td></tr>
+      <tr><td><b>B7</b> waiting</td><td><span class="lvl i">INFO</span></td><td class="logmsg">Snapshot topic read making no progress at offset <em>&lt;o&gt;</em>, target <em>&lt;t&gt;</em>, stalled for <em>&lt;N&gt;</em>s &nbsp;<span style="color:#6b7280">(repeats every 5&nbsp;s)</span></td></tr>
+      <tr><td><b>B8</b> fail</td><td><span class="lvl e">ERROR</span></td><td class="logmsg">recovery read of <em>&lt;tp&gt;</em> made no progress at offset <em>&lt;pos&gt;</em>, short of target <em>&lt;target&gt;</em>, past the stall deadline - failing rather than hanging or silently recovering possibly incomplete state; <em>&lt;diagnosis&gt;</em></td></tr>
+      <tr><td><b>B9</b> ↳ trunc.</td><td><span class="lvl d">diag</span></td><td class="logmsg">the log end regressed to <em>&lt;logEnd&gt;</em>, below the captured target: log truncation after an unclean leader election - acknowledged snapshot records are lost</td></tr>
+      <tr><td><b>B9</b> ↳ outlived</td><td><span class="lvl d">diag</span></td><td class="logmsg">the log end <em>&lt;logEnd&gt;</em> still covers the target: an open transaction outlived the deadline - … detect and abort it with kafka-transactions.sh</td></tr>
+    </tbody>
+  </table>
+
+  <ul class="note">
+    <li><b>Every scenario runs the same loop</b> — each turn is either an <span class="adv">advancing turn</span> (B6: poll returned a batch, position climbs) or a <span class="wait">waiting turn</span> (B7: poll came back empty, position frozen, clock ticks). <b>D is all advancing turns; A/B/C add a run of waiting turns.</b></li>
+    <li><b>A ≡ B</b> until 70 s — identical waiting-turn runs; the only difference is whether a poll returns records before the clock reaches B8. No separate "hang" detector — the deadline is it, discovered late on an ordinary turn, never a scheduled wake-up.</li>
+    <li><b>B vs C</b> differ only at B3 (warn fires / silent) and B9 (<code>logEnd</code> vs target). Reader is <b>group-less</b>, so <code>max.poll.interval.ms</code> eviction can't unwind the loop — only <span class="ok">✓</span> B5 (records) or <span class="bad">✗</span> B8 (deadline) exits it.</li>
+  </ul>
+</body>
+</html>
