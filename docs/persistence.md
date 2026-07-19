@@ -142,6 +142,13 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   the legitimate wait for an unfinished transaction (`transaction.timeout.ms` plus the broker's
   abort scan — the prefix-change wait below); the mode warns at module acquisition if either bound
   is broken.
+- **Preventing truncation** — the deadline only *flags* lost records; it cannot recover them, and it
+  catches truncation only while a recovery read is in flight (a truncation between reads is adopted
+  silently by the next recovery). So prevent it at the broker: keep the snapshot topic durable with
+  `unclean.leader.election.enable=false` (the default), `min.insync.replicas` ≥ 2, and a replication
+  factor ≥ 3 — the transactional producer already forces `acks=all`. An acknowledged snapshot then
+  survives any single broker failure; truncation requires an opted-in unclean election or a disaster
+  beyond the replication factor.
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
