@@ -211,7 +211,8 @@ which the takeover-abort collapses to sub-second for the partition's own — so 
 that wait and below `max.poll.interval.ms`: high enough not to fire during a legitimate wait, low
 enough to fire before the member is evicted. It is the fallback for a wait that never resolves.
 Failing also heals: the reading consumer is group-less, so eviction never unwinds the stuck thread
-but the error frees it, and the restarted recovery captures a fresh, reachable target — behind a
+but the error frees it, and the restarted recovery captures a fresh target — after a truncation it
+completes, but over the shortened log, so the loss stands until an operator acts (below); behind a
 hanging transaction, loudly again until the pin is cleared.
 
 The failure is diagnosed by re-reading the log end, because the two causes need opposite responses:
