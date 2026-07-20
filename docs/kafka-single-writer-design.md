@@ -34,7 +34,9 @@ sequenceDiagram
     Note over ST,B: next recovery folds from 151<br/>onto stale @100 — corruption
 ```
 
-## Mechanism: generation fencing
+## Mechanism
+
+### Generation fencing
 
 In the default (non-transactional) mode the input offsets are committed through the **Kafka consumer**
 (the ordinary consumer-group offset commit). In this mode they are committed through the snapshot
@@ -122,7 +124,7 @@ The unknown (negative) pre-join generation is never published — the coordinato
 validation for a commit carrying it, so it would land unfenced; a flush before the first join instead
 fails loudly rather than committing ungated.
 
-## Recovery read: bounded by the high watermark
+### Recovery read: bounded by the high watermark
 
 An open transaction on the snapshot topic distorts what a `read_committed` reader may see: the
 consumer's own `endOffsets` is the **last-stable-offset** (LSO) — the minimum of the high watermark and
@@ -148,7 +150,7 @@ misdirected at the snapshot topic — and there waiting is the only correct beha
 (`transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s): ~70 s at Kafka's
 default timeout.
 
-## Stable transactional.id: the takeover aborts unfinished transactions
+### Stable transactional.id: the takeover aborts unfinished transactions
 
 Each partition's producer uses a **stable** `transactional.id`, `"<prefix>-<partition>"` — a scheme
 whose cost, a producer per partition, this mode pays anyway. Every owner of a partition shares its
@@ -179,7 +181,7 @@ batch typically commits in well under a second.
 The completeness of recovery does not depend on any naming assumption: the id discipline buys the sub-second
 common case, the read bound (previous section) holds regardless.
 
-## Stalled read: a deadline instead of a silent hang
+### Stalled read: a deadline instead of a silent hang
 
 The recovery read waits by design: it keeps polling until its `read_committed` position reaches the
 captured high-watermark target (Recovery read, above). Two known Kafka failure modes can keep that
@@ -226,7 +228,7 @@ Only the transactional mode enables the deadline: waiting is part of its read se
 unbounded wait is reachable there. Plain caching's unbounded read is long-shipped behaviour;
 changing a stable mode's failure semantics is a separate decision.
 
-## Consumer rebalance protocols
+### Consumer rebalance protocols
 
 The per-member fencing token is the **generation** under the classic protocol and the **member epoch**
 under the consumer protocol
@@ -261,7 +263,7 @@ acknowledges the revocation — under both, the flush commits. Classic **coopera
 the member to the new generation by revoke time, so its flush is always fenced (safe; the new owner
 replays). A member evicted before the flush is rejected under all three — the same safe direction.
 
-## Write path: group-committed transactions
+### Write path: group-committed transactions
 
 A producer allows one transaction at a time, while kafka-flow flushes a partition's keys in
 parallel — and after a fresh assignment most of the active key population flushes in one wave per
