@@ -174,7 +174,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     val eventsA    = (1 to 5).toList.map(i => s"e$i")
     val eventsB    = (1 to 10).toList.map(i => s"e$i")
 
-    // each flow gets its own generation: flow A (the previous owner) a stale one, flow B (the new owner) the current one
+    // each flow gets its own generation: flow A (previous owner) a stale one, flow B (new owner) the current one
     def allocateFlow(
       moduleOf: KafkaPersistenceModuleOf[IO, String],
       groupMetadata: IO[Option[ConsumerGroupMetadata]],
@@ -415,7 +415,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     } yield {
       result match {
         case Left(e) =>
-          // even the first write carries the seeded offset, so the stale generation is rejected with CommitFailedException
+          // even the first write carries the seeded offset, so the stale generation is rejected (CommitFailedException)
           val chain = causeChain(e)
           assert(
             chain.exists(_.isInstanceOf[CommitFailedException]),

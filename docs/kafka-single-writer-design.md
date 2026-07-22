@@ -41,7 +41,7 @@ Two mechanisms carry the design: the generation fence stops a stale owner's writ
 the high-watermark-bounded recovery read keeps recovery complete where no fence is violated. The
 stable `transactional.id` keeps that read's ordinary wait sub-second, and the stall deadline bounds
 a wait that never resolves; the remaining sections trace the fence across rebalance protocols and
-the write path's group commit.
+detail the write path's group commit.
 
 ### Generation fencing
 
