@@ -90,7 +90,9 @@ Key points:
 
 - **Every** transaction commits the partition's current committable offset, so every write is gated. The
   offset itself advances only on the periodic offset-commit interval (`commitOffsetsInterval`, separate
-  from the snapshot-flush interval `persistEvery`) or on revoke; a snapshot write never advances it —
+  from the snapshot-flush interval `persistEvery`); on revoke the committed offset moves forward only
+  with `commitOnRevoke` or a `flushOnRevoke` flush (both off by default). A snapshot write never
+  advances it —
   the write just re-commits the current value to stay gated. That advance is committed in a
   transaction — batching in any snapshot writes queued at that moment, or committing the offset
   alone (an *offset-only* transaction) when there are none.
