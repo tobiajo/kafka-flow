@@ -154,7 +154,9 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   Cluster-side, the matching broker alerts are `UncleanLeaderElectionsPerSec > 0` (truncation risk)
   and `PartitionsWithLateTransactionsCount > 0` (hanging transactions). Consumer lag metrics read
   zero during the wait or stall (lag is measured to the last-stable-offset, where the read parks),
-  so alert on this mode's log signals, not on lag. Keep the value well below `max.poll.interval.ms` and above
+  so alert on this mode's log signals, not on lag. Keep the value well below `max.poll.interval.ms` — with
+  headroom for the on-failure diagnostic re-read (up to the snapshot consumer's `default.api.timeout.ms`,
+  ~60 s), which runs after the deadline fires and must also finish before the poll interval — and above
   the legitimate wait for an unfinished transaction (`transaction.timeout.ms` plus the broker's
   abort scan).
 - **Reducing truncation risk** — the deadline only *flags* lost records; it cannot recover them, and it
