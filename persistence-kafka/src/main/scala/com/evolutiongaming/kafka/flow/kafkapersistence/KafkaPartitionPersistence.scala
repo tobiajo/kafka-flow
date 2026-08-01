@@ -121,18 +121,34 @@ object KafkaPartitionPersistence {
     case _ => map // ignore records with no key for now
   }
 
+  /** Reads a snapshot partition to its end.
+    *
+    * @param partition
+    *   the snapshot-topic partition to read - the state partition the mapper points the owner at
+    * @param inputPartition
+    *   the input partition being recovered, used only to name the ephemeral readers
+    */
   private[kafkapersistence] def readSnapshots[F[_]: BracketThrowable: Log](
     consumerOf: ConsumerOf[F],
     consumerConfig: ConsumerConfig,
     snapshotTopic: Topic,
     partition: Partition,
+    inputPartition: Partition,
     stall: Option[Stall[F]],
   )(implicit fromBytes: FromBytes[F, String]): F[BytesByKey] = {
     val snapshotsPartition         = TopicPartition(topic = snapshotTopic, partition = partition)
     val snapshotPartitionSingleton = data.NonEmptySet.of(snapshotsPartition)
 
     // ephemeral assign-based readers: never group members, never committing offsets - a committed offset
-    // would override the earliest reset on the next recovery and silently shorten the read
+    // would override the earliest reset on the next recovery and silently shorten the read.
+    // The suffix carries the INPUT partition, not the state partition being read: under a non-identity
+    // partition mapper several input partitions map to one state partition, and a JVM owning several of them
+    // recovers them concurrently (TopicFlow.add is a parTraverse_), so a state-partition suffix would build
+    // several live consumers sharing one client.id. That is silently lossy - the second consumer registers no
+    // kafka.consumer:* MBeans at all and logs nothing, and closing either one unregisters the shared app-info,
+    // taking the survivor's metrics with it. The input partition is unique per owner by construction.
+    // Note the parameter is the guard: suffixing by `partition` again leaves `inputPartition` unused, which
+    // the build's fatal warnings turn into a compile error.
     def suffixed(suffix: String): ConsumerConfig =
       consumerConfig.copy(
         groupId    = none,
@@ -152,7 +168,7 @@ object KafkaPartitionPersistence {
     val highWatermark: F[Offset] =
       consumerOf
         .apply[String, ByteVector](
-          suffixed(s"snapshot-$partition-hw").copy(isolationLevel = IsolationLevel.ReadUncommitted)
+          suffixed(s"snapshot-$inputPartition-hw").copy(isolationLevel = IsolationLevel.ReadUncommitted)
         )
         .use(endOffset)
 
@@ -163,7 +179,7 @@ object KafkaPartitionPersistence {
 
     capturedHighWatermark.flatMap { captured =>
       consumerOf
-        .apply[String, ByteVector](suffixed(s"snapshot-$partition").copy(autoOffsetReset = Earliest))
+        .apply[String, ByteVector](suffixed(s"snapshot-$inputPartition").copy(autoOffsetReset = Earliest))
         .use { consumer =>
           for {
             _ <- consumer.assign(snapshotPartitionSingleton)

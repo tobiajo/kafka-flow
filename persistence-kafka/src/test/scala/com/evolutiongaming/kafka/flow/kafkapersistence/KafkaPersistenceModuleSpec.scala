@@ -5,7 +5,7 @@ import cats.effect.unsafe.implicits.global
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.LogOf
-import com.evolutiongaming.kafka.flow.PartitionAssignment
+import com.evolutiongaming.kafka.flow.{FlowMetrics, PartitionAssignment}
 import com.evolutiongaming.skafka.consumer.{
   AutoOffsetReset,
   Consumer as SkafkaConsumer,
@@ -134,6 +134,60 @@ class KafkaPersistenceModuleSpec extends FunSuite {
       }
     }
     TestControl.executeEmbed(test).unsafeRunSync()
+  }
+
+  test("co-owners of one state partition get distinct recovery-consumer client ids") {
+    // A non-identity mapper points several input partitions at one state partition, and a JVM owning several of
+    // them recovers them concurrently (TopicFlow.add is a parTraverse_). Two live consumers sharing a client.id
+    // register one set of kafka.consumer:* MBeans between them, with no warning - so the ids must differ.
+    val statePartition = Partition.min
+    val tp             = TopicPartition("state-topic", statePartition)
+    val fakes          = new FakeConsumers(tp)
+    val test = for {
+      captured    <- Ref.of[IO, List[ConsumerConfig]](Nil)
+      positionRef <- Ref.of[IO, Long](0L)
+      // an empty partition: position 0 already meets the end offset, so each read returns without polling. The
+      // fake answers endOffsets for `tp` alone - state partition 0 - so a read that followed the input partition
+      // instead of the mapped one would fail with a missing offset, pinning that only the label moved.
+      readConsumer = fakes.consumer(endOffset = 0L, positionRef = positionRef, records = Nil)
+      inner        = fakes.consumerOf(readConsumer = readConsumer, hwConsumer = readConsumer)
+      capturingOf = new ConsumerOf[IO] {
+        def apply[K, V](
+          config: ConsumerConfig
+        )(implicit fromBytesK: FromBytes[IO, K], fromBytesV: FromBytes[IO, V]) =
+          Resource.eval(captured.update(_ :+ config)) *> inner(config)
+      }
+      moduleOf = KafkaPersistenceModuleOf.caching[IO, String](
+        consumerOf      = capturingOf,
+        producer        = Producer.empty[IO],
+        consumerConfig  = ConsumerConfig(common = CommonConfig(clientId = "client".some)),
+        snapshotTopic   = tp.topic,
+        metrics         = FlowMetrics.empty[IO],
+        partitionMapper = KafkaPersistencePartitionMapper.modulo(sourcePartitions = 2, statePartitions = 1),
+      )
+      _ <- List(Partition.unsafe(0), Partition.unsafe(1)).parTraverse_ { inputPartition =>
+        moduleOf
+          .make(
+            PartitionAssignment[IO](
+              topicPartition = TopicPartition("input-topic", inputPartition),
+              assignedAt     = Offset.min,
+              groupMetadata  = IO.pure(none[ConsumerGroupMetadata]),
+            )
+          )
+          .use(_.keysOf.all("app", "group", tp).toList.void)
+      }
+      configs <- captured.get
+    } yield {
+      val clientIds = configs.flatMap(_.common.clientId)
+      assertEquals(clientIds.size, configs.size, s"every recovery consumer must carry a client id: $configs")
+      assertEquals(
+        clientIds.distinct,
+        clientIds,
+        s"co-owners of one state partition shared a recovery-consumer client id: $clientIds",
+      )
+      assertEquals(clientIds.toSet, Set("client-snapshot-0", "client-snapshot-1"))
+    }
+    test.unsafeRunSync()
   }
 
 }

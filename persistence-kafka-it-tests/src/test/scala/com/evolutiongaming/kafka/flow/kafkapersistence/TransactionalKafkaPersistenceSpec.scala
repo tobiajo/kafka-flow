@@ -87,6 +87,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       consumerConfig = consumerConfig.copy(isolationLevel = IsolationLevel.ReadCommitted),
       snapshotTopic  = stateTopic,
       partition      = Partition.min,
+      inputPartition = Partition.min,
       stall          = stallTimeout.map(KafkaPartitionPersistence.Stall(_, IO.monotonic)),
     )
 

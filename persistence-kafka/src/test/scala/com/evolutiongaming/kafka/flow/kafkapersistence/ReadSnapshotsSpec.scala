@@ -71,6 +71,7 @@ class ReadSnapshotsSpec extends FunSuite {
         consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
         snapshotTopic  = topic,
         partition      = partition,
+        inputPartition = partition,
         stall = KafkaPartitionPersistence
           .Stall(KafkaPersistenceModule.TransactionalConfig.DefaultRecoveryStallTimeout, IO.monotonic)
           .some,
@@ -98,6 +99,7 @@ class ReadSnapshotsSpec extends FunSuite {
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
           snapshotTopic  = topic,
           partition      = partition,
+          inputPartition = partition,
           stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
         )
         .attempt
@@ -126,6 +128,7 @@ class ReadSnapshotsSpec extends FunSuite {
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
           snapshotTopic  = topic,
           partition      = partition,
+          inputPartition = partition,
           stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
         )
         .attempt
@@ -153,6 +156,7 @@ class ReadSnapshotsSpec extends FunSuite {
         consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
         snapshotTopic  = topic,
         partition      = partition,
+        inputPartition = partition,
         stall          = KafkaPartitionPersistence.Stall(300.millis, IO.monotonic).some,
       )
     } yield assertEquals(stored.keys.toList.sorted, (0 until 8).map(i => s"k$i").toList)
@@ -177,6 +181,7 @@ class ReadSnapshotsSpec extends FunSuite {
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
           snapshotTopic  = topic,
           partition      = partition,
+          inputPartition = partition,
           stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
         )
         .attempt
@@ -205,6 +210,7 @@ class ReadSnapshotsSpec extends FunSuite {
             consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
             snapshotTopic  = topic,
             partition      = partition,
+            inputPartition = partition,
             stall          = KafkaPartitionPersistence.Stall(12.seconds, IO.monotonic).some,
           )
           .attempt
@@ -236,6 +242,7 @@ class ReadSnapshotsSpec extends FunSuite {
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
           snapshotTopic  = topic,
           partition      = partition,
+          inputPartition = partition,
           stall = KafkaPartitionPersistence
             .Stall(KafkaPersistenceModule.TransactionalConfig.DefaultRecoveryStallTimeout, IO.monotonic)
             .some,
@@ -283,6 +290,7 @@ class ReadSnapshotsSpec extends FunSuite {
           consumerConfig = ConsumerConfig(),
           snapshotTopic  = topic,
           partition      = partition,
+          inputPartition = partition,
           stall          = none,
         )
         .timeout(1.minute)

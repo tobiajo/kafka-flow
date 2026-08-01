@@ -321,6 +321,9 @@ object KafkaPersistenceModule {
             consumerConfig = consumerConfig,
             snapshotTopic  = snapshotTopicPartition.topic,
             partition      = targetPartition,
+            // the readers are named by the input partition: co-owners of one state partition recover
+            // concurrently and must not share a client.id - see readSnapshots
+            inputPartition = snapshotTopicPartition.partition,
             stall          = stall,
           )
           .map { snapshots =>
