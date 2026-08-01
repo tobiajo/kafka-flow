@@ -76,8 +76,15 @@ object KafkaSnapshotWriteDatabase {
         groupMetadata,
       )
     } yield Transactional(
-      // identity only: the single-writer/offset-binding guarantee assumes one input partition maps to one snapshot
-      // partition owned by one writer; a non-identity mapper breaks that, so it is not configurable here
+      // identity only - but not because a mapper would break the fence, which it would not. The generation gate
+      // is per group member, so every owner stays fenced against its own stale predecessor, and
+      // sendOffsetsToTransaction binds each owner's own input partition, needing no exclusivity over the snapshot
+      // partition. What a non-identity mapper adds is an obligation this code cannot check: several legitimately
+      // live owners would then share one snapshot partition, and the only thing keeping them apart is
+      // `isStateKeyOwned` carving the keys into disjoint sets. It also couples recovery between siblings - a
+      // co-owner's OPEN transaction pins the partition's last-stable-offset against another owner's
+      // read_committed recovery read, and unlike a crashed predecessor's it is not aborted by initTransactions,
+      // since the transactional.ids differ. Until something needs N:1 here, the narrow contract is the safe one.
       writeDatabase  = apply(snapshotTopicPartition, KafkaPersistencePartitionMapper.identity, groupCommit.sendWrite),
       scheduleCommit = groupCommit.scheduleCommit,
     )
