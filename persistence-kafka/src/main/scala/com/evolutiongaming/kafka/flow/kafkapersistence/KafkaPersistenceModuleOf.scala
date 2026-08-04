@@ -2,6 +2,7 @@ package com.evolutiongaming.kafka.flow.kafkapersistence
 
 import cats.Parallel
 import cats.effect.{Async, Concurrent, Resource}
+import cats.syntax.all.*
 import com.evolutiongaming.catshelper.{LogOf, Runtime}
 import com.evolutiongaming.kafka.flow.{FlowMetrics, PartitionAssignment}
 import com.evolutiongaming.skafka.consumer.{ConsumerConfig, ConsumerOf}
@@ -51,14 +52,25 @@ object KafkaPersistenceModuleOf {
     override def make(
       assignment: PartitionAssignment[F]
     ): Resource[F, KafkaPersistenceModule[F, S]] =
-      KafkaPersistenceModule.caching(
-        consumerOf             = consumerOf,
-        producer               = producer,
-        consumerConfig         = consumerConfig,
-        snapshotTopicPartition = TopicPartition(snapshotTopic, assignment.topicPartition.partition),
-        metrics                = metrics,
-        partitionMapper        = partitionMapper,
-      )
+      // both factories check here, where the assignment names the input topic: the lower-level
+      // KafkaPersistenceModule constructors do not, and `caching` structurally cannot - it is handed the snapshot
+      // topic paired with an input partition number and never learns the topic's name
+      Resource.eval(
+        KafkaPersistenceModule.validateSourcePartitions(
+          consumerOf          = consumerOf,
+          consumerConfig      = consumerConfig,
+          inputTopicPartition = assignment.topicPartition,
+          partitionMapper     = partitionMapper,
+        )
+      ) *>
+        KafkaPersistenceModule.caching(
+          consumerOf             = consumerOf,
+          producer               = producer,
+          consumerConfig         = consumerConfig,
+          snapshotTopicPartition = TopicPartition(snapshotTopic, assignment.topicPartition.partition),
+          metrics                = metrics,
+          partitionMapper        = partitionMapper,
+        )
   }
 
   def caching[F[_]: LogOf: Concurrent: Parallel: Runtime, S](
@@ -78,14 +90,15 @@ object KafkaPersistenceModuleOf {
     * without deprecation.
     *
     * A transactional [[KafkaPersistenceModule]] factory that protects the snapshot topic from stale writers - see
-    * `KafkaPersistenceModule.cachingTransactional` for semantics and trade-offs. The input topic and consumer
-    * generation are supplied by the flow, so they are not part of `config`.
+    * `KafkaPersistenceModule.cachingTransactional` for semantics and trade-offs, including the `partitionMapper`
+    * contract. The input topic and consumer generation are supplied by the flow, so they are not part of `config`.
     */
   def cachingTransactional[F[_]: LogOf: Async: Parallel: Runtime, S](
     consumerOf: ConsumerOf[F],
     producerOf: ProducerOf[F],
     config: KafkaPersistenceModule.TransactionalConfig,
-    metrics: FlowMetrics[F] = FlowMetrics.empty[F],
+    metrics: FlowMetrics[F]                          = FlowMetrics.empty[F],
+    partitionMapper: KafkaPersistencePartitionMapper = KafkaPersistencePartitionMapper.identity,
   )(
     implicit fromBytesKey: FromBytes[F, String],
     fromBytesState: FromBytes[F, S],
@@ -94,12 +107,23 @@ object KafkaPersistenceModuleOf {
     override def make(
       assignment: PartitionAssignment[F]
     ): Resource[F, KafkaPersistenceModule[F, S]] =
-      KafkaPersistenceModule.cachingTransactional(
-        consumerOf = consumerOf,
-        producerOf = producerOf,
-        config     = config,
-        assignment = assignment,
-        metrics    = metrics,
-      )
+      // as in `caching` above, and before the module builds its producer: a wrong count fails the assignment
+      // rather than opening a transactional producer for a mapping that misplaces keys
+      Resource.eval(
+        KafkaPersistenceModule.validateSourcePartitions(
+          consumerOf          = consumerOf,
+          consumerConfig      = config.consumerConfig,
+          inputTopicPartition = assignment.topicPartition,
+          partitionMapper     = partitionMapper,
+        )
+      ) *>
+        KafkaPersistenceModule.cachingTransactional(
+          consumerOf      = consumerOf,
+          producerOf      = producerOf,
+          config          = config,
+          assignment      = assignment,
+          metrics         = metrics,
+          partitionMapper = partitionMapper,
+        )
   }
 }
