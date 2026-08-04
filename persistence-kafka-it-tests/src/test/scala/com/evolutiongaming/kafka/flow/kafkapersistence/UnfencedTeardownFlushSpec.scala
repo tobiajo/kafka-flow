@@ -258,11 +258,15 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
   private def eagerPartitionFlowConfig: PartitionFlowConfig =
     PartitionFlowConfig(triggerTimersInterval = 0.seconds, commitOffsetsInterval = 0.seconds)
 
-  /** What the scenario observed once the dying member's teardown flush had run to completion. */
+  /** What the scenario observed once the dying member's teardown flush had run to completion, and then once the next
+    * owner had built on whatever pair survived it.
+    */
   private case class Observed(
     snapshot: Option[String],
     committedOffset: Option[Long],
     nextOwnerStateBefore: Option[String],
+    nextOwnerSnapshot: Option[String],
+    nextOwnerCommittedOffset: Long,
   )
 
   /** Member A buffers 1,2,3 and stalls; B takes the partition over, persists "12345" and commits offset 6; A then dies
@@ -354,9 +358,9 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
                 committed <- committedOffset(group, inputTopic)
               } yield (snapshot, committed)
             }
-            // end to end: the next owner recovers from the surviving (snapshot, offset) pair
+            // end to end: the next owner recovers from the surviving (snapshot, offset) pair and builds on it
             _ <- produce(producer, key, "6")
-            stateBeforeC <- member(
+            afterNextOwner <- member(
               persistence         = persistence,
               group               = group,
               clientId            = "member-c",
@@ -367,11 +371,25 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
               partitionFlowConfig = eagerPartitionFlowConfig,
               fold                = foldOf(seenC, onPoison = IO.unit),
             ).use { _ =>
-              eventually("C recovered and processed record 6") {
-                seenC.get.map(_.collectFirst { case Seen(`key`, stateBefore, "6") => stateBefore })
-              }
+              for {
+                stateBefore <- eventually("C recovered and processed record 6") {
+                  seenC.get.map(_.collectFirst { case Seen(`key`, stateBefore, "6") => stateBefore })
+                }
+                // liveness gate only - the exact value is asserted by the tests. C is eager and persists before
+                // committing, so once it has committed past record 6 its own snapshot is durable too
+                offset <- eventually("C committed past record 6")(
+                  committedOffset(group, inputTopic).map(_.filter(_ > 6L))
+                )
+                snapshot <- storedSnapshot
+              } yield (stateBefore, snapshot, offset)
             }
-          } yield Observed(afterTeardown._1, afterTeardown._2, stateBeforeC)
+          } yield Observed(
+            snapshot                 = afterTeardown._1,
+            committedOffset          = afterTeardown._2,
+            nextOwnerStateBefore     = afterNextOwner._1,
+            nextOwnerSnapshot        = afterNextOwner._2,
+            nextOwnerCommittedOffset = afterNextOwner._3,
+          )
         ).guarantee(releaseAOnce.attempt.void)
       } yield observed
     }
@@ -395,6 +413,10 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
       // so the next owner recovers state "123" at offset 6: records 4 and 5 are never re-folded, and with a
       // correct store this would be Some("12345") - durable data loss
       assertEquals(clue(observed.nextOwnerStateBefore), "123".some)
+      // and it is not transient: the next owner persists the damaged aggregate and commits PAST record 6, so
+      // the offsets that would have re-delivered 4 and 5 are gone for good
+      assertEquals(clue(observed.nextOwnerSnapshot), "1236".some)
+      assertEquals(clue(observed.nextOwnerCommittedOffset), 7L)
     }
 
     test.unsafeRunSync()
@@ -413,8 +435,11 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
       // mechanism as the revoke-route prevention test, and the reason A's release still succeeds
       assertEquals(clue(observed.snapshot), "12345".some)
       assertEquals(clue(observed.committedOffset), 6L.some)
-      // and the next owner recovers the consistent pair - nothing is lost
+      // and the next owner recovers the consistent pair - nothing is lost - then carries it forward: every
+      // record up to the offset it commits is in the snapshot it persists
       assertEquals(clue(observed.nextOwnerStateBefore), "12345".some)
+      assertEquals(clue(observed.nextOwnerSnapshot), "123456".some)
+      assertEquals(clue(observed.nextOwnerCommittedOffset), 7L)
     }
 
     test.unsafeRunSync()
