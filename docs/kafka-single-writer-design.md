@@ -51,7 +51,7 @@ In the default (non-transactional) mode the input offsets are committed through 
 transaction** via
 `sendOffsetsToTransaction(offsets, consumerGroupMetadata)`
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics),
-brokers 2.5+):
+brokers 2.5+ — the API shipped in 2.5.0 as [KAFKA-9418](https://issues.apache.org/jira/browse/KAFKA-9418)):
 the group coordinator validates the consumer **generation** and rejects a commit from a stale one
 (`ILLEGAL_GENERATION`, surfaced to the client as `CommitFailedException`).
 Since that commit and the snapshot writes share a transaction, the rejection aborts the writes too.
@@ -205,8 +205,12 @@ The second is a **hanging transaction**: an LSO pin that no timeout ever clears
 ([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions)
 added the `kafka-transactions.sh` tool to detect and abort it);
 [KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)
-broker-side verification, on by default since Kafka 3.6, prevents the class, confining this cause to
-older or opted-out brokers.
+broker-side verification
+([`transaction.partition.verification.enable`](https://kafka.apache.org/36/generated/kafka_config.html#brokerconfigs_transaction.partition.verification.enable),
+default `true` since Kafka 3.6) prevents the class, confining this cause to older or opted-out
+brokers — and to 3.6.0, whose verification broke compressed produce
+([KAFKA-15653](https://issues.apache.org/jira/browse/KAFKA-15653), fixed in 3.6.1; Apache's 3.6.0
+upgrade note said upgrade or disable the feature), so the effective floor is 3.6.1.
 
 Both are rare, and silent when they hit: the unbounded read hangs the poll thread inside the
 rebalance callback, nothing crashes, and `max.poll.interval.ms` evicts the member while
@@ -242,7 +246,8 @@ inherits the same bounded target and its wait, without the deadline.
 The per-member fencing token is the **generation** under the classic protocol and the **member epoch**
 under the consumer protocol
 ([KIP-848](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol),
-GA in Kafka 4.0, selected by `group.protocol=consumer`); they play the same role, and *generation* below
+GA in Kafka 4.0 — shipped as [KAFKA-14048](https://issues.apache.org/jira/browse/KAFKA-14048) —
+selected by `group.protocol=consumer`); they play the same role, and *generation* below
 stands for both. The fence holds under both protocols and surfaces identically — a stale transactional
 commit is rejected as `ILLEGAL_GENERATION` under each (the coordinator maps the consumer protocol's
 internal stale-epoch error to the same wire error). The post-poll read (above) is what makes the
@@ -262,7 +267,8 @@ between the broker-side bump and this member completing the round still carries 
 generation. Under the consumer protocol the epoch also advances *between* polls, so even a fresh
 post-poll read can be stale by the time the commit reaches the broker.
 [KIP-1251](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1251%3A+Assignment+epochs+for+consumer+groups)
-(brokers 4.3.0+) absorbs the consumer-protocol window — the coordinator accepts a lagging commit for a
+(brokers 4.3.0+, shipped as [KAFKA-20066](https://issues.apache.org/jira/browse/KAFKA-20066)) absorbs
+the consumer-protocol window — the coordinator accepts a lagging commit for a
 partition the member still owns, and a reassigned one stays fenced — hence `group.protocol=consumer`
 is recommended only with such brokers (below 4.3.0 its window is the wider one); no broker version
 absorbs the classic in-flight-round window.

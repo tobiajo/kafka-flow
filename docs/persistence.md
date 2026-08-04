@@ -111,7 +111,8 @@ discriminator (e.g. the input topic) or the flows share ids and fence each other
 Snapshot writes and the input-offset commit run in one Kafka transaction per assigned partition; a
 write from a stale consumer generation is fenced by the broker
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics),
-brokers 2.5+) and surfaces as
+brokers 2.5+ — the sendOffsets API shipped in 2.5.0 as
+[KAFKA-9418](https://issues.apache.org/jira/browse/KAFKA-9418)) and surfaces as
 `CommitFailedException` — or as a producer-epoch error (`ProducerFencedException` or
 `InvalidProducerEpochException`, by transaction protocol version) when a new owner's `initTransactions` has
 already fenced the stale producer; rejected either way. Recovery reads `read_committed`, so a
@@ -138,6 +139,14 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   records). A rolling deploy is safe; while the two modes coexist a non-transactional instance is not
   fenced — the same exposure you already have without this mode, gone once every instance is
   transactional.
+- **Rolling back is not symmetric** — once this mode has run, the snapshot topic holds the aborted
+  records of fenced writers, and the plain `caching` module reads with whatever `isolationLevel` its
+  `consumerConfig` carries (skafka defaults to `read_uncommitted`; only this mode forces
+  `read_committed`). Recovery applies records in offset order, last one wins, so an aborted stale
+  snapshot sitting above the committed newer one would win — recovering exactly the state this mode
+  exists to reject. **Roll back with `isolationLevel = IsolationLevel.ReadCommitted` on the plain
+  module's `consumerConfig`**, which is correct against a topic written either way and stays correct
+  once the aborted records compact away.
 - **Recovery fails loudly rather than hangs** — a recovery read that makes no progress for
   `recoveryStallTimeout` (default 3 min) fails with `RecoveryReadStalledError` instead of hanging the
   rebalance until the member is silently evicted at `max.poll.interval.ms`. The error names its
@@ -147,8 +156,13 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   exceeds the deadline heals on its own once the broker aborts it; a *hanging* transaction,
   whose last-stable-offset pin never clears, is detected and aborted with the `kafka-transactions.sh` tool
   ([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions));
-  brokers 3.6+ prevent it from arising by default
-  ([KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)).
+  brokers 3.6.1+ prevent it from arising by default — the broker config is
+  [`transaction.partition.verification.enable`](https://kafka.apache.org/36/generated/kafka_config.html#brokerconfigs_transaction.partition.verification.enable),
+  `true` unless someone opted out
+  ([KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense);
+  3.6.0 shipped it too, but its verification broke compressed produce —
+  [KAFKA-15653](https://issues.apache.org/jira/browse/KAFKA-15653), fixed in 3.6.1 — and Apache's
+  3.6.0 upgrade note said upgrade or disable the feature).
   If the diagnosis comes back undetermined (the high-watermark re-read itself failed), fall back to
   the broker alerts that follow.
   Cluster-side, the matching broker alerts are `UncleanLeaderElectionsPerSec > 0` (truncation risk)
@@ -186,7 +200,8 @@ Limitations:
 - The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
   a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols
-  (`group.protocol=classic|consumer`). With `consumer`, use **brokers 4.3.0+** — below that a still-valid
+  (`group.protocol=classic|consumer`). With `consumer`, use **brokers 4.3.0+**
+  ([KAFKA-20066](https://issues.apache.org/jira/browse/KAFKA-20066)) — below that a still-valid
   owner can be spuriously fenced during a rebalance and crash; the restart converges, but any later
   rebalance can fence again (safe, never corruption, but not stable).
 
