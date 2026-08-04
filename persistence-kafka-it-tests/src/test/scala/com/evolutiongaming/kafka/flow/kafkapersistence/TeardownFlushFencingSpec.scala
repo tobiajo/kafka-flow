@@ -1,6 +1,6 @@
 package com.evolutiongaming.kafka.flow.kafkapersistence
 
-import cats.data.NonEmptyList
+import cats.data.{NonEmptyList, NonEmptyMap}
 import cats.effect.unsafe.IORuntime
 import cats.effect.{Deferred, IO, Ref, Resource}
 import cats.syntax.all.*
@@ -20,21 +20,47 @@ import com.evolutiongaming.kafka.flow.{
   TopicFlowOf
 }
 import com.evolutiongaming.retry.Retry
-import com.evolutiongaming.skafka.consumer.{AutoOffsetReset, ConsumerConfig, ConsumerOf, ConsumerRecord, IsolationLevel}
-import com.evolutiongaming.skafka.producer.{Producer, ProducerConfig, ProducerOf, ProducerRecord}
-import com.evolutiongaming.skafka.{CommonConfig, Partition}
+import com.evolutiongaming.skafka.consumer.{
+  AutoOffsetReset,
+  ConsumerConfig,
+  ConsumerGroupMetadata,
+  ConsumerOf,
+  ConsumerRecord,
+  IsolationLevel
+}
+import com.evolutiongaming.skafka.producer.{Producer, ProducerConfig, ProducerOf, ProducerRecord, RecordMetadata}
+import com.evolutiongaming.skafka.{
+  ClientMetric,
+  CommonConfig,
+  OffsetAndMetadata,
+  Partition,
+  PartitionInfo,
+  ToBytes,
+  Topic,
+  TopicPartition
+}
 import org.apache.kafka.clients.admin.{AdminClient, AdminClientConfig}
+import org.apache.kafka.common.Uuid
+import org.apache.kafka.common.errors.{InvalidProducerEpochException, ProducerFencedException}
 import scodec.bits.ByteVector
 
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 import scala.concurrent.duration.*
 
-/** Characterizes the DEFAULT (non-transactional) Kafka persistence on the error-path teardown route: the flush that
-  * runs when the stream tears down is completely unfenced, so a dying instance can overwrite the new owner's fresher
-  * snapshot AFTER the partition has already moved - the corruption shape of
-  * https://github.com/evolution-gaming/kafka-flow/issues/732, produced here through a live rebalance and the untouched
-  * production machinery (`KafkaFlow` + `kafkaEagerRecovery` + `KafkaPersistenceModuleOf`).
+/** Proves the transactional Kafka persistence fences a stale flush on the error-path TEARDOWN route, through a live
+  * rebalance and the untouched production machinery (`KafkaFlow` + `kafkaEagerRecovery` +
+  * `KafkaPersistenceModuleOf.cachingTransactional`).
+  *
+  * The route matters because it is not the one the existing #732 prevention tests cover. Those drive the revoke
+  * callback with two `PartitionFlow`s over one partition and a fabricated stale generation
+  * (`TransactionalKafkaPersistenceSpec`); here a real broker evicts a real member, and what flushes afterwards is
+  * kafka-flow's teardown path rather than its revocation path. On the default last-write-wins persistence that flush
+  * would land unfenced and overwrite the new owner's fresher snapshot - the corruption shape of
+  * https://github.com/evolution-gaming/kafka-flow/issues/732. That exposure is documented and accepted
+  * (`docs/persistence.md`, "Protecting against stale snapshot writes"), and already has a reproduction in
+  * `TransactionalKafkaPersistenceSpec`, so it is not re-asserted here; this spec pins the mode that is supposed to be
+  * safe on a route where its safety was previously inference.
   *
   * The mechanism, each step in source:
   *   1. member A's poll loop stalls in a fold (any stall - long processing, GC, blocked I/O) past
@@ -48,32 +74,25 @@ import scala.concurrent.duration.*
   *      including the partition the broker already gave away, because teardown has no way to know it was kicked;
   *   1. releasing the partition flow releases its key flows, and `TimerFlowOf`'s flush-on-release flushes A's STALE
   *      buffered state (`TimerFlowOf.flushOnCancel`);
-  *   1. the write path decides the outcome, which is what the two tests below separate.
+  *   1. the write path decides the outcome - here, a transaction the broker rejects.
   *
-  * A's teardown offset commit does NOT clobber B's (the broker rejects a commit from a kicked member -
-  * `CommitFailedException`, swallowed in `TopicFlow.commitPending`), which is exactly what makes the surviving pair
-  * (stale snapshot, newer offset) silently corrupt in the unfenced case.
+  * What the test asserts, beyond that the fresher snapshot survives:
+  *   - the flush was ATTEMPTED and REJECTED, observed through A's own snapshot writer (`recording`). Without that, a
+  *     passing prevention assertion could equally mean no flush ever happened;
+  *   - which fence fires: the PRODUCER EPOCH, not the generation. Under the partition's shared stable
+  *     `transactional.id` the new owner's `initTransactions` has already bumped the epoch, so the broker rejects the
+  *     flush before it reaches the generation-gated offset commit (which would raise `CommitFailedException` instead);
+  *   - the next owner's own durable outcome, which states the invariant positively: every record up to the offset it
+  *     commits is in the snapshot it persists.
   *
-  * The two tests run the same scenario and differ only in the persistence and the expected outcome, mirroring the
-  * repro/prevention pair of `TransactionalKafkaPersistenceSpec` for the revoke-time flush. What this route adds over
-  * that pair is that the ownership overlap is not simulated - a real broker evicts a real member - and that the
-  * surviving (snapshot, offset) pair and the next owner's own durable outcome are both asserted, which is what shows
-  * the loss to be unrecoverable rather than transient:
-  *   - `caching` (the default): a plain `producer.send` with no fence of any kind (`KafkaSnapshotWriteDatabase.of`), so
-  *     the stale snapshot lands after B's fresher one and, the snapshot topic being compacted, becomes the recovery
-  *     value - while the committed input offset stays at B's newer one. The records between the two snapshots are never
-  *     re-folded: durable data loss. That is documented, accepted behavior rather than a fix waiting to happen -
-  *     last-write-wins stays exposed by design and the transactional mode is the protection (`docs/persistence.md`,
-  *     "Protecting against stale snapshot writes"). Its assertions therefore characterize what the mode currently does;
-  *     invert them to the transactional ones only if the default mode ever gains a fence.
-  *   - `cachingTransactional`: the same flush is a transaction the broker rejects, so B's snapshot survives and the
-  *     next owner loses nothing. On this route that was previously inference: the existing #732 prevention test covers
-  *     the revoke callback, and the fence that fires here turns out to be the producer epoch, not the generation.
+  * A's teardown offset commit does not clobber B's either (the broker rejects a commit from a kicked member -
+  * `CommitFailedException`, swallowed in `TopicFlow.commitPending`), so on the unfenced write path the surviving pair
+  * would be a stale snapshot at a newer offset: silent loss. That is what the fence prevents here.
   *
-  * One thing the route does expose as narrowly fixable, independently of the write path: teardown flushes EVERY cached
+  * One thing the route exposes as narrowly fixable, independently of the write path: teardown flushes EVERY cached
   * partition, where the revocation path (`TopicFlow.remove`) knows which partitions are gone. Not attempted here.
   */
-class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
+class TeardownFlushFencingSpec extends ForAllKafkaSuite {
   implicit val ioRuntime: IORuntime = IORuntime.global
   implicit val logOf: LogOf[IO]     = LogOf.slf4j[IO].unsafeRunSync()
   implicit val log: Log[IO]         = logOf(this.getClass).unsafeRunSync()
@@ -97,65 +116,77 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
     autoOffsetReset = AutoOffsetReset.Earliest,
   )
 
-  /** The persistence a member runs on: the only difference between the two tests below.
+  /** Every member gets the partition's stable `transactional.id`, so a takeover fences the previous owner twice over:
+    * the new owner's `initTransactions` bumps the shared id's producer epoch, and the generation the previous owner's
+    * writes bind an offset commit to is no longer current (KIP-447). The epoch fence is the one that fires here - see
+    * `writeOutcomes` and the test below.
     *
-    * @param isolationLevel
-    *   how the test observes the snapshot topic - the same level the persistence's own recovery reads with, so an
-    *   observation cannot see more than a recovering member would.
+    * @param producerOf
+    *   the module's snapshot-writer factory, so a member's writes can be observed (see `recording`).
     */
-  private case class Persistence(
-    moduleOf: (String, String) => Resource[IO, KafkaPersistenceModuleOf[IO, String]],
-    isolationLevel: IsolationLevel,
-  )
-
-  /** The default persistence: a plain producer per member, snapshot writes are unfenced `producer.send`s. */
-  private val cachingPersistence = Persistence(
-    moduleOf = (clientId, stateTopic) =>
-      ProducerOf
-        .apply1[IO]()
-        .apply(ProducerConfig(common = commonConfig(s"$clientId-snapshot-writer")))
-        .map { producer =>
-          KafkaPersistenceModuleOf.caching[IO, String](
-            consumerOf     = ConsumerOf.apply1[IO](),
-            producer       = producer,
-            consumerConfig = snapshotConsumerConfig(s"$clientId-snapshot-reader"),
-            snapshotTopic  = stateTopic,
-          )
-        },
-    isolationLevel = IsolationLevel.ReadUncommitted,
-  )
-
-  /** The transactional persistence. Every member gets the partition's stable `transactional.id`, so a takeover fences
-    * the previous owner twice over: the new owner's `initTransactions` bumps the shared id's producer epoch, and the
-    * generation the previous owner's writes bind an offset commit to is no longer current (KIP-447). The epoch fence is
-    * the one that fires here - see the test below.
-    */
-  private val transactionalPersistence = Persistence(
-    moduleOf = (clientId, stateTopic) =>
-      Resource.pure(
-        KafkaPersistenceModuleOf.cachingTransactional[IO, String](
-          consumerOf = ConsumerOf.apply1[IO](),
-          producerOf = ProducerOf.apply1[IO](),
-          config = KafkaPersistenceModule.TransactionalConfig(
-            consumerConfig        = snapshotConsumerConfig(s"$clientId-snapshot-reader"),
-            producerConfig        = ProducerConfig(common = commonConfig(s"$clientId-snapshot-writer")),
-            transactionalIdPrefix = appId,
-            snapshotTopic         = stateTopic,
-          ),
-        )
+  private def transactionalModuleOf(
+    clientId: String,
+    stateTopic: String,
+    producerOf: ProducerOf[IO],
+  ): KafkaPersistenceModuleOf[IO, String] =
+    KafkaPersistenceModuleOf.cachingTransactional[IO, String](
+      consumerOf = ConsumerOf.apply1[IO](),
+      producerOf = producerOf,
+      config = KafkaPersistenceModule.TransactionalConfig(
+        consumerConfig        = snapshotConsumerConfig(s"$clientId-snapshot-reader"),
+        producerConfig        = ProducerConfig(common = commonConfig(s"$clientId-snapshot-writer")),
+        transactionalIdPrefix = appId,
+        snapshotTopic         = stateTopic,
       ),
-    isolationLevel = IsolationLevel.ReadCommitted,
-  )
+    )
 
-  /** The final compacted view of the snapshot topic for `key`, read the way recovery reads it. */
-  private def snapshotOf(stateTopic: String, isolationLevel: IsolationLevel): IO[Option[String]] =
+  /** The outcome of every broker-answered transactional call a member's snapshot writer made: the ack of each `send`,
+    * each `sendOffsetsToTransaction` and each `commitTransaction`. Empty means the member never tried to write.
+    */
+  private type WriteOutcomes = Ref[IO, Vector[Either[Throwable, Unit]]]
+
+  /** Wraps a `ProducerOf` so every write the module performs through it records its outcome. Used on the dying member
+    * to assert that its teardown flush was actually ATTEMPTED and then REJECTED - without that, a passing prevention
+    * assertion could just mean no flush ever happened.
+    */
+  private def recording(outcomes: WriteOutcomes): ProducerOf[IO] = { (config: ProducerConfig) =>
+    ProducerOf.apply1[IO]().apply(config).map { underlying =>
+      def record[A](fa: IO[A]): IO[A] = fa.attempt.flatTap(r => outcomes.update(_ :+ r.void)).rethrow
+
+      new Producer[IO] {
+        def initTransactions: IO[Unit]  = underlying.initTransactions
+        def beginTransaction: IO[Unit]  = underlying.beginTransaction
+        def commitTransaction: IO[Unit] = record(underlying.commitTransaction)
+        def abortTransaction: IO[Unit]  = underlying.abortTransaction
+        def sendOffsetsToTransaction(
+          offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata],
+          consumerGroupMetadata: ConsumerGroupMetadata
+        ): IO[Unit] = record(underlying.sendOffsetsToTransaction(offsets, consumerGroupMetadata))
+        // the ack, not the enqueue, is what the broker answers - so record the inner effect
+        def send[K, V](record0: ProducerRecord[K, V])(
+          implicit toBytesK: ToBytes[IO, K],
+          toBytesV: ToBytes[IO, V]
+        ): IO[IO[RecordMetadata]] = underlying.send(record0).map(ack => record(ack))
+        def partitions(topic: Topic): IO[List[PartitionInfo]]   = underlying.partitions(topic)
+        def flush: IO[Unit]                                     = underlying.flush
+        def clientMetrics: IO[Seq[ClientMetric[IO]]]            = underlying.clientMetrics
+        def clientInstanceId(timeout: FiniteDuration): IO[Uuid] = underlying.clientInstanceId(timeout)
+      }
+    }
+  }
+
+  /** The final compacted view of the snapshot topic for `key`, read `read_committed` the way the persistence's own
+    * recovery reads it - so an observation can never see more than a recovering member would.
+    */
+  private def snapshotOf(stateTopic: String): IO[Option[String]] =
     KafkaPartitionPersistence
       .readSnapshots[IO](
-        consumerOf     = ConsumerOf.apply1[IO](),
-        consumerConfig = snapshotConsumerConfig("snapshot-observer").copy(isolationLevel = isolationLevel),
-        snapshotTopic  = stateTopic,
-        partition      = Partition.min,
-        stall          = none,
+        consumerOf = ConsumerOf.apply1[IO](),
+        consumerConfig =
+          snapshotConsumerConfig("snapshot-observer").copy(isolationLevel = IsolationLevel.ReadCommitted),
+        snapshotTopic = stateTopic,
+        partition     = Partition.min,
+        stall         = none,
       )
       .map(_.get(key).flatMap(_.decodeUtf8.toOption))
 
@@ -204,7 +235,6 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
     * (raises if the member's stream died with an error).
     */
   private def member(
-    persistence: Persistence,
     group: String,
     clientId: String,
     inputTopic: String,
@@ -213,10 +243,13 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
     timerFlowOf: TimerFlowOf[IO],
     partitionFlowConfig: PartitionFlowConfig,
     fold: FoldOption[IO, String, ConsumerRecord[String, ByteVector]],
+    producerOf: ProducerOf[IO] = ProducerOf.apply1[IO](),
   ): Resource[IO, IO[Unit]] = {
     implicit val retry: Retry[IO] = Retry.empty[IO]
     for {
-      moduleOf <- persistence.moduleOf(clientId, stateTopic)
+      moduleOf <- Resource.pure[IO, KafkaPersistenceModuleOf[IO, String]](
+        transactionalModuleOf(clientId, stateTopic, producerOf)
+      )
       timersOf <- Resource.eval(TimersOf.memory[IO, KafkaKey])
       partitionFlowOf = kafkaEagerRecovery[IO, String](
         kafkaPersistenceModuleOf = moduleOf,
@@ -273,6 +306,7 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
   private case class Observed(
     snapshot: Option[String],
     committedOffset: Option[Long],
+    staleFlushOutcomes: Vector[Either[Throwable, Unit]],
     nextOwnerStateBefore: Option[String],
     nextOwnerSnapshot: Option[String],
     nextOwnerCommittedOffset: Long,
@@ -282,9 +316,9 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
     * of an injected error and its teardown flushes the stale "123" of a partition it no longer owns. Finally member C
     * recovers, to show what the surviving (snapshot, offset) pair means end to end.
     */
-  private def teardownFlushScenario(persistence: Persistence, stateTopic: String, group: String): IO[Observed] = {
+  private def teardownFlushScenario(stateTopic: String, group: String): IO[Observed] = {
     val inputTopic     = s"input-$stateTopic"
-    val storedSnapshot = snapshotOf(stateTopic, persistence.isolationLevel)
+    val storedSnapshot = snapshotOf(stateTopic)
 
     val producerResource =
       ProducerOf.apply1[IO]().apply(ProducerConfig(common = commonConfig("input-producer")))
@@ -302,14 +336,16 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
         // A's poison fold blocks on this gate; completing it left-makes the fold raise, i.e. an error escapes
         // the poll loop and A tears down
         gate <- Deferred[IO, Either[Throwable, Unit]]
-        _    <- List("1", "2", "3").traverse_(produce(producer, key, _))
-        _    <- produce(producer, poisonKey, "x")
+        // every write A's snapshot writer makes, with its outcome: A never persists before teardown, so whatever
+        // lands here IS the teardown flush - and the test can tell "fenced" from "never attempted"
+        outcomesA <- Ref.of[IO, Vector[Either[Throwable, Unit]]](Vector.empty)
+        _         <- List("1", "2", "3").traverse_(produce(producer, key, _))
+        _         <- produce(producer, poisonKey, "x")
 
         // member A: short max.poll.interval, so the blocked fold gets it kicked from the group quickly; buffers
         // state without persisting - its only write is the teardown flush under test. A's release IS that flush,
         // so it cannot be `use`-scoped: it runs at the controlled point below, and the guarantee covers the rest
         allocatedA <- member(
-          persistence         = persistence,
           group               = group,
           clientId            = "member-a",
           inputTopic          = inputTopic,
@@ -318,6 +354,7 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
           timerFlowOf         = bufferingTimerFlowOf,
           partitionFlowConfig = PartitionFlowConfig(),
           fold                = foldOf(seenA, onPoison = gate.get.flatMap(IO.fromEither)),
+          producerOf          = recording(outcomesA),
         ).allocated
         (completionA, releaseA) = allocatedA
         releasedA              <- Ref.of[IO, Boolean](false)
@@ -333,7 +370,6 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
             // member B: joins the same group; A - stalled past its max.poll.interval - is kicked and the broker
             // hands the partition to B, which re-folds from the committed offset (none -> earliest)
             afterTeardown <- member(
-              persistence         = persistence,
               group               = group,
               clientId            = "member-b",
               inputTopic          = inputTopic,
@@ -365,12 +401,12 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
                 _         <- releaseAOnce
                 snapshot  <- storedSnapshot
                 committed <- committedOffset(group, inputTopic)
-              } yield (snapshot, committed)
+                outcomes  <- outcomesA.get
+              } yield (snapshot, committed, outcomes)
             }
             // end to end: the next owner recovers from the surviving (snapshot, offset) pair and builds on it
             _ <- produce(producer, key, "6")
             afterNextOwner <- member(
-              persistence         = persistence,
               group               = group,
               clientId            = "member-c",
               inputTopic          = inputTopic,
@@ -395,6 +431,7 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
           } yield Observed(
             snapshot                 = afterTeardown._1,
             committedOffset          = afterTeardown._2,
+            staleFlushOutcomes       = afterTeardown._3,
             nextOwnerStateBefore     = afterNextOwner._1,
             nextOwnerSnapshot        = afterNextOwner._2,
             nextOwnerCommittedOffset = afterNextOwner._3,
@@ -404,44 +441,31 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
     }
   }
 
-  // CHARACTERIZATION, NOT DESIRED BEHAVIOR: every assertion below asserts that the corruption HAPPENS. The default
-  // mode is last-write-wins by design (see the scaladoc), so this is what it currently does; if it ever gains a
-  // fence, invert these to the transactional test's assertions below.
-  test("issue #732 shape (characterized): an error-path teardown flush lands unfenced after the new owner's snapshot") {
-    val test = teardownFlushScenario(
-      persistence = cachingPersistence,
-      stateTopic  = "unfenced-teardown-state-topic",
-      group       = "unfenced-teardown-group",
-    ).map { observed =>
-      // THE DEFECT: the plain-producer flush is not fenced, so the dying instance's stale snapshot landed
-      // after - and thus over - the new owner's fresher one
-      assertEquals(clue(observed.snapshot), "123".some)
-      // while the committed input offset stays at B's newer one (A's teardown commit is rejected by the broker
-      // and swallowed) - the silently corrupt (stale snapshot, newer offset) pair
-      assertEquals(clue(observed.committedOffset), 6L.some)
-      // so the next owner recovers state "123" at offset 6: records 4 and 5 are never re-folded, and with a
-      // correct store this would be Some("12345") - durable data loss
-      assertEquals(clue(observed.nextOwnerStateBefore), "123".some)
-      // and it is not transient: the next owner persists the damaged aggregate and commits PAST record 6, so
-      // the offsets that would have re-delivered 4 and 5 are gone for good
-      assertEquals(clue(observed.nextOwnerSnapshot), "1236".some)
-      assertEquals(clue(observed.nextOwnerCommittedOffset), 7L)
-    }
-
-    test.unsafeRunSync()
-  }
-
   test("issue #732 prevention: an error-path teardown flush is fenced (transactional)") {
     val test = teardownFlushScenario(
-      persistence = transactionalPersistence,
-      stateTopic  = "fenced-teardown-state-topic",
-      group       = "fenced-teardown-group",
+      stateTopic = "fenced-teardown-state-topic",
+      group      = "fenced-teardown-group",
     ).map { observed =>
-      // THE PROTECTION: the same flush is a transaction the broker rejects, so the new owner's snapshot survived.
-      // Under the shared stable id, B's init has already epoch-fenced A, so the broker rejects A's flush for its
-      // stale producer epoch (logged by the run as "scache: failed to release cache entry:
-      // InvalidProducerEpochException") before it ever reaches the generation-gated offset commit - the same
-      // mechanism as the revoke-route prevention test, and the reason A's release still succeeds
+      // NOT VACUOUS: A did try to flush, and the broker rejected it. Without this the assertions below would also
+      // hold if the teardown flush had simply never happened, which is the one way this test could rot into
+      // proving nothing
+      val errors = observed.staleFlushOutcomes.collect { case Left(e) => e }
+      assert(
+        clue(observed.staleFlushOutcomes).nonEmpty,
+        "member A never attempted a snapshot write, so the fence was never exercised",
+      )
+      // under the shared stable id, B's init has already epoch-fenced A, so the broker rejects A's flush for its
+      // stale producer epoch BEFORE it reaches the generation-gated offset commit (which would raise
+      // CommitFailedException instead) - the same mechanism as the revoke-route prevention test. Either epoch
+      // exception is accepted: which one surfaces depends on the transaction protocol version
+      assert(
+        errors.exists(e => e.isInstanceOf[InvalidProducerEpochException] || e.isInstanceOf[ProducerFencedException]),
+        s"expected A's stale flush to be rejected for its producer epoch, got ${clue(errors)}",
+      )
+
+      // THE PROTECTION: the rejected flush did not land, so the new owner's fresher snapshot survived, paired with
+      // the offset the new owner committed. A's release still succeeds - the rejection surfaces only as a
+      // swallowed "scache: failed to release cache entry: ..." line
       assertEquals(clue(observed.snapshot), "12345".some)
       assertEquals(clue(observed.committedOffset), 6L.some)
       // and the next owner recovers the consistent pair - nothing is lost - then carries it forward: every
