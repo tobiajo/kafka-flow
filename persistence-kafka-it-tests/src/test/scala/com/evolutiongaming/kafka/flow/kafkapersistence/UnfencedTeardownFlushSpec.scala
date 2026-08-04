@@ -57,11 +57,11 @@ import scala.concurrent.duration.*
   * `CommitFailedException`, swallowed in `TopicFlow.commitPending`), which is exactly what makes the surviving pair
   * (stale snapshot, newer offset) silently corrupt.
   *
-  * The assertions below PIN THE DEFECT: they assert the corrupted outcome. When the defect is fixed the assertions
-  * must be flipped to the safe outcome (stale flush rejected or skipped; recovery sees B's snapshot). The
-  * transactional mode (`KafkaPersistenceModuleOf.cachingTransactional`) is immune by construction: the same flush is
-  * a generation-gated transaction the broker rejects (see `TransactionalKafkaPersistenceSpec`, "issue #732
-  * prevention: stale flush-on-revoke is fenced (transactional)").
+  * The assertions below PIN THE DEFECT: they assert the corrupted outcome. When the defect is fixed the assertions must
+  * be flipped to the safe outcome (stale flush rejected or skipped; recovery sees B's snapshot). The transactional mode
+  * (`KafkaPersistenceModuleOf.cachingTransactional`) is immune by construction: the same flush is a generation-gated
+  * transaction the broker rejects (see `TransactionalKafkaPersistenceSpec`, "issue #732 prevention: stale
+  * flush-on-revoke is fenced (transactional)").
   */
 class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
   implicit val ioRuntime: IORuntime = IORuntime.global
@@ -111,9 +111,9 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
 
   private def eventually[A](hint: String, timeout: FiniteDuration = 90.seconds)(fa: IO[Option[A]]): IO[A] = {
     def loop(remaining: FiniteDuration): IO[A] = fa.flatMap {
-      case Some(a)                   => a.pure[IO]
+      case Some(a)                     => a.pure[IO]
       case None if remaining > 0.nanos => IO.sleep(250.millis) *> loop(remaining - 250.millis)
-      case None                      => IO.raiseError(new RuntimeException(s"condition not met within $timeout: $hint"))
+      case None => IO.raiseError(new RuntimeException(s"condition not met within $timeout: $hint"))
     }
     loop(timeout)
   }
@@ -121,8 +121,8 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
   /** What a member's fold observed: the key, the state BEFORE the record and the record's value. */
   private case class Seen(key: String, stateBefore: Option[String], value: String)
 
-  /** State is the concatenation of consumed values; the poison record runs `onPoison` (member A blocks and then
-    * raises there, other members pass through) and leaves no state.
+  /** State is the concatenation of consumed values; the poison record runs `onPoison` (member A blocks and then raises
+    * there, other members pass through) and leaves no state.
     */
   private def foldOf(
     seen: Ref[IO, Vector[Seen]],
@@ -133,13 +133,14 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
         value <- IO(record.value.get.value.decodeUtf8.toOption.get)
         key    = record.key.get.value
         _     <- seen.update(_ :+ Seen(key, state, value))
-        next  <- if (key == poisonKey) onPoison.as(none[String])
-                 else IO.pure(state.fold(value)(_ + value).some)
+        next <-
+          if (key == poisonKey) onPoison.as(none[String])
+          else IO.pure(state.fold(value)(_ + value).some)
       } yield next
     }
 
-  /** A full production member: `KafkaFlow` over the non-transactional Kafka snapshot persistence. Yields the
-    * background completion (raises if the member's stream died with an error).
+  /** A full production member: `KafkaFlow` over the non-transactional Kafka snapshot persistence. Yields the background
+    * completion (raises if the member's stream died with an error).
     */
   private def member(
     group: String,
@@ -192,8 +193,8 @@ class UnfencedTeardownFlushSpec extends ForAllKafkaSuite {
     } yield completion
   }
 
-  /** Buffers state without ever persisting or committing (flush only on release) - the shape of an instance that
-    * relies on flush-on-revoke.
+  /** Buffers state without ever persisting or committing (flush only on release) - the shape of an instance that relies
+    * on flush-on-revoke.
     */
   private def bufferingTimerFlowOf: TimerFlowOf[IO] =
     TimerFlowOf.unloadOrphaned[IO](

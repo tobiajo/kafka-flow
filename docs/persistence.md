@@ -63,6 +63,90 @@ You do not catch the rejection yourself; it is handled for you:
 Either way the rejected write does not land and no offset is committed for it, so the new owner
 replays the affected events.
 
+One failure of the **Kafka** backend's transactional mode is not a rejection but an *unanswered*
+commit: if `commitTransaction` times out client-side, the broker may have committed it anyway. The
+write is reported as failed, and nothing local can resolve it — retrying blocks for up to
+`max.block.ms` inside the poll cycle, and aborting is inert while a commit is unresolved. Nothing is
+lost: the input offset rides the same transaction, so snapshot and offset commit together or not at
+all, and the failure tears the flow down so the rebuilt module's `initTransactions` settles the
+transaction broker-side. Worth knowing about `ignorePersistErrors = true` here: it swallows that
+failure too, and the producer stays unusable for the rest of the assignment, so the partition quietly
+stops persisting *and* stops advancing offsets until the next rebalance — frozen and self-consistent
+rather than corrupted, but no longer making progress. `AmbiguousCommitAbortSpec` pins this against a
+real broker.
+
+### Compare-and-set snapshot writes (Cassandra)
+
+Enable with the `compareAndSet` flag:
+
+```scala
+CassandraSnapshots.withSchema[F, State](
+  session,
+  sync,
+  compareAndSet = true,
+)
+// or via the persistence module:
+CassandraPersistence.withSchema[F, State](
+  session,
+  sync,
+  consistencyOverrides,
+  keysSegments,
+  snapshotCompareAndSet = true,
+)
+```
+
+Each snapshot write becomes an offset-guarded conditional write, and each delete an offset-carrying
+tombstone reaped by the `ttl`; a stale write is rejected with `CassandraSnapshots.SnapshotWriteConflict`.
+
+- **Cost** — every write and delete becomes a lightweight transaction (Paxos): several inter-replica
+  round-trips, a few times slower and more coordinator-CPU-intensive than a quorum write. A
+  `persistEvery` wave flushes a partition's whole changed-key population, so the added load scales with
+  that wave. Measure it against your write rate first.
+- **Consistency** — set `ConsistencyOverrides` read **and** write to a quorum (`QUORUM`, or
+  `LOCAL_QUORUM` for single-DC): the fence's read side needs `R + W > N`, and these are **not**
+  defaulted (an unset override uses the session default, often `LOCAL_ONE`). For single-DC also set
+  the scassandra client's `query.serial-consistency = LOCAL_SERIAL` — the lightweight transaction's
+  serial level is separate from `ConsistencyOverrides` and defaults to cross-DC `SERIAL`, so a
+  conditional write otherwise pays a cross-datacenter round-trip.
+- **TTL** — set a `ttl` to bound tombstone (and Paxos-partition) growth, preferably from the first
+  deployment: Cassandra TTLs are per cell, so changing the `ttl` around deletes can leave rows whose
+  guard cell expired early — handled (they read as absent and the next persist repairs them, see the
+  design doc's TTL notes), but best avoided.
+- **Rollout** — no migration either direction (the condition reads the `offset` column every version
+  already writes). A rolling deploy is safe; while the two modes coexist there is a clock-skew caveat
+  (design doc), negligible with NTP-synced clocks.
+- **Cassandra version** — run ≥ 3.0.24 / 3.11.10 / 4.0: CASSANDRA-12126 broke linearizability for
+  exactly the non-applying conditional-write shape this mode issues (and leave the
+  `cassandra.unsafe.disable-serial-reads-linearizability` flag unset). On 4.1+, Paxos v2
+  (`paxos_variant: v2` plus scheduled paxos repair) is recommended — it also closes the legacy-Paxos
+  linearizability gap during range movements (bootstrap/decommission/move).
+
+Limitations:
+- Offsets must be monotonic per key: after a consumer-group offset reset, lower-offset writes do not
+  overwrite a newer snapshot until the stored snapshots are passed or truncated. Through the fenced
+  buffer a replayed lower-offset write is *dropped* (held at the recovered high-water — silent, by
+  design); a write the buffer does not gate (a custom or unfenced path) is *rejected* at the store with
+  `SnapshotWriteConflict`. Either way the newer snapshot stands.
+- Writes at an *equal* offset are allowed (e.g. a timer-driven state change at the same offset), so a
+  stale writer holding exactly the stored offset is not detected. It is safe: a same-offset write
+  cannot drop committed events — it does not move the recovery point.
+- The guard lives in the row, so it expires with the `ttl`: once a row's TTL lapses a stale write can
+  land a fresh `INSERT`. Harmless when the TTL far exceeds the overlap window (the usual case).
+- Only this mode's statements may touch the snapshots table: mixing plain writes into rows managed by
+  lightweight transactions voids Cassandra's linearizability guarantee (their timestamps do not
+  compose).
+- Under events-recovery (`restoreEvents`), the journal is a second, *unfenced* store: a delete spans
+  the snapshot tombstone and the journal clear with no cross-store atomicity, and a stale owner's
+  replayed appends (or a crash between the two deletes) can leave journal rows for a tombstoned key,
+  below its tombstone's offset. This gap predates the compare-and-set mode. What compare-and-set adds
+  is the guard: recovery folds only the journal rows whose offset exceeds the fenced store's offset
+  onto the store's snapshot as the base, so sub-floor residue is never folded — it cannot resurrect a
+  deleted key or regress a live one. The filter is on the event offset, not the fold's result, so it
+  holds at every recovery, not only the first (an offset comparison of the fold result would let the
+  residue back in once legitimate events advanced the journal past the store). Under last-write-wins
+  there is no trustworthy floor to filter against, so events-recovery there remains exposed;
+  snapshot-recovery modes are unaffected either way.
+
 ### Transactional snapshot writes (Kafka)
 
 **EXPERIMENTAL** — use at your own risk: the mechanism is design-verified but not yet proven in
