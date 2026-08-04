@@ -25,6 +25,8 @@ class ReadSnapshotsSpec extends FunSuite {
   private val topic     = "state-topic"
   private val partition = Partition.min
   private val tp        = TopicPartition(topic, partition)
+  // the common case: one input partition recovering its own state partition
+  private val reader = KafkaPartitionPersistence.SnapshotReader(tp, partition)
 
   private val fakes = new FakeConsumers(tp)
   import fakes.{consumer, consumerOf}
@@ -69,8 +71,7 @@ class ReadSnapshotsSpec extends FunSuite {
       stored <- KafkaPartitionPersistence.readSnapshots[IO](
         consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
         consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
-        snapshotTopic  = topic,
-        partition      = partition,
+        reader         = reader,
         stall = KafkaPartitionPersistence
           .Stall(KafkaPersistenceModule.TransactionalConfig.DefaultRecoveryStallTimeout, IO.monotonic)
           .some,
@@ -96,8 +97,7 @@ class ReadSnapshotsSpec extends FunSuite {
         .readSnapshots[IO](
           consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
-          snapshotTopic  = topic,
-          partition      = partition,
+          reader         = reader,
           stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
         )
         .attempt
@@ -107,6 +107,36 @@ class ReadSnapshotsSpec extends FunSuite {
         assertEquals(e.targetOffset, Offset.unsafe(3))
         assert(e.diagnosis.contains("open transaction"), s"unexpected diagnosis: ${e.diagnosis}")
       case other => fail(s"expected RecoveryReadStalledError, got $other")
+    }
+
+    TestControl.executeEmbed(test.timeout(1.minute)).unsafeRunSync()
+  }
+
+  test("a many-to-one read carries both the state partition read and the input partition reading it") {
+    // co-owners of one state partition are told apart only by the input partition, so the stall error must carry it
+    // alongside the partition actually read - the two are different numbers here
+    val inputPartition = Partition.unsafe(3)
+    val coOwner        = KafkaPartitionPersistence.SnapshotReader(tp, inputPartition)
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      readConsumer = consumer(endOffset = 1L, positionRef = positionRef, records = List(record(0, "k0")))
+      hwConsumer   = consumer(endOffset = 3L, positionRef = positionRef, records = Nil)
+      result <- KafkaPartitionPersistence
+        .readSnapshots[IO](
+          consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
+          consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
+          reader         = coOwner,
+          stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
+        )
+        .attempt
+    } yield {
+      val reader = coOwner
+      result match {
+        case Left(e: KafkaPartitionPersistence.RecoveryReadStalledError) => assertEquals(e.reader, reader)
+        case other => fail(s"expected RecoveryReadStalledError, got $other")
+      }
+      // the rendering, pinned once here rather than at every place that carries it
+      assertEquals(reader.toString, s"Snapshot topic $topic partition $partition (input partition $inputPartition)")
     }
 
     TestControl.executeEmbed(test.timeout(1.minute)).unsafeRunSync()
@@ -124,8 +154,7 @@ class ReadSnapshotsSpec extends FunSuite {
         .readSnapshots[IO](
           consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
-          snapshotTopic  = topic,
-          partition      = partition,
+          reader         = reader,
           stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
         )
         .attempt
@@ -151,8 +180,7 @@ class ReadSnapshotsSpec extends FunSuite {
         // the same fake serves both views: equal bounds, no pin
         consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = readConsumer),
         consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
-        snapshotTopic  = topic,
-        partition      = partition,
+        reader         = reader,
         stall          = KafkaPartitionPersistence.Stall(300.millis, IO.monotonic).some,
       )
     } yield assertEquals(stored.keys.toList.sorted, (0 until 8).map(i => s"k$i").toList)
@@ -175,8 +203,7 @@ class ReadSnapshotsSpec extends FunSuite {
         .readSnapshots[IO](
           consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
-          snapshotTopic  = topic,
-          partition      = partition,
+          reader         = reader,
           stall          = KafkaPartitionPersistence.Stall(200.millis, IO.monotonic).some,
         )
         .attempt
@@ -203,8 +230,7 @@ class ReadSnapshotsSpec extends FunSuite {
           .readSnapshots[IO](
             consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
             consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
-            snapshotTopic  = topic,
-            partition      = partition,
+            reader         = reader,
             stall          = KafkaPartitionPersistence.Stall(12.seconds, IO.monotonic).some,
           )
           .attempt
@@ -234,8 +260,7 @@ class ReadSnapshotsSpec extends FunSuite {
         KafkaPartitionPersistence.readSnapshots[IO](
           consumerOf     = consumerOf(readConsumer = readConsumer, hwConsumer = hwConsumer),
           consumerConfig = ConsumerConfig(isolationLevel = IsolationLevel.ReadCommitted),
-          snapshotTopic  = topic,
-          partition      = partition,
+          reader         = reader,
           stall = KafkaPartitionPersistence
             .Stall(KafkaPersistenceModule.TransactionalConfig.DefaultRecoveryStallTimeout, IO.monotonic)
             .some,
@@ -281,8 +306,7 @@ class ReadSnapshotsSpec extends FunSuite {
         .readSnapshots[IO](
           consumerOf     = countingOf,
           consumerConfig = ConsumerConfig(),
-          snapshotTopic  = topic,
-          partition      = partition,
+          reader         = reader,
           stall          = none,
         )
         .timeout(1.minute)

@@ -38,7 +38,7 @@ private[kafkapersistence] final class FakeConsumers(tp: TopicPartition) {
   // serves `records` one per poll from `position`, advancing it; on an empty poll it sleeps the poll timeout, as a
   // real blocking poll would - under TestControl each sleep advances virtual time exactly. endOffsets is fixed per
   // consumer (the isolation-dependent bound) unless an effect is passed (to move it between captures);
-  // `emptyPollsBeforeServe` returns that many empty polls before each record (a slow but progressing read)
+  // `emptyPollsBeforeServe` returns that many empty polls before each record (a slow but progressing read);
   def consumer(
     endOffset: Long,
     positionRef: Ref[IO, Long],

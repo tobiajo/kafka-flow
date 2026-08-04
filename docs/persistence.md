@@ -16,8 +16,9 @@ backends are provided:
   events) and/or *snapshots* (the latest state) in Cassandra tables. See
   `CassandraPersistence`.
 - **Kafka** (`kafka-flow-persistence-kafka`) — stores per-key snapshots in a dedicated Kafka
-  [compacted](https://kafka.apache.org/documentation/#compaction) topic, recovered by reading that
-  topic to the end on assignment. See `KafkaPersistenceModuleOf`.
+  [compacted](https://kafka.apache.org/documentation/#compaction) topic (normally with the same
+  partition count as the input topic), recovered by reading that topic to the end on assignment.
+  See `KafkaPersistenceModuleOf`.
 
 Both backends recover state per key during partition assignment, relying on Kafka's guarantee that a
 partition is owned by a single consumer in the group. The [stale-writer
@@ -25,6 +26,38 @@ protections](#protecting-against-stale-snapshot-writes) below cover the one case
 guarantee is not enough for the **Kafka** backend. The Cassandra backend writes snapshots
 unconditionally (last write wins, no offset check), so it stays exposed to the stale-writer
 overwrite, like a custom store (see [Custom snapshot storage](#custom-snapshot-storage)).
+
+### Partition mapping (Kafka)
+
+By default the Kafka backend recovers input partition N from snapshot partition N. A
+`KafkaPersistencePartitionMapper` changes that — `modulo` routes several input partitions onto one
+snapshot partition, so the snapshot topic can be smaller than the input topic. It applies to both
+Kafka modes, plain and transactional, and the ownership contract it has to satisfy is in its scaladoc:
+read that before writing one.
+
+What matters for operations is that **the mapping is part of the snapshot topic's on-disk layout, not
+a setting**. Snapshots sit where the mapper that wrote them put them, and recovery reads where the
+mapper it runs with points. Switching identity ↔ `modulo`, or changing `statePartitions`, therefore
+needs a fresh snapshot topic plus an input replay; rollback is the same migration in reverse. A rolling
+swap loses state silently, and in both directions:
+
+- Every input partition whose mapping moved recovers nothing — its snapshots are in a partition nobody
+  reads any more — while the committed input offsets stay current, so the events behind the lost state
+  are never replayed either. Partitions whose mapping is unchanged are spared that loss, which is what
+  makes the damage partial and easy to miss; they are not automatically safe, though. Swapping to a
+  *less* selective ownership rule makes them over-recover instead: rolled back to identity, which claims
+  every key it reads, an unchanged partition also adopts its former co-owners' keys — duplicate flows
+  with their own timers, written back under the identity layout.
+- If a rebalance hands a partition back to a not-yet-rolled instance, that instance recovers the
+  pre-roll snapshot and folds onto it from the *newer* offset.
+
+Nothing fails while this happens: recovery logs a completed read. The one in-band signal is the
+ownership ratio each recovery logs (`owns M of N keys read`, at `warn` when a mapper claims none of a
+non-empty partition), and it is weak in both directions — a mapping that is merely *wrong* keeps a
+plausible-looking share and stays at `info`, while an input partition that has no snapshotted keys of
+its own yet warns although nothing is wrong, as soon as a co-owner has written any (an entirely empty
+partition stays quiet). Treat it as the cheapest available signal, not as detection: it is worth
+reading after a deploy, not worth paging on unattended.
 
 ## Protecting against stale snapshot writes
 
@@ -92,7 +125,7 @@ val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[F, State](
 `idempotence` and the per-partition `transactional.id` are set for you — don't configure them in
 `producerConfig` — and the snapshot `consumerConfig` is forced to `read_committed`, with `groupId`
 cleared and `autoCommit` off: the recovery readers never join a group or commit offsets.
-The id is stable per partition (`"<prefix>-snapshot-<partition>"`): every owner of a partition shares it, so a
+The id is stable per partition (`"<prefix>-snapshot-<input partition>"`): every owner of a partition shares it, so a
 takeover's `initTransactions` fences the previous owner's producer and aborts any transaction it left
 open. The input topic whose offsets are committed transactionally, and the consumer generation used
 to fence stale writers, are both supplied
@@ -120,7 +153,7 @@ fenced writer's aborted records are
 never recovered. After a hard crash the new owner takes over immediately (aborting the crashed
 owner's unfinished transaction) and recovers everything that was committed. If an unfinished
 transaction belongs to some other `transactional.id` (see the limitations for when that happens),
-recovery waits until the broker aborts it instead — slower, but nothing committed is ever missed.
+recovery waits it out instead — slower, but nothing committed is ever missed.
 
 - **Cost** — snapshot writes commit in Kafka transactions (a few ms each on real brokers), and cost
   tracks the *number* of transactions more than their size. Concurrent key flushes are group-committed,
@@ -131,7 +164,7 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   producer config, default 1 min, ≤ the broker's `transaction.max.timeout.ms`). Large snapshots lengthen
   it with the batch — lower `maxWritesPerTransaction` (at a throughput cost) or raise the timeout.
   Raising it does not slow normal recovery (a takeover aborts this id's unfinished transactions
-  immediately); it only lengthens the prefix-change wait (below).
+  immediately); it only lengthens a wait for a transaction this takeover does not abort (below).
 - **Output is at-least-once** — output produces stay outside the snapshot transaction, so a replayed
   batch re-emits them; the consuming side must tolerate duplicates. Only the snapshot store and the
   input-offset commit are kept consistent (corruption prevention, not exactly-once).
@@ -139,7 +172,7 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   records). A rolling deploy is safe; while the two modes coexist a non-transactional instance is not
   fenced — the same exposure you already have without this mode, gone once every instance is
   transactional.
-- **Rolling back is not symmetric** — once this mode has run, the snapshot topic holds the aborted
+- **Rolling back to the plain module is not symmetric** — once this mode has run, the snapshot topic holds the aborted
   records of fenced writers, and the plain `caching` module reads with whatever `isolationLevel` its
   `consumerConfig` carries (skafka defaults to `read_uncommitted`; only this mode forces
   `read_committed`). Recovery applies records in offset order, last one wins, so an aborted stale
@@ -170,7 +203,11 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   zero during the wait or stall (lag is measured to the last-stable-offset, where the read parks),
   so alert on this mode's log signals, not on lag. Keep the value well below `max.poll.interval.ms` and above
   the legitimate wait for an unfinished transaction (`transaction.timeout.ms` plus the broker's
-  abort scan).
+  abort scan). Note what it is: a *no-progress* detector, not a budget for the whole read. A recovery
+  that keeps advancing, however slowly, never trips it — and under a many-to-one mapper each co-owner
+  reads the entire shared partition, so a read's duration scales with the combined snapshots of all of
+  them. Overrun `max.poll.interval.ms` that way and the broker evicts the member with no
+  `RecoveryReadStalledError` and nothing in the log but an ordinary revoke/assign pair.
 - **Reducing truncation risk** — the deadline only *flags* lost records; it cannot recover them, and it
   catches truncation only while a recovery read is in flight. Reads run only at partition assignment,
   so a truncation usually lands between them and is adopted silently by the next recovery. So guard
@@ -197,8 +234,15 @@ Limitations:
   open only during a synchronous flush or offset commit, so a graceful rollout leaves nothing open.
   (A foreign producer's transaction on the snapshot topic is waited out the same way — but the
   topic must be exclusive to the flow regardless.)
-- The mode always uses the identity `KafkaPersistencePartitionMapper` (fencing is per input partition);
-  a non-identity mapper is not supported here.
+- A non-identity `KafkaPersistencePartitionMapper` makes the guarantee conditional on `isStateKeyOwned`
+  claiming each key for the input partition whose events build it — read its scaladoc first. Every
+  co-owner of a state partition is another writer to it, so their open transactions can delay
+  recovery, and each recovers by reading the whole shared partition into memory before discarding
+  what it does not own — concurrently, so a JVM holding `k` co-owners reads the partition `k` times
+  (read amplification), but each retains only its owned keys in memory. Changing that mapping over
+  existing snapshots is a state migration, not a config change (see [Partition
+  mapping](#partition-mapping-kafka)) — and the rollout note above does not cover it. Its stale-recovery
+  case is also the one divergence this fence cannot catch: every owner involved is legitimate.
 - The fence works under both the **classic** and the **consumer** group protocols
   (`group.protocol=classic|consumer`). With `consumer`, use **brokers 4.3.0+**
   ([KAFKA-20066](https://issues.apache.org/jira/browse/KAFKA-20066)) — below that a still-valid

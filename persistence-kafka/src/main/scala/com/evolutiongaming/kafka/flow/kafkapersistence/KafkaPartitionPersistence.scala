@@ -23,15 +23,26 @@ object KafkaPartitionPersistence {
 
   private case class MissingOffsetError(topicPartition: TopicPartition) extends NoStackTrace
 
+  /** Identifies a recovery read: the snapshot partition read, labelled by the input partition whose owner reads it -
+    * under a many-to-one mapper the co-owners of one state partition would otherwise log indistinguishably.
+    */
+  private[kafkapersistence] final case class SnapshotReader(
+    snapshotPartition: TopicPartition,
+    inputPartition: Partition,
+  ) {
+    override def toString: String =
+      s"Snapshot topic ${snapshotPartition.topic} partition ${snapshotPartition.partition} " +
+        s"(input partition $inputPartition)"
+  }
+
   private[kafkapersistence] final case class RecoveryReadStalledError(
-    topicPartition: TopicPartition,
+    reader: SnapshotReader,
     position: Offset,
     targetOffset: Offset,
     diagnosis: String,
   ) extends RuntimeException(
-        s"recovery read of $topicPartition made no progress at offset $position, short of target $targetOffset, " +
-          s"past the stall deadline - failing rather than hanging or silently recovering possibly " +
-          s"incomplete state; $diagnosis"
+        s"$reader read made no progress at offset $position, short of target $targetOffset, past the stall " +
+          s"deadline - failing rather than hanging or silently recovering possibly incomplete state; $diagnosis"
       )
       with NoStackTrace
 
@@ -53,12 +64,12 @@ object KafkaPartitionPersistence {
   // non-transactional read: drain to the target, waiting as long as it takes (the long-shipped behaviour)
   private[kafkapersistence] def readPartition[F[_]: Monad: Log](
     consumer: SkafkaConsumer[F, String, ByteVector],
-    snapshotPartition: TopicPartition,
+    reader: SnapshotReader,
     targetOffset: Offset,
   ): F[BytesByKey] =
-    Log[F].info(s"Snapshot topic read started up to offset $targetOffset") *>
+    Log[F].info(s"$reader read started up to offset $targetOffset") *>
       FlatMap[F].tailRecM(BytesByKey.empty) { acc =>
-        consumer.position(snapshotPartition).flatMap {
+        consumer.position(reader.snapshotPartition).flatMap {
           case offset if offset >= targetOffset => acc.asRight[BytesByKey].pure[F]
           case _                                => pollFold(consumer, acc).map(_.asLeft[BytesByKey])
         }
@@ -70,15 +81,15 @@ object KafkaPartitionPersistence {
   // transactional read: the same drain, but fails loudly once no progress has been made for the whole deadline
   private[kafkapersistence] def readPartitionWithDeadline[F[_]: MonadThrow: Log](
     consumer: SkafkaConsumer[F, String, ByteVector],
-    snapshotPartition: TopicPartition,
+    reader: SnapshotReader,
     targetOffset: Offset,
     stall: Stall[F],
     diagnoseStall: F[String],
   ): F[BytesByKey] =
-    Log[F].info(s"Snapshot topic read started up to offset $targetOffset") *>
+    Log[F].info(s"$reader read started up to offset $targetOffset") *>
       FlatMap[F].tailRecM(ReadState(BytesByKey.empty, none)) {
         case ReadState(acc, last) =>
-          consumer.position(snapshotPartition).flatMap {
+          consumer.position(reader.snapshotPartition).flatMap {
             case offset if offset >= targetOffset =>
               acc.asRight[ReadState].pure[F]
             case offset =>
@@ -94,13 +105,11 @@ object KafkaPartitionPersistence {
                     val logDue     = now - stuck.logAt >= logStallEvery
                     val failOrLog =
                       diagnoseStall
-                        .flatMap(d =>
-                          RecoveryReadStalledError(snapshotPartition, offset, targetOffset, d).raiseError[F, Unit]
-                        )
+                        .flatMap(d => RecoveryReadStalledError(reader, offset, targetOffset, d).raiseError[F, Unit])
                         .whenA(stalledFor >= stall.timeout) *>
                         Log[F]
                           .info(
-                            s"Snapshot topic read making no progress at offset $offset, target $targetOffset, " +
+                            s"$reader read making no progress at offset $offset, target $targetOffset, " +
                               s"stalled for ${stalledFor.toSeconds}s"
                           )
                           .whenA(logDue)
@@ -121,15 +130,18 @@ object KafkaPartitionPersistence {
     case _ => map // ignore records with no key for now
   }
 
+  /** The reader's input partition keys the ephemeral consumers' client-id, on which co-owners of one state partition
+    * sharing a JVM would otherwise collide.
+    */
   private[kafkapersistence] def readSnapshots[F[_]: BracketThrowable: Log](
     consumerOf: ConsumerOf[F],
     consumerConfig: ConsumerConfig,
-    snapshotTopic: Topic,
-    partition: Partition,
+    reader: SnapshotReader,
     stall: Option[Stall[F]],
   )(implicit fromBytes: FromBytes[F, String]): F[BytesByKey] = {
-    val snapshotsPartition         = TopicPartition(topic = snapshotTopic, partition = partition)
+    val snapshotsPartition         = reader.snapshotPartition
     val snapshotPartitionSingleton = data.NonEmptySet.of(snapshotsPartition)
+    val inputPartition             = reader.inputPartition
 
     // ephemeral assign-based readers: never group members, never committing offsets - a committed offset
     // would override the earliest reset on the next recovery and silently shorten the read
@@ -152,7 +164,7 @@ object KafkaPartitionPersistence {
     val highWatermark: F[Offset] =
       consumerOf
         .apply[String, ByteVector](
-          suffixed(s"snapshot-$partition-hw").copy(isolationLevel = IsolationLevel.ReadUncommitted)
+          suffixed(s"snapshot-${inputPartition.value}-hw").copy(isolationLevel = IsolationLevel.ReadUncommitted)
         )
         .use(endOffset)
 
@@ -163,7 +175,7 @@ object KafkaPartitionPersistence {
 
     capturedHighWatermark.flatMap { captured =>
       consumerOf
-        .apply[String, ByteVector](suffixed(s"snapshot-$partition").copy(autoOffsetReset = Earliest))
+        .apply[String, ByteVector](suffixed(s"snapshot-${inputPartition.value}").copy(autoOffsetReset = Earliest))
         .use { consumer =>
           for {
             _ <- consumer.assign(snapshotPartitionSingleton)
@@ -173,7 +185,7 @@ object KafkaPartitionPersistence {
                 endOffset(consumer).flatMap { lastStableOffset =>
                   Log[F]
                     .warn(
-                      s"Snapshot topic $snapshotTopic partition $partition recovery waits for open transaction(s): " +
+                      s"$reader recovery waits for open transaction(s): " +
                         s"last-stable-offset $lastStableOffset below captured target $capturedTarget; " +
                         s"normally resolves within the pinning producer's transaction.timeout.ms " +
                         s"plus the broker's abort scan"
@@ -183,7 +195,7 @@ object KafkaPartitionPersistence {
                 }
             }
             bytesByKey <- stall match {
-              case None        => readPartition(consumer, snapshotsPartition, targetOffset)
+              case None        => readPartition(consumer, reader, targetOffset)
               case Some(stall) =>
                 // a stall's cause, re-read lazily only if the deadline fires; best-effort - a re-read that
                 // itself fails leaves the cause undetermined rather than masking the stall
@@ -199,11 +211,9 @@ object KafkaPartitionPersistence {
                         "kafka-transactions.sh"
                   }
                   .handleError(_ => "the cause could not be determined: the high-watermark re-read failed")
-                readPartitionWithDeadline(consumer, snapshotsPartition, targetOffset, stall, diagnoseStall)
+                readPartitionWithDeadline(consumer, reader, targetOffset, stall, diagnoseStall)
             }
-            _ <- Log[F].info(
-              s"Snapshot topic $snapshotTopic partition $partition read complete at offset $targetOffset, ${bytesByKey.size} keys read"
-            )
+            _ <- Log[F].info(s"$reader read complete at offset $targetOffset, ${bytesByKey.size} keys read")
           } yield bytesByKey
         }
     }

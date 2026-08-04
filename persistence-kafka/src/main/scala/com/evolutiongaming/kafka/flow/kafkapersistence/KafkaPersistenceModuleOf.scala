@@ -78,14 +78,15 @@ object KafkaPersistenceModuleOf {
     * without deprecation.
     *
     * A transactional [[KafkaPersistenceModule]] factory that protects the snapshot topic from stale writers - see
-    * `KafkaPersistenceModule.cachingTransactional` for semantics and trade-offs. The input topic and consumer
-    * generation are supplied by the flow, so they are not part of `config`.
+    * `KafkaPersistenceModule.cachingTransactional` for semantics and trade-offs, including the `partitionMapper`
+    * contract. The input topic and consumer generation are supplied by the flow, so they are not part of `config`.
     */
   def cachingTransactional[F[_]: LogOf: Async: Parallel: Runtime, S](
     consumerOf: ConsumerOf[F],
     producerOf: ProducerOf[F],
     config: KafkaPersistenceModule.TransactionalConfig,
-    metrics: FlowMetrics[F] = FlowMetrics.empty[F],
+    metrics: FlowMetrics[F]                          = FlowMetrics.empty[F],
+    partitionMapper: KafkaPersistencePartitionMapper = KafkaPersistencePartitionMapper.identity,
   )(
     implicit fromBytesKey: FromBytes[F, String],
     fromBytesState: FromBytes[F, S],
@@ -95,11 +96,12 @@ object KafkaPersistenceModuleOf {
       assignment: PartitionAssignment[F]
     ): Resource[F, KafkaPersistenceModule[F, S]] =
       KafkaPersistenceModule.cachingTransactional(
-        consumerOf = consumerOf,
-        producerOf = producerOf,
-        config     = config,
-        assignment = assignment,
-        metrics    = metrics,
+        consumerOf      = consumerOf,
+        producerOf      = producerOf,
+        config          = config,
+        assignment      = assignment,
+        metrics         = metrics,
+        partitionMapper = partitionMapper,
       )
   }
 }
