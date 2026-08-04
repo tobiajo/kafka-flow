@@ -13,6 +13,7 @@ import com.evolutiongaming.skafka.consumer.ConsumerGroupMetadata
 import com.evolutiongaming.skafka.producer.{Producer, ProducerRecord, RecordMetadata}
 import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, Partition, ToBytes, Topic, TopicPartition}
 import munit.FunSuite
+import org.apache.kafka.common.errors.TimeoutException
 
 import scala.concurrent.duration.*
 
@@ -243,6 +244,58 @@ class GroupCommitSpec extends FunSuite {
     }
     test.unsafeRunSync()
   }
+
+  // an ambiguous (client-side timeout) commit failure must NEVER be answered with an abort: the broker may have
+  // committed, and kafka-clients rejects any other operation while the commit is unresolved. The contract's move is
+  // to retry the commit. See AmbiguousCommitAbortSpec for the same behaviour against a real broker.
+
+  test("an ambiguously timed-out commit is retried, never aborted: the write succeeds once a retry lands") {
+    val test = for {
+      events   <- Ref.of[IO, Vector[Event]](Vector.empty)
+      attempts <- Ref.of[IO, Int](0)
+      // the first two commit attempts time out client-side; the third completes
+      commit = attempts.updateAndGet(_ + 1).flatMap { n =>
+        if (n <= 2) IO.raiseError(new TimeoutException(s"commit attempt $n timed out"))
+        else events.update(_ :+ Event.Commit)
+      }
+      tx <- buildTransactional(
+        recordingProducer(events, commitTransactionOf = commit.some),
+        ConsumerGroupMetadata.Empty.some,
+        maxWritesPerTransaction = 256,
+      )
+      result <- tx.writeDatabase.write(kafkaKey("key1"), Stored.Live(("state-1"), none)).attempt
+      log    <- events.get
+      tries  <- attempts.get
+    } yield {
+      assertEquals(result, Right(()))
+      assertEquals(tries, 3) // original attempt + two retries
+      assertEquals(log.count(_ == Event.Commit), 1)
+      assertEquals(log.count(_ == Event.Abort), 0) // abort after an ambiguous commit is out of contract
+    }
+    test.unsafeRunSync()
+  }
+
+  test("a persistently timed-out commit surfaces the timeout without an abort") {
+    val test = for {
+      events   <- Ref.of[IO, Vector[Event]](Vector.empty)
+      attempts <- Ref.of[IO, Int](0)
+      commit    = attempts.update(_ + 1) *> IO.raiseError[Unit](new TimeoutException("commit timed out"))
+      tx <- buildTransactional(
+        recordingProducer(events, commitTransactionOf = commit.some),
+        ConsumerGroupMetadata.Empty.some,
+        maxWritesPerTransaction = 256,
+      )
+      result <- tx.writeDatabase.write(kafkaKey("key1"), Stored.Live(("state-1"), none)).attempt
+      log    <- events.get
+      tries  <- attempts.get
+    } yield {
+      assert(result.left.exists(_.isInstanceOf[TimeoutException]), s"the ambiguous timeout surfaces: $result")
+      assert(tries > 1, s"the commit was retried before surfacing: $tries attempts")
+      // never aborted: the commit may have landed broker-side; the producer is discarded with the module instead
+      assertEquals(log.count(_ == Event.Abort), 0)
+    }
+    test.unsafeRunSync()
+  }
 }
 
 object GroupCommitSpec {
@@ -259,19 +312,24 @@ object GroupCommitSpec {
   private val CommitBoom = new RuntimeException("commit boom")
 
   /** A `Producer` that records the transactional calls into `events` and delegates everything else to a no-op producer
-    * (which also fabricates the `RecordMetadata` for `send`). `failCommit` makes `commitTransaction` raise.
+    * (which also fabricates the `RecordMetadata` for `send`). `failCommit` makes `commitTransaction` raise;
+    * `commitTransactionOf` replaces the whole `commitTransaction` behaviour (the override must record `Event.Commit`
+    * itself when it succeeds).
     */
   def recordingProducer(
     events: Ref[IO, Vector[Event]],
-    failCommit: Boolean          = false,
-    onBeginTransaction: IO[Unit] = IO.unit,
+    failCommit: Boolean                   = false,
+    onBeginTransaction: IO[Unit]          = IO.unit,
+    commitTransactionOf: Option[IO[Unit]] = None,
   ): Producer[IO] = {
     val base = Producer.empty[IO]
     new Producer[IO] {
-      def initTransactions: IO[Unit]  = base.initTransactions
-      def beginTransaction: IO[Unit]  = events.update(_ :+ Event.Begin) *> onBeginTransaction
-      def commitTransaction: IO[Unit] = if (failCommit) IO.raiseError(CommitBoom) else events.update(_ :+ Event.Commit)
-      def abortTransaction: IO[Unit]  = events.update(_ :+ Event.Abort)
+      def initTransactions: IO[Unit] = base.initTransactions
+      def beginTransaction: IO[Unit] = events.update(_ :+ Event.Begin) *> onBeginTransaction
+      def commitTransaction: IO[Unit] = commitTransactionOf.getOrElse {
+        if (failCommit) IO.raiseError(CommitBoom) else events.update(_ :+ Event.Commit)
+      }
+      def abortTransaction: IO[Unit] = events.update(_ :+ Event.Abort)
 
       def sendOffsetsToTransaction(
         offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata],
