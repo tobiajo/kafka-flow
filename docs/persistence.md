@@ -59,6 +59,33 @@ its own yet warns although nothing is wrong, as soon as a co-owner has written a
 partition stays quiet). Treat it as the cheapest available signal, not as detection: it is worth
 reading after a deploy, not worth paging on unattended.
 
+One input is checked rather than trusted: a mapper that declares the input-topic partition count it
+was configured for (`modulo`'s `sourcePartitions`; a custom mapper opts in via
+`expectedSourcePartitions`) is validated against the live topic on every partition assignment — by
+both `KafkaPersistenceModuleOf` factories, which is how the flow builds a module; the lower-level
+`KafkaPersistenceModule` constructors do not check, and `caching` cannot, never learning the input
+topic's name — and a
+mismatch fails the assignment with both numbers, the topic and the mapper — a wrong count would
+otherwise misplace keys at recovery as silently as the layout swaps above. The flip side is
+deliberate, and worth knowing before an input-topic expansion: instances still carrying the old
+count fail every assignment until the new configuration rolls out — a loud outage in place of
+silent corruption. There is no switch to turn the check off.
+
+Know what that outage looks like, because it is wider than one partition. The failure leaves the
+rebalance callback, so under `KafkaFlow.retryOnError` — or any non-terminating retry — the flow tears
+down and rebuilds the **whole consumer**, leaves the group and rejoins, and repeats on a backoff
+capped at a minute, indefinitely. Every member holding a partition of that topic does the same, so the
+group rebalances on a loop, and healthy partitions on those members are recycled along with the broken
+one. The process never crashes, so there is no restart count and no liveness-probe failure: the
+retry's log line is the only signal, and it carries the error's name and message
+(`SourcePartitionsMismatchError`, the topic, both counts, the mapper) — alert on it directly.
+
+Only a real disagreement costs that. A metadata fetch that fails propagates as itself, and a broker
+answering with *no* partitions — how a client reports a topic it does not know — is logged and the
+check skipped for that assignment rather than failing it: this instance was just assigned a partition
+of the topic, so the topic exists and the answer can only be a stale view. The next assignment checks
+again.
+
 ## Protecting against stale snapshot writes
 
 Consumer-group ownership of the input topic does **not** extend to the snapshot store. During a

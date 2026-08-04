@@ -58,6 +58,19 @@ trait KafkaPersistencePartitionMapper {
     *   `true` if the aggregate is built from events in `sourcePartition`.
     */
   def isStateKeyOwned(stateKey: String, sourcePartition: Partition): Boolean
+
+  /** The input topic's partition count this mapper assumes, if any. An `isStateKeyOwned` that re-derives the owning
+    * partition by hashing (as `modulo` does) bakes that count into every answer, and a count that differs from the
+    * topic's real one misplaces keys silently at recovery. A mapper that declares its assumption here is checked
+    * against the live input topic on every partition assignment, and a mismatch fails the assignment loudly instead.
+    * Both `KafkaPersistenceModuleOf` factories check; the lower-level `KafkaPersistenceModule` constructors do not, and
+    * `caching` structurally cannot - it is handed the snapshot topic paired with an input partition *number* and never
+    * learns the input topic's name.
+    *
+    * `None` means "don't check me": either the mapper assumes no particular count (as `identity` does not), or it
+    * predates this member - existing implementations inherit this default and stay unvalidated.
+    */
+  def expectedSourcePartitions: Option[Int] = None
 }
 
 object KafkaPersistencePartitionMapper {
@@ -76,11 +89,12 @@ object KafkaPersistencePartitionMapper {
     * `sourcePartitions` must be the input topic's real partition count: any other value misplaces at least half of all
     * keys - a misplaced key is credited to a partition other than the one whose events build it, so its owner recovers
     * nothing for it and rebuilds from empty state, and where the crediting partition reads the same state partition, it
-    * recovers the snapshot into a second flow.
+    * recovers the snapshot into a second flow. The modules check the value against the live topic on every partition
+    * assignment (see `expectedSourcePartitions`) and fail the assignment on a mismatch.
     *
     * The count is a deployment invariant: expanding the input topic moves keys between partitions (a state migration
-    * under any mapping, identity included) and `sourcePartitions` has to be raised in the same roll - a stale number
-    * keeps recovering against the old partitioning.
+    * under any mapping, identity included) and `sourcePartitions` has to be raised in the same roll - until it is,
+    * every assignment fails on the check, rather than silently recovering against the old partitioning.
     */
   def modulo(sourcePartitions: Int, statePartitions: Int): KafkaPersistencePartitionMapper =
     new Modulo(sourcePartitions, statePartitions)
@@ -89,6 +103,8 @@ object KafkaPersistencePartitionMapper {
     override def getStatePartition(sourcePartition: Partition): Partition = sourcePartition
 
     override def isStateKeyOwned(stateKey: String, sourcePartition: Partition): Boolean = true
+
+    override def toString: String = "identity"
   }
 
   private class Modulo(sourcePartitions: Int, statePartitions: Int) extends KafkaPersistencePartitionMapper {
@@ -98,5 +114,9 @@ object KafkaPersistencePartitionMapper {
     // UTF-8: the bytes skafka's ToBytes[String] handed the producer to hash
     override def isStateKeyOwned(stateKey: String, sourcePartition: Partition): Boolean =
       BuiltInPartitioner.partitionForKey(stateKey.getBytes(UTF_8), sourcePartitions) == sourcePartition.value
+
+    override def expectedSourcePartitions: Option[Int] = Some(sourcePartitions)
+
+    override def toString: String = s"modulo(sourcePartitions = $sourcePartitions, statePartitions = $statePartitions)"
   }
 }

@@ -4,7 +4,8 @@ import cats.Parallel
 import cats.effect.{Async, Clock, Concurrent, Resource}
 import cats.syntax.all.*
 import com.evolution.scache.Cache
-import com.evolutiongaming.catshelper.{FromTry, Log, LogOf, Runtime}
+import com.evolutiongaming.catshelper.{BracketThrowable, FromTry, Log, LogOf, Runtime}
+import com.evolutiongaming.kafka.flow.kafka.Codecs.*
 import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
 import com.evolutiongaming.kafka.flow.key.{Keys, KeysOf}
 import com.evolutiongaming.kafka.flow.metrics.syntax.*
@@ -19,6 +20,7 @@ import scodec.bits.ByteVector
 import com.evolutiongaming.skafka.consumer.ConsumerRecord
 
 import scala.concurrent.duration.*
+import scala.util.control.NoStackTrace
 
 /** A module, necessary to create a Kafka snapshot persistence.
   */
@@ -34,6 +36,72 @@ trait KafkaPersistenceModule[F[_], S] {
 }
 
 object KafkaPersistenceModule {
+
+  /** The mapper's declared input-topic partition count disagrees with the live topic: recovery would misplace keys
+    * (each owner rebuilds misplaced keys from empty while a co-owner may recover them into a duplicate flow), so the
+    * assignment fails instead. See [[KafkaPersistencePartitionMapper.expectedSourcePartitions]].
+    */
+  private[kafkapersistence] final case class SourcePartitionsMismatchError(
+    inputTopic: Topic,
+    expected: Int,
+    actual: Int,
+    partitionMapper: KafkaPersistencePartitionMapper,
+  ) extends RuntimeException(
+        s"partition mapper $partitionMapper expects input topic '$inputTopic' to have $expected partitions, " +
+          s"but it has $actual - a wrong count misplaces keys at recovery (owners rebuild from empty state, " +
+          "co-owners may recover duplicates), so this assignment fails instead; align the mapper's " +
+          "sourcePartitions with the topic"
+      )
+      with NoStackTrace
+
+  /** Fails module acquisition - which is per assignment and immediately precedes the first recovery read - when the
+    * mapper declares an input-topic partition count and the live topic disagrees. A mapper declaring `None` is not
+    * checked and no consumer is opened.
+    *
+    * Only a disagreement fails, and deliberately so, because failing here is expensive: the error leaves the rebalance
+    * callback, so the flow's retry rebuilds the whole consumer rather than the one partition (see the persistence
+    * docs). A mismatch earns that - every recovery under it misplaces keys until the configuration changes. The two
+    * ways of *not* knowing do not: a metadata fetch that fails propagates as itself, and a broker that answers with no
+    * partitions at all - how a client reports a topic it does not know - is logged and the check skipped, because this
+    * consumer was just assigned a partition of that topic, so the topic exists and an empty answer can only be a stale
+    * view. The next assignment checks again.
+    */
+  private[kafkapersistence] def validateSourcePartitions[F[_]: BracketThrowable: LogOf](
+    consumerOf: ConsumerOf[F],
+    consumerConfig: ConsumerConfig,
+    inputTopicPartition: TopicPartition,
+    partitionMapper: KafkaPersistencePartitionMapper,
+  )(implicit fromBytesKey: FromBytes[F, String]): F[Unit] =
+    partitionMapper.expectedSourcePartitions.traverse_ { expected =>
+      // ephemeral metadata-only consumer, group-less like the recovery readers (see readSnapshots)
+      val config = consumerConfig.copy(
+        groupId    = none,
+        autoCommit = false,
+        common = consumerConfig
+          .common
+          .copy(clientId = consumerConfig.common.clientId.map { cid =>
+            s"$cid-snapshot-${inputTopicPartition.partition.value}-src"
+          }),
+      )
+      consumerOf.apply[String, ByteVector](config).use { consumer =>
+        consumer.partitions(inputTopicPartition.topic).flatMap {
+          case Nil =>
+            LogOf[F]
+              .apply(KafkaPersistenceModule.getClass)
+              .flatMap {
+                _.warn(
+                  s"the broker returned no partitions for input topic '${inputTopicPartition.topic}', so " +
+                    s"$partitionMapper could not be checked against it - skipping the check for this assignment " +
+                    "rather than failing it, since an assigned topic exists and an empty answer is a stale view"
+                )
+              }
+          case partitions =>
+            SourcePartitionsMismatchError(inputTopicPartition.topic, expected, partitions.size, partitionMapper)
+              .raiseError[F, Unit]
+              .whenA(partitions.size != expected)
+        }
+      }
+    }
 
   /** Settings for [[cachingTransactional]].
     *

@@ -5,7 +5,7 @@ import cats.effect.unsafe.implicits.global
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.{Log, LogOf}
-import com.evolutiongaming.kafka.flow.PartitionAssignment
+import com.evolutiongaming.kafka.flow.{FlowMetrics, PartitionAssignment}
 import com.evolutiongaming.skafka.consumer.{
   AutoOffsetReset,
   Consumer as SkafkaConsumer,
@@ -297,6 +297,141 @@ class KafkaPersistenceModuleSpec extends FunSuite {
       assertEquals(readsNone, (0, List.empty[String]), "an empty state partition is no evidence of a wrong mapper")
     }
     TestControl.executeEmbed(test).unsafeRunSync()
+  }
+
+  // acquires both module paths - the plain caching (via its factory, where the input topic is known) and the
+  // transactional - with the same consumers and mapper: the source-partitions check must behave identically on both
+  private def acquireBoth(
+    consumerOf: ConsumerOf[IO],
+    mapper: KafkaPersistencePartitionMapper,
+    inputTp: TopicPartition,
+  ): IO[List[Either[Throwable, Unit]]] = {
+    val assignment = PartitionAssignment[IO](inputTp, Offset.min, IO.pure(none[ConsumerGroupMetadata]))
+    // through the factories, both of them, because that is where the check lives - the lower-level
+    // KafkaPersistenceModule constructors deliberately do not carry it
+    val transactional = KafkaPersistenceModuleOf
+      .cachingTransactional[IO, String](
+        consumerOf = consumerOf,
+        producerOf = (_: ProducerConfig) => Resource.pure[IO, Producer[IO]](Producer.empty[IO]),
+        config = KafkaPersistenceModule.TransactionalConfig(
+          consumerConfig        = ConsumerConfig(),
+          producerConfig        = ProducerConfig(),
+          transactionalIdPrefix = "app",
+          snapshotTopic         = "state-topic",
+        ),
+        metrics         = FlowMetrics.empty[IO],
+        partitionMapper = mapper,
+      )
+      .make(assignment)
+    val plain = KafkaPersistenceModuleOf
+      .caching[IO, String](
+        consumerOf      = consumerOf,
+        producer        = Producer.empty[IO],
+        consumerConfig  = ConsumerConfig(),
+        snapshotTopic   = "state-topic",
+        metrics         = FlowMetrics.empty[IO],
+        partitionMapper = mapper,
+      )
+      .make(assignment)
+    List(transactional, plain).traverse(_.use_.attempt)
+  }
+
+  test("acquisition fails when the live input topic disagrees with the mapper's declared partition count") {
+    // the silent alternative is corruption at recovery: keys hashed against the wrong count are credited to the
+    // wrong input partition, whose owner rebuilds them from empty while a co-owner may recover duplicates
+    val mapper = KafkaPersistencePartitionMapper.modulo(sourcePartitions = 4, statePartitions = 1)
+    val fakes  = new FakeConsumers(TopicPartition("state-topic", Partition.min))
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      consumer =
+        fakes.consumer(0L.pure[IO], positionRef, Nil, partitionsByTopic = Map("input-topic" -> IO.pure(2)))
+      results <- acquireBoth(
+        fakes.consumerOf(readConsumer = consumer, hwConsumer = consumer),
+        mapper,
+        TopicPartition("input-topic", Partition.min),
+      )
+    } yield results.foreach {
+      case Left(e: KafkaPersistenceModule.SourcePartitionsMismatchError) =>
+        // an operator gets both numbers, the topic and the mapper - enough to see which side to fix
+        assertEquals((e.inputTopic, e.expected, e.actual), ("input-topic", 4, 2))
+        List("input-topic", "4", "2", mapper.toString).foreach(part => assert(clue(e.getMessage).contains(clue(part))))
+      case other => fail(s"expected acquisition to fail with the mismatch, got $other")
+    }
+    test.unsafeRunSync()
+  }
+
+  test("acquisition passes the check when the live input topic matches the declared partition count") {
+    // also pins WHICH topic is queried: the fake serves a count for the input topic alone, so a check against
+    // any other topic would read the empty delegate and fail as a mismatch
+    val mapper = KafkaPersistencePartitionMapper.modulo(sourcePartitions = 2, statePartitions = 1)
+    val fakes  = new FakeConsumers(TopicPartition("state-topic", Partition.min))
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      consumer =
+        fakes.consumer(0L.pure[IO], positionRef, Nil, partitionsByTopic = Map("input-topic" -> IO.pure(2)))
+      results <- acquireBoth(
+        fakes.consumerOf(readConsumer = consumer, hwConsumer = consumer),
+        mapper,
+        TopicPartition("input-topic", Partition.min),
+      )
+    } yield assertEquals(results, List(Right(()), Right(())))
+    test.unsafeRunSync()
+  }
+
+  test("a mapper declaring no expected count skips the check - acquisition opens no consumer") {
+    // a custom implementation inherits the None default and stays unvalidated, as before this member existed;
+    // unusedConsumerOf raises on any consumer opening, so passing is proof no metadata was fetched
+    val unchecked = new KafkaPersistencePartitionMapper {
+      def getStatePartition(sourcePartition: Partition): Partition               = Partition.min
+      def isStateKeyOwned(stateKey: String, sourcePartition: Partition): Boolean = true
+    }
+    val test = acquireBoth(unusedConsumerOf, unchecked, TopicPartition("input-topic", Partition.min))
+      .map(results => assertEquals(results, List(Right(()), Right(()))))
+    test.unsafeRunSync()
+  }
+
+  test("a failed partition-count fetch propagates as itself, never as a mismatch") {
+    // unknown is not wrong: a broker that cannot be asked must fail the assignment with its own error, not
+    // convict the mapper of a mismatch it never verified
+    val boom   = new RuntimeException("metadata fetch failed")
+    val mapper = KafkaPersistencePartitionMapper.modulo(sourcePartitions = 2, statePartitions = 1)
+    val fakes  = new FakeConsumers(TopicPartition("state-topic", Partition.min))
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      consumer =
+        fakes.consumer(0L.pure[IO], positionRef, Nil, partitionsByTopic = Map("input-topic" -> IO.raiseError(boom)))
+      results <- acquireBoth(
+        fakes.consumerOf(readConsumer = consumer, hwConsumer = consumer),
+        mapper,
+        TopicPartition("input-topic", Partition.min),
+      )
+    } yield results.foreach {
+      case Left(e)  => assert(clue(e) eq clue[Throwable](boom))
+      case Right(_) => fail("expected the fetch failure to fail acquisition")
+    }
+    test.unsafeRunSync()
+  }
+
+  test("a topic the broker reports no partitions for skips the check rather than failing the assignment") {
+    // an empty answer is how a client reports a topic it does not know, and it cannot mean the configuration is
+    // wrong: this consumer was assigned a partition of that topic, so the topic exists and the view is merely stale.
+    // Failing here would be paid for by the whole consumer - the error leaves the rebalance callback and the flow's
+    // retry rebuilds everything - so a transient view must not cost that
+    val mapper = KafkaPersistencePartitionMapper.modulo(sourcePartitions = 2, statePartitions = 1)
+    val fakes  = new FakeConsumers(TopicPartition("state-topic", Partition.min))
+    val test = for {
+      positionRef <- Ref.of[IO, Long](0L)
+      consumer     = fakes.consumer(0L.pure[IO], positionRef, Nil, partitionsByTopic = Map("input-topic" -> 0.pure[IO]))
+      results <- acquireBoth(
+        fakes.consumerOf(readConsumer = consumer, hwConsumer = consumer),
+        mapper,
+        TopicPartition("input-topic", Partition.min),
+      )
+    } yield results.foreach {
+      case Right(()) => ()
+      case Left(e)   => fail(s"expected an unknown topic to skip the check, not fail the assignment: $e")
+    }
+    test.unsafeRunSync()
   }
 
   // records warn lines only: these tests assert the level the recovery chose, never its wording
