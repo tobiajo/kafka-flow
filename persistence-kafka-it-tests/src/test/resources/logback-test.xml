@@ -6,6 +6,9 @@
         </encoder>
     </appender>
 
+    <!-- the eviction scenario's phase narration is what makes a failure readable -->
+    <logger name="com.evolutiongaming.kafka.flow.kafkapersistence.LiveRebalanceFencingSpec" level="INFO"/>
+
     <logger name="org.apache.kafka" level="ERROR"/>
     <logger name="org.apache.zookeeper" level="ERROR"/>
     <logger name="kafka" level="ERROR"/>

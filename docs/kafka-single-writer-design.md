@@ -358,8 +358,8 @@ Reproduce: `KAFKA_FLOW_PERF=1 sbt "persistence-kafka-it-tests/testOnly *Transact
 
 ## Testing
 
-Integration tests (`TransactionalKafkaPersistenceSpec`, in persistence-kafka-it-tests) run against a
-real broker:
+Integration tests (`TransactionalKafkaPersistenceSpec` and `LiveRebalanceFencingSpec`, in
+persistence-kafka-it-tests) run against a real broker:
 
 - **Reproduction and prevention** — the corruption pair runs the real recovery and flush-on-revoke
   machinery (`kafkaEagerRecovery` — every key recovered on assignment): corruption reproduced with
@@ -377,10 +377,21 @@ real broker:
   wait for a transaction no takeover aborts (Recovery read, above): a foreign transaction held
   open through the read, its LSO pin asserted active, then waited out under a deadline set above
   the wait — the read completes, the deadline never fires.
+- **Live rebalance, evicted owner** (`LiveRebalanceFencingSpec`) — the fence tests above inject the
+  stale generation, so the fence is only ever asked to reject a hand-made token; here the token goes
+  stale by itself. A flow stalls inside its `fold`, which runs on the poll loop's thread of control, so
+  its own heartbeat thread leaves the group past `max.poll.interval.ms`; a second flow takes the
+  partition over for real, and only then is the first released, so its next periodic flush is a stale
+  write. Three arms, each asserting what a recovery would adopt: under the shared stable id the flush
+  dies at the epoch fence the takeover's init already bumped; with the ids unshared — a configuration
+  the library never produces, so this arm probes the broker rather than guarding a regression — the
+  coordinator's member validation rejects the commit on its own; the plain arm reproduces #732 under
+  the same eviction, live rather than simulated.
 
-The suites drive flows with explicit consumer generations rather than live rebalances; the
-protocol/assignor matrix (Consumer rebalance protocols, above) rests on broker semantics, not on
-tests here.
+The protocol/assignor matrix (Consumer rebalance protocols, above) is exercised only at
+`CooperativeStickyAssignor` on the classic protocol; the rest rests on broker semantics, not on tests
+here. Eviction skips the revocation the combinations disagree about, so it is the row the matrix
+predicts to be uniform.
 
 Unit suites pin the client-side pieces the mechanism depends on:
 
