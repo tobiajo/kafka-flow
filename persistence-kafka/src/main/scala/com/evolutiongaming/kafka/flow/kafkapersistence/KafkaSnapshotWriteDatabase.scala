@@ -9,7 +9,7 @@ import cats.syntax.all.*
 import com.evolutiongaming.catshelper.FromTry
 import com.evolutiongaming.kafka.flow.KafkaKey
 import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
-import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
+import com.evolutiongaming.kafka.flow.snapshot.{SnapshotWriteDatabase, Stored}
 import com.evolutiongaming.skafka.consumer.ConsumerGroupMetadata
 import com.evolutiongaming.skafka.producer.{Producer, ProducerRecord}
 import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, ToBytes, TopicPartition}
@@ -189,13 +189,13 @@ object KafkaSnapshotWriteDatabase {
     snapshotTopicPartition: TopicPartition,
     partitionMapper: KafkaPersistencePartitionMapper,
     send: ProducerRecord[String, S] => F[Unit],
-    ): SnapshotWriteDatabase[F, KafkaKey, S] = new SnapshotWriteDatabase[F, KafkaKey, S] {
+  ): SnapshotWriteDatabase[F, KafkaKey, S] = new SnapshotWriteDatabase[F, KafkaKey, S] {
     // a present value persists the snapshot, an absent value is a tombstone (delete); the Kafka path fences by the
     // producer's transactional generation, so `stored.offset` is not needed here. The watermark is carried in the tombstone.
     override def write(key: KafkaKey, stored: Stored[S]): F[Unit] = {
       val snapshotWithWatermark = stored.value.map { snapshot =>
         // Encode the watermark in the snapshot (e.g., as a field or header)
-        snapshot
+        snapshot.copy(seenSeqNr = stored.seenSeqNr)
       }
       produce(key, snapshotWithWatermark)
     }
