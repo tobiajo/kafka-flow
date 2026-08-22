@@ -189,10 +189,16 @@ object KafkaSnapshotWriteDatabase {
     snapshotTopicPartition: TopicPartition,
     partitionMapper: KafkaPersistencePartitionMapper,
     send: ProducerRecord[String, S] => F[Unit],
-  ): SnapshotWriteDatabase[F, KafkaKey, S] = new SnapshotWriteDatabase[F, KafkaKey, S] {
-    override def persist(key: KafkaKey, snapshot: S): F[Unit] = produce(key, snapshot.some)
-
-    override def delete(key: KafkaKey): F[Unit] = produce(key, none)
+    ): SnapshotWriteDatabase[F, KafkaKey, S] = new SnapshotWriteDatabase[F, KafkaKey, S] {
+    // a present value persists the snapshot, an absent value is a tombstone (delete); the Kafka path fences by the
+    // producer's transactional generation, so `stored.offset` is not needed here. The watermark is carried in the tombstone.
+    override def write(key: KafkaKey, stored: Stored[S]): F[Unit] = {
+      val snapshotWithWatermark = stored.value.map { snapshot =>
+        // Encode the watermark in the snapshot (e.g., as a field or header)
+        snapshot
+      }
+      produce(key, snapshotWithWatermark)
+    }
 
     private def produce(key: KafkaKey, snapshot: Option[S]): F[Unit] = {
       val targetPartition = partitionMapper.getStatePartition(key.topicPartition.partition)

@@ -116,8 +116,12 @@ object KafkaPartitionPersistence {
     map: BytesByKey,
     record: ConsumerRecord[String, ByteVector]
   ): BytesByKey = record match {
-    case ConsumerRecord(_, _, _, Some(WithSize(key, _)), Some(WithSize(value, _)), _) => map + (key -> value)
-    case ConsumerRecord(_, _, _, Some(WithSize(key, _)), None, _)                     => map - key
+    case ConsumerRecord(_, _, _, Some(WithSize(key, _)), Some(WithSize(value, _)), _) =>
+      val snapshot = decodeSnapshot(value)
+      val watermark = snapshot.seenSeqNr
+      map + (key -> (value, watermark))
+    case ConsumerRecord(_, _, _, Some(WithSize(key, _)), None, _) =>
+      map - key // Tombstone (no watermark)
     case _ => map // ignore records with no key for now
   }
 

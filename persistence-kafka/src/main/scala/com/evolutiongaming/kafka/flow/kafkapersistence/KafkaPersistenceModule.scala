@@ -357,7 +357,7 @@ object KafkaPersistenceModule {
   ): F[SnapshotPersistenceOf[F, KafkaKey, S, ConsumerRecord[String, ByteVector]]] =
     LogOf[F].apply(classOf[KafkaPersistenceModule[F, S]]).map { implicit log =>
       val read =
-        KafkaSnapshotReadDatabase.of[F, S](snapshotTopicPartition.topic, getState = key => cache.remove(key).flatten)
+        KafkaSnapshotReadDatabase.of[F, S](snapshotTopicPartition.topic, getState = key => cache.get(key))
 
       val snapshotDatabase = SnapshotDatabase(
         read  = read,
