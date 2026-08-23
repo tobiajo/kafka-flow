@@ -9,7 +9,7 @@ import cats.syntax.all.*
 import com.evolutiongaming.catshelper.FromTry
 import com.evolutiongaming.kafka.flow.KafkaKey
 import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
-import com.evolutiongaming.kafka.flow.snapshot.{SnapshotWriteDatabase, Stored}
+import com.evolutiongaming.kafka.flow.snapshot.{KafkaSnapshot, SnapshotWriteDatabase, Stored}
 import com.evolutiongaming.skafka.consumer.ConsumerGroupMetadata
 import com.evolutiongaming.skafka.producer.{Producer, ProducerRecord}
 import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, ToBytes, TopicPartition}
@@ -20,8 +20,9 @@ object KafkaSnapshotWriteDatabase {
     snapshotTopicPartition: TopicPartition,
     producer: Producer[F],
     partitionMapper: KafkaPersistencePartitionMapper = KafkaPersistencePartitionMapper.identity,
-  ): SnapshotWriteDatabase[F, KafkaKey, S] =
+  ): SnapshotWriteDatabase[F, KafkaKey, S] = {
     apply(snapshotTopicPartition, partitionMapper, record => producer.send(record).flatten.void)
+  }
 
   /** Result of [[transactional]]: the snapshot write database plus a `ScheduleCommit` that routes input offset commits
     * through the same per-partition transactions as the snapshot writes.
@@ -61,11 +62,11 @@ object KafkaSnapshotWriteDatabase {
       transactionLock <- Semaphore[F](1)
       // writes are bounded by maxWritesPerTransaction per transaction; offset-only markers ride on a separate
       // unbounded lane so they never consume a write slot (periodic offset commits must not cut write throughput)
-      writes  <- Queue.unbounded[F, Pending[F, S]]
-      markers <- Queue.unbounded[F, Pending[F, S]]
+      writes  <- Queue.unbounded[F, Pending[F, KafkaSnapshot[S]]]
+      markers <- Queue.unbounded[F, Pending[F, KafkaSnapshot[S]]]
       // seed with the assigned offset so the first flush already carries an offset and is generation-gated
       offsetToCommit <- Ref[F].of(assignedOffset)
-      groupCommit = new GroupCommit(
+      groupCommit = new GroupCommit[F, S](
         producer,
         maxWritesPerTransaction,
         transactionLock,
@@ -83,12 +84,12 @@ object KafkaSnapshotWriteDatabase {
     )
 
   /** Group-commit machinery backing [[transactional]]. The producer allows one open transaction at a time, so
-    * `transactionLock` serializes them and each holder group-commits up to `maxWritesPerTransaction` writes plus all
-    * queued offset-only markers in one transaction, binding the latest offset to gate it. Markers ride a separate lane
-    * so they never consume a write slot. The over-cap backlog, empty batches and cancellation are handled at the
-    * methods below; all paths are safe - an interrupted flush never advances the offset. See
-    * `docs/kafka-single-writer-design.md`.
-    */
+     * `transactionLock` serializes them and each holder group-commits up to `maxWritesPerTransaction` writes plus all
+     * queued offset-only markers in one transaction, binding the latest offset to gate it. Markers ride a separate lane
+     * so they never consume a write slot. The over-cap backlog, empty batches and cancellation are handled at the
+     * methods below; all paths are safe - an interrupted flush never advances the offset. See
+     * `docs/kafka-single-writer-design.md`.
+     */
   private final class GroupCommit[F[_]: FromTry: Concurrent, S: ToBytes[F, *]](
     producer: Producer[F],
     maxWritesPerTransaction: Int,
@@ -191,7 +192,8 @@ object KafkaSnapshotWriteDatabase {
     send: ProducerRecord[String, S] => F[Unit],
   ): SnapshotWriteDatabase[F, KafkaKey, S] = new SnapshotWriteDatabase[F, KafkaKey, S] {
     // a present value persists the snapshot, an absent value is a tombstone (delete); the Kafka path fences by the
-    // producer's transactional generation, so `stored.offset` is not needed here
+    // producer's transactional generation, so `stored.offset` is not needed here for fencing.
+    // However, we now track offsets for floor-based safe deletes when used with offset-carrying read database.
     override def write(key: KafkaKey, stored: Stored[S]): F[Unit] = produce(key, stored.value)
 
     private def produce(key: KafkaKey, snapshot: Option[S]): F[Unit] = {
