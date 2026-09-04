@@ -53,9 +53,13 @@ can implement its own protection — see [Custom snapshot storage](#custom-snaps
 
 You do not catch the rejection yourself; it is handled for you:
 
-- **Periodic flush** — the conflict fails the stale instance's flow. That is safe (it no longer owns
-  the partition), unless you set `persistPeriodically(ignorePersistErrors = true)`, in which case it
-  is logged and swallowed.
+- **Periodic flush and periodic offset commit** — the rejection is logged at `warn`, counted in
+  `snapshot_write_fenced_total`, and retried on the next tick: the key stays dirty and keeps holding
+  its offset, and the committed offset stays where it was. That covers the common case, a still-valid
+  owner fenced during a rebalance, which heals as soon as the consumer's next poll refreshes its
+  generation; a genuinely stale owner is torn down by that same poll. Only an unbroken run of
+  rejections longer than `fenceTolerance` (default 1 minute) fails the flow. `ignorePersistErrors`
+  is not needed for this and can stay off, so every other persist error still fails the flow.
 - **Flush-on-revoke** — the conflict surfaces as a cache-entry release error that scache prints to
   `System.err` — not via the logging framework — and swallows
   (`scache: failed to release cache entry: ...`), so the partition hands off cleanly.
@@ -82,7 +86,7 @@ val moduleOf = KafkaPersistenceModuleOf.cachingTransactional[F, State](
     producerConfig        = snapshotProducerConfig,
     transactionalIdPrefix = applicationId,
     snapshotTopic         = stateTopic,
-    // also tunable: maxWritesPerTransaction, recoveryStallTimeout (both below)
+    // also tunable: maxWritesPerTransaction, recoveryStallTimeout, fenceTolerance (all below)
   ),
 )
 // wire it into the flow as usual:
@@ -157,6 +161,14 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   so alert on this mode's log signals, not on lag. Keep the value well below `max.poll.interval.ms` and above
   the legitimate wait for an unfinished transaction (`transaction.timeout.ms` plus the broker's
   abort scan).
+- **A fence is tolerated, briefly** — `fenceTolerance` (default 1 min) bounds how long an unbroken run
+  of rejected writes and commits is retried before one fails the flow (What a rejected write looks
+  like, above). Keep it at a few commit ticks and well inside `max.poll.interval.ms`: a member that
+  cannot obtain a valid generation for that long has a different problem, and failing is the right
+  escape. `Duration.Zero` fails on the first rejection. Alert on a run of rejections, not on the
+  counter alone: `snapshot_write_fenced_total` tracks churn (deploys, evictions, scale changes) by
+  design, and a rejection that tracks poll age instead of churn is an eviction — a liveness fault
+  that shows as the same rejection.
 - **Reducing truncation risk** — the deadline only *flags* lost records; it cannot recover them, and it
   catches truncation only while a recovery read is in flight. Reads run only at partition assignment,
   so a truncation usually lands between them and is adopted silently by the next recovery. So guard
@@ -174,7 +186,8 @@ Limitations:
   `flushOnRevoke` does not shrink the replay window there.
 - A stale owner's late `initTransactions` can fence the current owner's producer: the current owner's flow
   fails once and recovers (rebalance and replay); no wrong write can land. Rare, and a different
-  fence — the producer epoch (its errors above), not the group generation (`CommitFailedException`).
+  fence — the producer epoch (its errors above), not the group generation (`CommitFailedException`) —
+  which is not tolerated: that producer is unusable.
 - A `transactionalIdPrefix` change can cost recovery a wait: an old-prefix instance that dies
   mid-transaction during the rollout (any unclean death — a crash, an OOM kill, a forced pod
   delete) leaves that transaction under an id no new instance will ever init, so recovery waits
@@ -187,8 +200,8 @@ Limitations:
   a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols
   (`group.protocol=classic|consumer`). With `consumer`, use **brokers 4.3.0+** — below that a still-valid
-  owner can be spuriously fenced during a rebalance and crash; the restart converges, but any later
-  rebalance can fence again (safe, never corruption, but not stable).
+  owner is spuriously fenced on more rebalances; each is tolerated and retried (above), so the cost is
+  a delayed flush and a warning per rebalance, never corruption.
 
 ### Custom snapshot storage
 

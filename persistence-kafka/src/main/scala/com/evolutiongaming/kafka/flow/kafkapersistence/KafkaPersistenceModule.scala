@@ -9,7 +9,12 @@ import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
 import com.evolutiongaming.kafka.flow.key.{Keys, KeysOf}
 import com.evolutiongaming.kafka.flow.metrics.syntax.*
 import com.evolutiongaming.kafka.flow.persistence.{PersistenceOf, SnapshotPersistenceOf}
-import com.evolutiongaming.kafka.flow.snapshot.{SnapshotDatabase, SnapshotWriteDatabase, SnapshotsOf}
+import com.evolutiongaming.kafka.flow.snapshot.{
+  SnapshotDatabase,
+  SnapshotWriteDatabase,
+  SnapshotWriteMetrics,
+  SnapshotsOf
+}
 import com.evolutiongaming.kafka.flow.{FlowMetrics, KafkaKey, PartitionAssignment}
 import com.evolutiongaming.skafka.consumer.{ConsumerConfig, ConsumerOf, IsolationLevel}
 import com.evolutiongaming.skafka.producer.{Producer, ProducerConfig, ProducerOf}
@@ -59,6 +64,13 @@ object KafkaPersistenceModule {
     *   how long a snapshot recovery read may make no progress before it fails with `RecoveryReadStalledError` instead
     *   of hanging. Keep it below the driving consumer's `max.poll.interval.ms` - including one diagnostic re-read on
     *   failure, bounded by the snapshot consumer's `default.api.timeout.ms` - and above the open-transaction wait.
+    * @param fenceTolerance
+    *   how long an unbroken run of generation fences (snapshot writes or offset commits the broker rejected for a stale
+    *   consumer generation) is tolerated before one fails the flow, see [[KafkaSnapshotWriteDatabase.transactional]].
+    *   Within it the flow keeps the fenced state dirty and the offset uncommitted and retries on its next tick, which
+    *   is all a fence needs: the consumer refreshes its generation on the next poll. A run that outlasts it means the
+    *   member cannot obtain a valid generation, and failing is the right escape. `Duration.Zero` fails on the first
+    *   fence.
     */
   final case class TransactionalConfig(
     consumerConfig: ConsumerConfig,
@@ -67,6 +79,7 @@ object KafkaPersistenceModule {
     snapshotTopic: Topic,
     maxWritesPerTransaction: Int         = TransactionalConfig.DefaultMaxWritesPerTransaction,
     recoveryStallTimeout: FiniteDuration = TransactionalConfig.DefaultRecoveryStallTimeout,
+    fenceTolerance: FiniteDuration       = TransactionalConfig.DefaultFenceTolerance,
   )
 
   object TransactionalConfig {
@@ -80,6 +93,12 @@ object KafkaPersistenceModule {
       * clears both configuration bounds at Kafka defaults.
       */
     private[kafkapersistence] val DefaultRecoveryStallTimeout: FiniteDuration = 3.minutes
+
+    /** Default for [[TransactionalConfig.fenceTolerance]]: a few commit ticks at a short `commitOffsetsInterval`, and
+      * well inside the rebalance timeout (`max.poll.interval.ms`, 5 minutes at Kafka defaults) a member has to obtain a
+      * valid generation.
+      */
+    private[kafkapersistence] val DefaultFenceTolerance: FiniteDuration = 1.minute
   }
 
   def caching[F[_]: LogOf: Concurrent: Parallel: Runtime, S](
@@ -169,11 +188,12 @@ object KafkaPersistenceModule {
     * `transactional.id`, whose `initTransactions` aborts any transaction a crashed previous owner left open; snapshot
     * writes run in group-committed transactions (see [[KafkaSnapshotWriteDatabase.transactional]]) that also commit the
     * input offset. A stale consumer generation is rejected by the broker (KIP-447), aborting the transaction, so a
-    * stale owner can neither advance offsets nor overwrite a newer snapshot. Recovery reads with `read_committed`,
-    * bounded by the high watermark so an open transaction the takeover does not reach is waited out, and unlike
-    * `caching` the identity partition mapping is always used; output stays at-least-once. See the "Protecting against
-    * stale snapshot writes" persistence docs for guarantees, limitations, costs and rollout, and
-    * `docs/kafka-single-writer-design.md` for the mechanism.
+    * stale owner can neither advance offsets nor overwrite a newer snapshot; the flow tolerates the rejection for
+    * `fenceTolerance` (retrying on its next tick, once the poll has refreshed the generation) and counts it in
+    * `snapshot_write_fenced_total`. Recovery reads with `read_committed`, bounded by the high watermark so an open
+    * transaction the takeover does not reach is waited out, and unlike `caching` the identity partition mapping is
+    * always used; output stays at-least-once. See the "Protecting against stale snapshot writes" persistence docs for
+    * guarantees, limitations, costs and rollout, and `docs/kafka-single-writer-design.md` for the mechanism.
     *
     * The `assignment` must describe the input partition of the SAME consumer that drives this flow (its `groupMetadata`
     * generation is what fences a stale owner); `assignedAt` seeds the offset-to-commit so even the first write is
@@ -192,8 +212,15 @@ object KafkaPersistenceModule {
   ): Resource[F, KafkaPersistenceModule[F, S]] = {
     val snapshotTopicPartition = TopicPartition(config.snapshotTopic, assignment.topicPartition.partition)
     for {
-      log           <- Resource.eval(LogOf[F].apply(KafkaPersistenceModule.getClass))
-      transactional <- transactionalWriteDatabase[F, S](producerOf, config, assignment, snapshotTopicPartition, log)
+      log <- Resource.eval(LogOf[F].apply(KafkaPersistenceModule.getClass))
+      transactional <- transactionalWriteDatabase[F, S](
+        producerOf,
+        config,
+        assignment,
+        snapshotTopicPartition,
+        metrics.snapshotWriteMetrics,
+        log,
+      )
       // records of aborted transactions (e.g. of a fenced previous owner) must not be recovered as snapshots
       parts <- of(
         consumerOf             = consumerOf,
@@ -219,12 +246,13 @@ object KafkaPersistenceModule {
     config: TransactionalConfig,
     assignment: PartitionAssignment[F],
     snapshotTopicPartition: TopicPartition,
+    metrics: SnapshotWriteMetrics[F],
     log: Log[F],
   )(
     implicit toBytesState: ToBytes[F, S]
   ): Resource[F, KafkaSnapshotWriteDatabase.Transactional[F, S]] = {
     implicit val fromTry: FromTry[F] = FromTry.lift
-    import config.{maxWritesPerTransaction, producerConfig, transactionalIdPrefix}
+    import config.{fenceTolerance, maxWritesPerTransaction, producerConfig, transactionalIdPrefix}
     import assignment.{assignedAt, groupMetadata, topicPartition as inputTopicPartition}
 
     val partition       = inputTopicPartition.partition
@@ -253,6 +281,8 @@ object KafkaPersistenceModule {
           groupMetadata           = groupMetadata,
           assignedOffset          = assignedAt,
           maxWritesPerTransaction = maxWritesPerTransaction,
+          fenceTolerance          = fenceTolerance,
+          metrics                 = metrics,
         )
       )
     } yield transactional

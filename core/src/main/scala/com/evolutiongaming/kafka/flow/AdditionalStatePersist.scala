@@ -4,7 +4,7 @@ import cats.Applicative
 import cats.effect.syntax.all.*
 import cats.effect.{Clock, MonadCancel, MonadCancelThrow, Ref}
 import cats.syntax.all.*
-import com.evolutiongaming.kafka.flow.kafka.OffsetToCommit
+import com.evolutiongaming.kafka.flow.kafka.{GenerationFencedError, OffsetToCommit}
 import com.evolutiongaming.kafka.flow.persistence.Persistence
 import com.evolutiongaming.skafka.consumer.ConsumerRecord
 import scodec.bits.ByteVector
@@ -88,6 +88,13 @@ object AdditionalStatePersist {
               _ <- F.whenA(lastPersisted.forall(ts => now - ts.toEpochMilli > cooldownMs)) {
                 for {
                   _ <- persistence.flush.attempt.flatMap {
+                    // the fence heals on the next poll; the state stays dirty for the periodic persist to retry
+                    case Left(e: GenerationFencedError) =>
+                      keyContext
+                        .log
+                        .warn(
+                          s"Additional persisting fenced by a stale consumer generation, left to the periodic persist: $e"
+                        )
                     case Left(e) if ignorePersistErrors =>
                       val trimmedState = state.toString.take(charsToPrint)
                       keyContext

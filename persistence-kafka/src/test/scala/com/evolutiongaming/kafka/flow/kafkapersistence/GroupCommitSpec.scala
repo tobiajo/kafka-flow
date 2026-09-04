@@ -1,5 +1,6 @@
 package com.evolutiongaming.kafka.flow.kafkapersistence
 
+import cats.Applicative
 import cats.data.NonEmptyMap
 import cats.effect.testkit.TestControl
 import cats.effect.unsafe.implicits.global
@@ -7,19 +8,24 @@ import cats.effect.{Deferred, IO, Ref}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.FromTry
 import com.evolutiongaming.kafka.flow.KafkaKey
+import com.evolutiongaming.kafka.flow.kafka.GenerationFencedError
 import com.evolutiongaming.kafka.flow.kafkapersistence.GroupCommitSpec.*
+import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteMetrics
 import com.evolutiongaming.skafka.consumer.ConsumerGroupMetadata
 import com.evolutiongaming.skafka.producer.{Producer, ProducerRecord, RecordMetadata}
 import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, Partition, ToBytes, Topic, TopicPartition}
 import munit.FunSuite
+import org.apache.kafka.clients.consumer.CommitFailedException
+import org.apache.kafka.common.KafkaException
 
 import scala.concurrent.duration.*
 
 /** Local (no broker) tests of the group-commit orchestration behind `KafkaSnapshotWriteDatabase.transactional`:
   * batching under the cap, committing the input offset on every transaction, the offset-only commit marker, the seeded
-  * first offset, and the abort / fail-loud paths. A recording in-memory `Producer` stands in for the broker - this is
-  * orchestration logic, independent of any broker behavior. The broker's generation fencing (the part that genuinely
-  * needs Kafka) is covered by `TransactionalKafkaPersistenceSpec`.
+  * first offset, the abort / fail-loud paths, and the classification of a generation fence under its tolerance. A
+  * recording in-memory `Producer` stands in for the broker - this is orchestration logic, independent of any broker
+  * behavior. The broker's generation fencing (the part that genuinely needs Kafka) is covered by
+  * `TransactionalKafkaPersistenceSpec`.
   */
 class GroupCommitSpec extends FunSuite {
 
@@ -37,7 +43,9 @@ class GroupCommitSpec extends FunSuite {
     producer: Producer[IO],
     groupMetadata: Option[ConsumerGroupMetadata],
     maxWritesPerTransaction: Int,
-    assignedOffset: Offset = Offset.min,
+    assignedOffset: Offset            = Offset.min,
+    fenceTolerance: FiniteDuration    = KafkaPersistenceModule.TransactionalConfig.DefaultFenceTolerance,
+    metrics: SnapshotWriteMetrics[IO] = SnapshotWriteMetrics.empty[IO],
   ): IO[KafkaSnapshotWriteDatabase.Transactional[IO, String]] =
     KafkaSnapshotWriteDatabase.transactional[IO, String](
       snapshotTopicPartition  = snapshotTopicPartition,
@@ -46,7 +54,22 @@ class GroupCommitSpec extends FunSuite {
       groupMetadata           = IO.pure(groupMetadata),
       assignedOffset          = assignedOffset,
       maxWritesPerTransaction = maxWritesPerTransaction,
+      fenceTolerance          = fenceTolerance,
+      metrics                 = metrics,
     )
+
+  // counts `fenced` calls per input partition
+  private def fenceCounter: IO[(SnapshotWriteMetrics[IO], IO[List[TopicPartition]])] =
+    Ref.of[IO, List[TopicPartition]](Nil).map { fences =>
+      val metrics = new SnapshotWriteMetrics[IO] {
+        def fenced(topicPartition: TopicPartition)(implicit F: Applicative[IO]): IO[Unit] =
+          fences.update(_ :+ topicPartition)
+      }
+      (metrics, fences.get)
+    }
+
+  private def isGenerationFence(e: Throwable): Boolean =
+    Iterator.iterate(e)(_.getCause).takeWhile(_ != null).exists(_.isInstanceOf[CommitFailedException])
 
   // transactions never interleave (the group-commit lock serializes them), so the event log splits into transactions
   // at each Begin; this counts the records sent within each one
@@ -213,6 +236,7 @@ class GroupCommitSpec extends FunSuite {
         groupMetadata           = gmRef.get,
         assignedOffset          = Offset.min,
         maxWritesPerTransaction = 256,
+        fenceTolerance          = KafkaPersistenceModule.TransactionalConfig.DefaultFenceTolerance,
       )
       _   <- tx.writeDatabase.persist(kafkaKey("key1"), "state-1") // commits under generation 1
       _   <- gmRef.set(generation(2).some) // a rebalance advances the generation
@@ -222,15 +246,126 @@ class GroupCommitSpec extends FunSuite {
     test.unsafeRunSync()
   }
 
-  test("a commit failure aborts the transaction and surfaces to the caller") {
+  test("a commit failure aborts the transaction and surfaces to the caller, unclassified and uncounted") {
+    val test = for {
+      events           <- Ref.of[IO, Vector[Event]](Vector.empty)
+      counter          <- fenceCounter
+      (metrics, fenced) = counter
+      tx <- buildTransactional(
+        recordingProducer(events, failCommit = true),
+        ConsumerGroupMetadata.Empty.some,
+        256,
+        metrics = metrics
+      )
+      result <- tx.writeDatabase.persist(kafkaKey("key1"), "state-1").attempt
+      log    <- events.get
+      fenced <- fenced
+    } yield {
+      assertEquals(result, Left(CommitBoom)) // not a fence: surfaces as is
+      assertEquals(log.count(_ == Event.Commit), 0)
+      assert(log.contains(Event.Abort), s"aborted: $log")
+      assertEquals(fenced, Nil)
+    }
+    test.unsafeRunSync()
+  }
+
+  List(
+    "bare"                                 -> new CommitFailedException("stale generation"),
+    "wrapped by a fenced producer's state" -> new KafkaException("error state", new CommitFailedException()),
+  ).foreach {
+    case (shape, error) =>
+      test(
+        s"a generation fence ($shape) aborts, is counted per input partition and surfaces as GenerationFencedError"
+      ) {
+        // one outcome for the whole batch: the write and the offset-only marker riding the same transaction both see
+        // the fenced type, so their callers keep the state dirty / the offset uncommitted and retry
+        val test = for {
+          events           <- Ref.of[IO, Vector[Event]](Vector.empty)
+          fence            <- Ref.of[IO, Option[Throwable]](error.some)
+          counter          <- fenceCounter
+          (metrics, fenced) = counter
+          tx <- buildTransactional(
+            recordingProducer(events, failOffsets = fence.get),
+            ConsumerGroupMetadata.Empty.some,
+            256,
+            metrics = metrics,
+          )
+          write  <- tx.writeDatabase.persist(kafkaKey("key1"), "state-1").attempt
+          marker <- tx.scheduleCommit.schedule(Offset.unsafe(7)).attempt
+          log    <- events.get
+          fenced <- fenced
+        } yield {
+          List(write, marker).foreach {
+            case Left(GenerationFencedError(cause)) => assertEquals(cause, error)
+            case other                              => fail(s"expected GenerationFencedError, got $other")
+          }
+          assertEquals(log.count(_ == Event.Commit), 0)
+          assertEquals(log.count(_ == Event.Abort), 2)
+          assertEquals(fenced, List(inputTopicPartition, inputTopicPartition))
+        }
+        test.unsafeRunSync()
+      }
+  }
+
+  test("fences are tolerated for fenceTolerance from the streak's first fence; a committed transaction resets it") {
+    // virtual time: the tolerance is measured on the monotonic clock, which TestControl advances with IO.sleep
+    val tolerance = 1.minute
+    val program = for {
+      events           <- Ref.of[IO, Vector[Event]](Vector.empty)
+      fence            <- Ref.of[IO, Option[Throwable]](none)
+      counter          <- fenceCounter
+      (metrics, fenced) = counter
+      tx <- buildTransactional(
+        recordingProducer(events, failOffsets = fence.get),
+        ConsumerGroupMetadata.Empty.some,
+        256,
+        fenceTolerance = tolerance,
+        metrics        = metrics,
+      )
+      write   = tx.writeDatabase.persist(kafkaKey("key1"), "state-1").attempt
+      _      <- fence.set(new CommitFailedException("stale").some)
+      first  <- write // t = 0: the streak starts
+      _      <- IO.sleep(tolerance - 1.second)
+      inside <- write // t = 59s: still inside
+      _      <- IO.sleep(2.seconds)
+      past   <- write // t = 61s: the member could not obtain a valid generation within the tolerance
+      _      <- fence.set(none)
+      healed <- write // a committed transaction ends the streak
+      _      <- fence.set(new CommitFailedException("stale again").some)
+      fresh  <- write // a new streak is tolerated again
+      fenced <- fenced
+    } yield {
+      assert(first.left.exists(_.isInstanceOf[GenerationFencedError]), s"first: $first")
+      assert(inside.left.exists(_.isInstanceOf[GenerationFencedError]), s"inside: $inside")
+      past match {
+        case Left(e) =>
+          assert(!e.isInstanceOf[GenerationFencedError], s"past the tolerance the raw error propagates: $e")
+          assert(isGenerationFence(e), s"the raw fence keeps its cause: $e")
+        case Right(()) => fail("expected the fence past the tolerance to fail")
+      }
+      assertEquals(healed, Right(()))
+      assert(fresh.left.exists(_.isInstanceOf[GenerationFencedError]), s"fresh: $fresh")
+      assertEquals(fenced.size, 4) // every fence counts, tolerated or not
+    }
+    TestControl.executeEmbed(program).unsafeRunSync()
+  }
+
+  test("fenceTolerance = Zero fails on the first fence") {
     val test = for {
       events <- Ref.of[IO, Vector[Event]](Vector.empty)
-      tx     <- buildTransactional(recordingProducer(events, failCommit = true), ConsumerGroupMetadata.Empty.some, 256)
+      tx <- buildTransactional(
+        recordingProducer(events, failOffsets = IO.pure(new CommitFailedException("stale").some)),
+        ConsumerGroupMetadata.Empty.some,
+        256,
+        fenceTolerance = Duration.Zero,
+      )
       result <- tx.writeDatabase.persist(kafkaKey("key1"), "state-1").attempt
       log    <- events.get
     } yield {
-      assert(result.isLeft, s"error surfaced: $result")
-      assertEquals(log.count(_ == Event.Commit), 0)
+      result match {
+        case Left(e)   => assert(!e.isInstanceOf[GenerationFencedError] && isGenerationFence(e), s"got $e")
+        case Right(()) => fail("expected the fence to fail")
+      }
       assert(log.contains(Event.Abort), s"aborted: $log")
     }
     test.unsafeRunSync()
@@ -251,12 +386,14 @@ object GroupCommitSpec {
   private val CommitBoom = new RuntimeException("commit boom")
 
   /** A `Producer` that records the transactional calls into `events` and delegates everything else to a no-op producer
-    * (which also fabricates the `RecordMetadata` for `send`). `failCommit` makes `commitTransaction` raise.
+    * (which also fabricates the `RecordMetadata` for `send`). `failCommit` makes `commitTransaction` raise;
+    * `failOffsets` makes `sendOffsetsToTransaction` raise the given error (the broker's rejection of a commit).
     */
   def recordingProducer(
     events: Ref[IO, Vector[Event]],
-    failCommit: Boolean          = false,
-    onBeginTransaction: IO[Unit] = IO.unit,
+    failCommit: Boolean                = false,
+    onBeginTransaction: IO[Unit]       = IO.unit,
+    failOffsets: IO[Option[Throwable]] = IO.pure(none),
   ): Producer[IO] = {
     val base = Producer.empty[IO]
     new Producer[IO] {
@@ -268,7 +405,11 @@ object GroupCommitSpec {
       def sendOffsetsToTransaction(
         offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata],
         consumerGroupMetadata: ConsumerGroupMetadata,
-      ): IO[Unit] = events.update(_ :+ Event.Offsets(offsets.head._2.offset, consumerGroupMetadata.generationId))
+      ): IO[Unit] =
+        failOffsets.flatMap {
+          case Some(error) => IO.raiseError(error)
+          case None => events.update(_ :+ Event.Offsets(offsets.head._2.offset, consumerGroupMetadata.generationId))
+        }
 
       def send[K, V](
         record: ProducerRecord[K, V]
