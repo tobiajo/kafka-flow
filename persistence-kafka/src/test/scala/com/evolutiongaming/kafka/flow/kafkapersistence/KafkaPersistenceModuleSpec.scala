@@ -1,11 +1,17 @@
 package com.evolutiongaming.kafka.flow.kafkapersistence
 
+import cats.Applicative
+import cats.data.NonEmptyMap
 import cats.effect.testkit.TestControl
 import cats.effect.unsafe.implicits.global
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.LogOf
-import com.evolutiongaming.kafka.flow.PartitionAssignment
+import com.evolutiongaming.kafka.flow.kafka.GenerationFencedError
+import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteMetrics
+import com.evolutiongaming.kafka.flow.{FlowMetrics, PartitionAssignment}
+import com.evolutiongaming.skafka.OffsetAndMetadata
+import org.apache.kafka.clients.consumer.CommitFailedException
 import com.evolutiongaming.skafka.consumer.{
   AutoOffsetReset,
   Consumer as SkafkaConsumer,
@@ -24,7 +30,8 @@ import scala.concurrent.duration.*
   * `transactional.id` (a takeover must abort a crashed owner's unfinished transaction) and idempotence - applied over
   * whatever `producerConfig` carries. Its recovery read is wired `read_committed` from earliest with the configured
   * deadline enabled, and its ephemeral consumers are group-less and never commit offsets - a committed offset would
-  * override the earliest reset on the next recovery.
+  * override the earliest reset on the next recovery. Its writer gets the configured fence tolerance and the
+  * `FlowMetrics` fence counter.
   */
 class KafkaPersistenceModuleSpec extends FunSuite {
 
@@ -134,6 +141,89 @@ class KafkaPersistenceModuleSpec extends FunSuite {
       }
     }
     TestControl.executeEmbed(test).unsafeRunSync()
+  }
+
+  List(
+    "the default tolerance surfaces the fence as GenerationFencedError" -> (none[FiniteDuration], true),
+    "fenceTolerance = Zero fails on the first fence"                    -> (Duration.Zero.some, false),
+  ).foreach {
+    case (name, (fenceTolerance, tolerated)) =>
+      test(s"the module wires fenceTolerance and the fence counter into its writer: $name") {
+        // the broker's rejection of the offset commit, as kafka-clients raises it
+        val fencingProducer: Producer[IO] = new Producer[IO] {
+          private val base                = Producer.empty[IO]
+          def initTransactions: IO[Unit]  = base.initTransactions
+          def beginTransaction: IO[Unit]  = base.beginTransaction
+          def commitTransaction: IO[Unit] = base.commitTransaction
+          def abortTransaction: IO[Unit]  = base.abortTransaction
+          def sendOffsetsToTransaction(
+            offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata],
+            consumerGroupMetadata: ConsumerGroupMetadata,
+          ): IO[Unit] = IO.raiseError(new CommitFailedException("stale generation"))
+          def send[K, V](record: com.evolutiongaming.skafka.producer.ProducerRecord[K, V])(
+            implicit toBytesK: com.evolutiongaming.skafka.ToBytes[IO, K],
+            toBytesV: com.evolutiongaming.skafka.ToBytes[IO, V]
+          ) = base.send(record)
+          def partitions(topic: com.evolutiongaming.skafka.Topic) = base.partitions(topic)
+          def flush: IO[Unit]                                     = base.flush
+          def clientMetrics                                       = base.clientMetrics
+          def clientInstanceId(timeout: FiniteDuration)           = base.clientInstanceId(timeout)
+        }
+        val inputTopicPartition = TopicPartition("input-topic", Partition.min)
+        val test = for {
+          fences <- Ref.of[IO, List[TopicPartition]](Nil)
+          metrics = new FlowMetrics[IO] {
+            private val empty                        = FlowMetrics.empty[IO]
+            def keyDatabaseMetrics                   = empty.keyDatabaseMetrics
+            def journalDatabaseMetrics               = empty.journalDatabaseMetrics
+            def snapshotDatabaseMetrics              = empty.snapshotDatabaseMetrics
+            def persistenceModuleMetrics             = empty.persistenceModuleMetrics
+            def foldOptionMetrics                    = empty.foldOptionMetrics
+            def enhancedFoldMetrics                  = empty.enhancedFoldMetrics
+            def keyStateOfMetrics                    = empty.keyStateOfMetrics
+            def partitionFlowOfMetrics               = empty.partitionFlowOfMetrics
+            def topicFlowOfMetrics                   = empty.topicFlowOfMetrics
+            def compressorMetrics(component: String) = empty.compressorMetrics(component)
+            def snapshotWriteMetrics = new SnapshotWriteMetrics[IO] {
+              def fenced(topicPartition: TopicPartition)(implicit F: Applicative[IO]): IO[Unit] =
+                fences.update(_ :+ topicPartition)
+            }
+          }
+          base = KafkaPersistenceModule.TransactionalConfig(
+            consumerConfig        = ConsumerConfig(),
+            producerConfig        = ProducerConfig(),
+            transactionalIdPrefix = "app",
+            snapshotTopic         = "state-topic",
+          )
+          config = fenceTolerance.fold(base)(tolerance => base.copy(fenceTolerance = tolerance))
+          producerOf = new ProducerOf[IO] {
+            def apply(config: ProducerConfig): Resource[IO, Producer[IO]] = Resource.pure(fencingProducer)
+          }
+          assignment = PartitionAssignment[IO](
+            topicPartition = inputTopicPartition,
+            assignedAt     = Offset.min,
+            groupMetadata  = IO.pure(ConsumerGroupMetadata.Empty.some),
+          )
+          result <- KafkaPersistenceModule
+            .cachingTransactional[IO, String](unusedConsumerOf, producerOf, config, assignment, metrics)
+            .use { module =>
+              module
+                .scheduleCommit
+                .getOrElse(fail("transactional module exposes no ScheduleCommit"))
+                .schedule(Offset.min)
+            }
+            .attempt
+          fenced <- fences.get
+        } yield {
+          result match {
+            case Left(_: GenerationFencedError) => assert(tolerated, s"expected the raw fence, got $result")
+            case Left(_: CommitFailedException) => assert(!tolerated, s"expected GenerationFencedError, got $result")
+            case other                          => fail(s"unexpected outcome $other")
+          }
+          assertEquals(fenced, List(inputTopicPartition))
+        }
+        test.unsafeRunSync()
+      }
   }
 
 }

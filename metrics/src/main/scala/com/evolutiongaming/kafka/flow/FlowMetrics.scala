@@ -14,8 +14,8 @@ import com.evolutiongaming.kafka.flow.key.KeyDatabaseMetrics.*
 import com.evolutiongaming.kafka.flow.metrics.{Metrics, MetricsK}
 import com.evolutiongaming.kafka.flow.persistence.PersistenceModule
 import com.evolutiongaming.kafka.flow.persistence.compression.Compressor
-import com.evolutiongaming.kafka.flow.snapshot.SnapshotDatabase
 import com.evolutiongaming.kafka.flow.snapshot.SnapshotDatabaseMetrics.*
+import com.evolutiongaming.kafka.flow.snapshot.{SnapshotDatabase, SnapshotWriteMetrics}
 import com.evolutiongaming.skafka.consumer.ConsumerRecord
 import com.evolutiongaming.smetrics.CollectorRegistry
 import scodec.bits.ByteVector
@@ -25,6 +25,7 @@ trait FlowMetrics[F[_]] {
   implicit def keyDatabaseMetrics: Metrics[KeyDatabase[F, KafkaKey]]
   implicit def journalDatabaseMetrics: Metrics[JournalDatabase[F, KafkaKey, ConsumerRecord[String, ByteVector]]]
   implicit def snapshotDatabaseMetrics: MetricsK[SnapshotDatabase[F, KafkaKey, *]]
+  def snapshotWriteMetrics: SnapshotWriteMetrics[F]
   implicit def persistenceModuleMetrics: MetricsK[PersistenceModule[F, *]]
   implicit def foldOptionMetrics: MetricsK[FoldOption[F, *, ConsumerRecord[String, ByteVector]]]
   implicit def enhancedFoldMetrics: MetricsK[EnhancedFold[F, *, ConsumerRecord[String, ByteVector]]]
@@ -43,6 +44,7 @@ object FlowMetrics {
     keyDatabase      <- keyDatabaseMetricsOf[F].apply(registry)
     journalDatabase  <- journalDatabaseMetricsOf[F].apply(registry)
     snapshotDatabase <- snapshotDatabaseMetricsOf[F].apply(registry)
+    snapshotWrite    <- SnapshotWriteMetrics.of[F](registry)
     persistenceModule = new MetricsK[PersistenceModule[F, *]] {
       def withMetrics[S](module: PersistenceModule[F, S]) = new PersistenceModule[F, S] {
         def keys      = keyDatabase.withMetrics(module.keys)
@@ -59,6 +61,7 @@ object FlowMetrics {
     def keyDatabaseMetrics                                           = keyDatabase
     def journalDatabaseMetrics                                       = journalDatabase
     def snapshotDatabaseMetrics                                      = snapshotDatabase
+    def snapshotWriteMetrics                                         = snapshotWrite
     def persistenceModuleMetrics                                     = persistenceModule
     def foldOptionMetrics                                            = foldMetrics.foldOptionMetrics
     def enhancedFoldMetrics                                          = foldMetrics.enhancedFoldMetrics
@@ -72,6 +75,7 @@ object FlowMetrics {
     def keyDatabaseMetrics       = Metrics.empty
     def journalDatabaseMetrics   = Metrics.empty
     def snapshotDatabaseMetrics  = MetricsK.empty[SnapshotDatabase[F, KafkaKey, *]]
+    def snapshotWriteMetrics     = SnapshotWriteMetrics.empty[F]
     def persistenceModuleMetrics = MetricsK.empty[PersistenceModule[F, *]]
     def foldOptionMetrics        = MetricsK.empty[FoldOption[F, *, ConsumerRecord[String, ByteVector]]]
     def enhancedFoldMetrics      = MetricsK.empty[EnhancedFold[F, *, ConsumerRecord[String, ByteVector]]]

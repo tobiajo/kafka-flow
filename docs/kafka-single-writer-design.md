@@ -105,9 +105,9 @@ Key points:
   The consumer-commit path still runs each poll cycle but now finds nothing staged — a no-op — so the
   partition is never committed through the consumer.
 - Both the write and the offset-only commit are **synchronous** — there is no background committer, so
-  the call itself drives the transaction and blocks on its outcome. That blocking is what lets a fence
-  (`CommitFailedException`) propagate into the flow and crash a stale owner, rather than being lost on a
-  fire-and-forget commit thread.
+  the call itself drives the transaction and blocks on its outcome. That blocking is what brings a fence
+  (`CommitFailedException`) back into the flow, where the fenced state is kept dirty and retried
+  (Tolerating a fence, below), rather than being lost on a fire-and-forget commit thread.
 - The fence is per **member + generation**, not per partition: the coordinator checks the committer's
   generation, not which partitions it still owns, so a member still on the current generation cannot be
   stopped from committing a partition it just lost. That is closed client-side: a revoked partition's
@@ -125,8 +125,9 @@ the flow.
 A generation captured once at assignment would miss a routine case: a rebalance can advance the
 generation while leaving this member's partitions unchanged. The capture would go stale, and the
 retained partition's next transactional commit would be spuriously fenced though the member still owns
-it, crashing a still-valid owner — safe (a fenced commit writes nothing), but not stable. Refreshing
-after every poll avoids it: a post-poll read follows the silent bump a rebalance callback does not.
+it, and every commit after it too — safe (a fenced commit writes nothing), but nothing would ever land
+again. Refreshing after every poll avoids it: a post-poll read follows the silent bump a rebalance
+callback does not.
 The unknown (negative) pre-join generation is never published — for a commit carrying it against an
 empty group (exactly the pre-join case) the coordinator *skips* generation validation, so it would
 land unfenced; a flush before the first join instead fails loudly rather than committing ungated.
@@ -254,7 +255,8 @@ classic **eager** assignor — which revokes and reassigns the full set on every
 callback that could be acted on.
 
 What the read cannot close is a residual window in which a still-valid owner is spuriously fenced — a
-liveness cost, never a safety one (a lagging token only fences). Under the classic protocol the window
+liveness cost, never a safety one (a lagging token only fences), and one the flow absorbs rather than
+crashes on (Tolerating a fence, below). Under the classic protocol the window
 is the in-flight join round: a round can span polls
 ([KIP-266](https://cwiki.apache.org/confluence/display/KAFKA/KIP-266%3A+Fix+consumer+indefinite+blocking+behavior)),
 and a flush of a retained partition
@@ -272,6 +274,55 @@ before the member rejoins, and the consumer protocol keeps the member on its epo
 acknowledges the revocation — under both, the flush commits. Classic **cooperative** has already moved
 the member to the new generation by revoke time, so its flush is always fenced (safe; the new owner
 replays). A member evicted before the flush is rejected under all three — the same safe direction.
+
+### Tolerating a fence
+
+The broker's rejection *is* the fence: the transaction aborted, so neither the snapshot nor the offset
+landed. Nothing more is needed from the flow, and failing it makes things worse. kafka-clients maps a
+stale-generation rejection of the offset commit (`ILLEGAL_GENERATION`, or `UNKNOWN_MEMBER_ID` for an
+evicted member) to an *abortable* `CommitFailedException`, so the producer survives the abort and can
+open the next transaction. The consumer heals itself: its heartbeat sees the same error and clears the
+generation, and the next poll either completes the in-flight join round — a retained partition then
+continues under the new generation — or rejoins with `onPartitionsLost`, which tears every flow down
+before the member re-enters the group. A flow that crashes on the fence adds a leave and a second join
+on top of that: two generation bumps instead of one, and each bump fences the peers' in-flight commits.
+Under a rolling deploy that amplification turns a handful of spurious fences into a retry storm
+(observed in preprod: three deploys became ~94 minutes of it).
+
+So a fence is tolerated, and classified once. Every fence surfaces in `KafkaSnapshotWriteDatabase`,
+where the snapshot batch and the offset-only marker share the transaction and a failure completes
+every pending item with the same error. There a `CommitFailedException` anywhere in the cause chain
+(kafka-clients re-raises through a fenced producer whose abort left the error state set as
+`KafkaException(cause = CommitFailedException)`) becomes `GenerationFencedError`; callers match on the
+type and nobody else walks cause chains.
+
+- **Persist path** (`TimerFlowOf`, and the additional persist): the key stays dirty and keeps holding
+  its last persisted offset, so the partition cannot commit past it, and the next tick retries — by
+  then the poll has refreshed the generation. This is what `ignorePersistErrors` does for every error,
+  applied to the fence alone, so the flag can stay off and every other persist error keeps failing the
+  flow. A key whose persist was fenced (or ignored) is also never unloaded: unloading drops its held
+  offset with it.
+- **Periodic commit path** (`PartitionFlow`): the partition's committed-offset marker advances only
+  once the commit is scheduled, so a fenced commit leaves it behind and the same offset is scheduled
+  again on the next tick — otherwise the swallowed fence would leave a silent hole until the next
+  progress.
+- **Bounded**: `fenceTolerance` (default 1 minute) is how long an unbroken run of fences is tolerated,
+  measured from the run's first fence and reset by any committed transaction; past it the underlying
+  error propagates and the flow fails as before. A member that cannot obtain a valid generation within
+  a rebalance timeout has a different problem, and the crash is the right escape there. The bound is a
+  duration, not a count, because a fenced persist wave fails many transactions within a single tick.
+- **Producer-epoch fences stay fatal** (`ProducerFencedException`, `InvalidProducerEpochException`):
+  that producer is unusable, and re-creating it in place is a separate step. The stale owner's late
+  `initTransactions` that raises it (Stable transactional.id, above) is rare.
+- **Counted**: `snapshot_write_fenced_total` (per input topic and partition) counts every fenced
+  transaction, tolerated or not. It should track churn — deploys, evictions, scale changes — and stay at
+  zero otherwise.
+
+An evicted member gets the same exception and the same answer. Its heartbeat sees `UNKNOWN_MEMBER_ID`,
+its generation and member id reset, and its next poll fires `onPartitionsLost`, tearing every flow down
+before it rejoins as a new member: the zombie lives at most one poll interval, and every write it
+attempts in that window is fenced. If the poll never comes the flow is stuck regardless, and the crash
+never helped there either — the commit runs on the poll thread. That case is a poll-age problem.
 
 ### Write path: group-committed transactions
 
@@ -308,6 +359,10 @@ Entry point: `KafkaPersistenceModuleOf.cachingTransactional`. In the current cod
   staged, it commits nothing (a no-op).
 - **Generation currency** — the `Consumer` wrapper holds `groupMetadata` in a `Ref`, refreshed after every
   poll.
+- **Fence tolerance** — classified in `KafkaSnapshotWriteDatabase` (`GroupCommit.classifyFence`, bounded
+  by `TransactionalConfig.fenceTolerance`) as `GenerationFencedError`; tolerated in
+  `TimerFlowOf.attemptToPersist`, `AdditionalStatePersist` and `PartitionFlow`'s periodic `commit`;
+  counted through `FlowMetrics.snapshotWriteMetrics` (`snapshot_write_fenced_total`).
 - **Recovery read** — `KafkaPartitionPersistence.readSnapshots` (the high-watermark capture, the
   drain to target, the start-of-read wait warn — logged when the captured target sits above the LSO).
 - **Stall deadline** — the read loop `KafkaPartitionPersistence.readPartitionWithDeadline`, failing
@@ -367,8 +422,10 @@ real broker:
   consumer generation* and asserts the newer snapshot survives.
 - **Generation fence, isolated** — under the stable id a stale flush dies at the epoch fence first
   (Stable transactional.id, above), so these tests drive a live, unfenced producer whose generation
-  alone is stale: the next periodic flush fails fast, the first flush is gated by the offset seeded
-  at assignment, and a transactional offset commit is rejected.
+  alone is stale: a fenced periodic flush lands nothing, leaves the flow running and lands on the
+  retry once the generation is current again (and fails fast at `fenceTolerance = Zero`); the first
+  flush is gated by the offset seeded at assignment; and a transactional offset commit is rejected
+  as `GenerationFencedError`.
 - **Concurrent writes** — a partition's keys flush in parallel against the one shared producer
   (Write path, above); asserted safe for distinct keys.
 - **Unfinished transactions, both resolutions** — the takeover-abort at the handover: the
@@ -391,11 +448,18 @@ Unit suites pin the client-side pieces the mechanism depends on:
 - **`GroupCommitSpec`** (persistence-kafka) — the group commit against a recording producer,
   broker-free (the fence itself is the integration suite's job): the committed offset never leads
   the writes it covers; offset-only commits ride free of the cap; a missing generation fails loudly
-  instead of committing ungated; and the generation is read live per transaction, never cached.
+  instead of committing ungated; the generation is read live per transaction, never cached; and the
+  fence classification (bare and wrapped `CommitFailedException`, counted once per transaction, the
+  tolerance window under virtual time, the reset on a committed transaction, `Zero`).
 - **`KafkaPersistenceModuleSpec`** (persistence-kafka) — the module's wiring: the producer settings,
   the `read_committed`-from-earliest read with the deadline enabled and the offset side cleared
   (group-less, no auto-commit — a committed offset would override the earliest reset on the next
-  recovery and silently shorten it).
+  recovery and silently shorten it), and `fenceTolerance` plus the `FlowMetrics` fence counter
+  reaching the writer.
+- **`TimerFlowOfSpec`, `AdditionalPersistSpec`, `PartitionFlowSpec`** (core) — the tolerated side:
+  a fenced persist keeps the key dirty, loaded and holding its offset with `ignorePersistErrors` off; a
+  fenced periodic commit is scheduled again with the same offset on the next tick and advances once it
+  goes through; any other commit error still fails the flow.
 - **`ReadSnapshotsSpec`** (persistence-kafka) — the read itself: the high-watermark target (a read
   bounded at the reader's own `endOffsets`, the LSO, would silently under-read), the deadline with
   its diagnosis (a failing re-read never masks the stall), a progressing read outliving the

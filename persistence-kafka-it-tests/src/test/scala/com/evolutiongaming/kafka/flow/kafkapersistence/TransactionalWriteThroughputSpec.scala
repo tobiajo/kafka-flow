@@ -191,6 +191,7 @@ class TransactionalWriteThroughputSpec extends ForAllKafkaSuite {
                 groupMetadata           = IO.pure(current.some),
                 assignedOffset          = Offset.min,
                 maxWritesPerTransaction = cap,
+                fenceTolerance          = KafkaPersistenceModule.TransactionalConfig.DefaultFenceTolerance,
               )
               .map(_.writeDatabase)
             _ <- database.persist(kafkaKey(stateTopic, "warm-up"), payload)
@@ -263,6 +264,7 @@ class TransactionalWriteThroughputSpec extends ForAllKafkaSuite {
                 groupMetadata           = IO.pure(current.some),
                 assignedOffset          = Offset.min,
                 maxWritesPerTransaction = KafkaPersistenceModule.TransactionalConfig.DefaultMaxWritesPerTransaction,
+                fenceTolerance          = KafkaPersistenceModule.TransactionalConfig.DefaultFenceTolerance,
               )
               .map(_.writeDatabase)
             _       <- database.persist(kafkaKey(stateTopic, "warm-up"), "warm-up")
