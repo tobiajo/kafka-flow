@@ -12,6 +12,7 @@ import com.evolutiongaming.skafka.consumer.ConsumerGroupMetadata
 import com.evolutiongaming.skafka.producer.{Producer, ProducerRecord, RecordMetadata}
 import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, Partition, ToBytes, Topic, TopicPartition}
 import munit.FunSuite
+import org.apache.kafka.common.errors.TimeoutException
 
 import scala.concurrent.duration.*
 
@@ -235,6 +236,36 @@ class GroupCommitSpec extends FunSuite {
     }
     test.unsafeRunSync()
   }
+
+  // a client-side commit timeout is ambiguous (the broker may have committed) and surfaces as itself; retrying it
+  // here is the tempting "fix" this guards against, since each attempt blocks up to max.block.ms inside a poll
+  // cycle. See docs/persistence.md. Only the kafka-flow side is pinnable with a fake: the real client throws from
+  // abortTransaction while a commit is unresolved, where this fake's abort succeeds.
+  test("an ambiguously timed-out commit surfaces as itself, unretried") {
+    val test = for {
+      events   <- Ref.of[IO, Vector[Event]](Vector.empty)
+      attempts <- Ref.of[IO, Int](0)
+      boom      = new TimeoutException("commit timed out")
+      commit    = attempts.update(_ + 1) *> IO.raiseError[Unit](boom)
+      tx <- buildTransactional(
+        recordingProducer(events, commitTransactionOf = commit.some),
+        ConsumerGroupMetadata.Empty.some,
+        maxWritesPerTransaction = 256,
+      )
+      result <- tx.writeDatabase.persist(kafkaKey("key1"), "state-1").attempt
+      tries  <- attempts.get
+      log    <- events.get
+    } yield {
+      // told it failed, though the broker may have committed - only a rebuilt producer resolves that
+      assertEquals(result.left.toOption, boom.some)
+      // exactly once: kafka-flow never retries it (the client may still retry the EndTxn on the wire)
+      assertEquals(tries, 1)
+      // the cleanup abort is attempted, and its own outcome never replaces the timeout above
+      assertEquals(log.count(_ == Event.Abort), 1)
+      assertEquals(log.count(_ == Event.Commit), 0)
+    }
+    test.unsafeRunSync()
+  }
 }
 
 object GroupCommitSpec {
@@ -251,19 +282,25 @@ object GroupCommitSpec {
   private val CommitBoom = new RuntimeException("commit boom")
 
   /** A `Producer` that records the transactional calls into `events` and delegates everything else to a no-op producer
-    * (which also fabricates the `RecordMetadata` for `send`). `failCommit` makes `commitTransaction` raise.
+    * (which also fabricates the `RecordMetadata` for `send`). `failCommit` makes `commitTransaction` raise;
+    * `commitTransactionOf` replaces the whole `commitTransaction` behavior, and so must record `Event.Commit` itself on
+    * any path where it succeeds - the two are mutually exclusive.
     */
   def recordingProducer(
     events: Ref[IO, Vector[Event]],
-    failCommit: Boolean          = false,
-    onBeginTransaction: IO[Unit] = IO.unit,
+    failCommit: Boolean                   = false,
+    onBeginTransaction: IO[Unit]          = IO.unit,
+    commitTransactionOf: Option[IO[Unit]] = None,
   ): Producer[IO] = {
+    require(!failCommit || commitTransactionOf.isEmpty, "failCommit and commitTransactionOf are mutually exclusive")
     val base = Producer.empty[IO]
     new Producer[IO] {
-      def initTransactions: IO[Unit]  = base.initTransactions
-      def beginTransaction: IO[Unit]  = events.update(_ :+ Event.Begin) *> onBeginTransaction
-      def commitTransaction: IO[Unit] = if (failCommit) IO.raiseError(CommitBoom) else events.update(_ :+ Event.Commit)
-      def abortTransaction: IO[Unit]  = events.update(_ :+ Event.Abort)
+      def initTransactions: IO[Unit] = base.initTransactions
+      def beginTransaction: IO[Unit] = events.update(_ :+ Event.Begin) *> onBeginTransaction
+      def commitTransaction: IO[Unit] = commitTransactionOf.getOrElse {
+        if (failCommit) IO.raiseError(CommitBoom) else events.update(_ :+ Event.Commit)
+      }
+      def abortTransaction: IO[Unit] = events.update(_ :+ Event.Abort)
 
       def sendOffsetsToTransaction(
         offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata],
