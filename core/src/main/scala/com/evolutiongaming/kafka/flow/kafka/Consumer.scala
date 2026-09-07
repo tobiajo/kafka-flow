@@ -41,18 +41,48 @@ object Consumer {
       groupMetadataRef <- Ref[F].of(none[ConsumerGroupMetadata])
     } yield new Consumer[F] {
       def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[F]): F[Unit] =
-        consumer.subscribe(topics, listener)
+        consumer.subscribe(topics, refreshBeforeRevoke(listener))
+
+      // under the cooperative assignor the revoke callback runs inside `ConsumerCoordinator.onJoinComplete`, which
+      // writes the new generation to the client's `groupMetadata` BEFORE invoking it: the post-poll snapshot is one
+      // generation behind there, and a revoke-time commit bound to it is fenced every time. So the callback reads
+      // first. Legal: it runs on the poll thread, and the consumer's lock is reentrant for its owner. Safe: no other
+      // member owns the partition in that generation yet (see the design doc). On the `onJoinPrepare` paths (eager,
+      // or a cooperative revocation of an unsubscribed topic) the generation has not moved, so the read only
+      // republishes what the member holds. Best-effort: a failed read leaves the previous snapshot, which only
+      // fences; there is no logger here, so it is silent
+      private def refreshBeforeRevoke(listener: RebalanceListener1[F]): RebalanceListener1[F] =
+        new RebalanceListener1[F] {
+          private val refreshFromConsumer: RebalanceCallback[F, Unit] =
+            RebalanceCallback
+              .api[F]
+              .groupMetadata
+              .flatMap(meta => RebalanceCallback.lift(publish(meta)))
+              .handleErrorWith(_ => RebalanceCallback.api[F].empty)
+
+          def onPartitionsAssigned(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[F, Unit] =
+            listener.onPartitionsAssigned(partitions)
+
+          def onPartitionsRevoked(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[F, Unit] =
+            refreshFromConsumer *> listener.onPartitionsRevoked(partitions)
+
+          // not decorated: the client never rewrites `groupMetadata` on the lost path, and a read there could only
+          // publish a generation this member is losing partitions under
+          def onPartitionsLost(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[F, Unit] =
+            listener.onPartitionsLost(partitions)
+        }
 
       def poll(timeout: FiniteDuration): F[ConsumerRecords[String, ByteVector]] =
         consumer.poll(timeout) <* refresh
 
-      // read the generation after every poll, not from a rebalance callback: a bump that assigns this member
-      // nothing new fires no callback at all under the consumer protocol (KIP-848), and under the classic
+      // read the generation after every poll, not only from a rebalance callback: a bump that assigns this
+      // member nothing new fires no callback at all under the consumer protocol (KIP-848), and under the classic
       // cooperative assignor an empty one the typed listener drops (skafka#581), so only a read tracks it.
       // The join round may span polls (KIP-266: poll(Duration) does not block on it), so the read converges
       // on the poll after the round completes; the interim lag only self-fences. Revoked partitions were torn
-      // down inside the poll under the pre-rebalance generation, so every flow still alive is owned in the
-      // one just read. A failed read fails the poll itself; its records are uncommitted and simply re-polled.
+      // down inside the poll under the generation `refreshBeforeRevoke` published, so every flow still alive is
+      // owned in the one just read. A failed read fails the poll itself; its records are uncommitted and simply
+      // re-polled.
       private def refresh: F[Unit] =
         consumer.groupMetadata.flatMap(publish)
 

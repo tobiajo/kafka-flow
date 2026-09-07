@@ -270,8 +270,18 @@ absorbs the classic in-flight-round window.
 The revoke-time flush is the one place the combinations differ in outcome. Classic **eager** revokes
 before the member rejoins, and the consumer protocol keeps the member on its epoch until it
 acknowledges the revocation — under both, the flush commits. Classic **cooperative** has already moved
-the member to the new generation by revoke time, so its flush is always fenced (safe; the new owner
-replays). A member evicted before the flush is rejected under all three — the same safe direction.
+the member to the new generation by revoke time: the client assigns its new group metadata before it
+invokes the revoke callback, so a commit bound to the post-poll snapshot would be fenced every time. The
+revoke callback therefore reads the consumer's group metadata first and publishes it, and the
+revoke-time commit lands under the generation the client already moved to (a failed read leaves the
+previous snapshot, which only fences). Nothing else can own the partition in that generation:
+cooperative withholds a revoked partition from its next owner for one further round, and a member
+that fell out of the group re-enters through `onPartitionsLost`, which clears its assignment before
+it joins. `flushOnRevoke = true` already ran the revoked partitions' snapshot transactions inside the
+callback; they now commit instead of aborting, so the state lands and the callback carries the commit
+round trips, counting against `max.poll.interval.ms`. That work is unbounded: a partition with many
+dirty keys can hold the callback past the rebalance timeout, which evicts the member. A member evicted
+before the flush is rejected under all three — the same safe direction.
 
 ### Write path: group-committed transactions
 
