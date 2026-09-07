@@ -25,8 +25,8 @@ class GroupCommitSpec extends FunSuite {
 
   private implicit val fromTry: FromTry[IO] = FromTry.lift
 
-  private val snapshotTopicPartition = TopicPartition("snapshots", Partition.min)
-  private val inputTopicPartition    = TopicPartition("input", Partition.min)
+  private val snapshotTopic       = "snapshots"
+  private val inputTopicPartition = TopicPartition("input", Partition.min)
 
   private def kafkaKey(key: String): KafkaKey = KafkaKey("app", "group", inputTopicPartition, key)
 
@@ -40,7 +40,7 @@ class GroupCommitSpec extends FunSuite {
     assignedOffset: Offset = Offset.min,
   ): IO[KafkaSnapshotWriteDatabase.Transactional[IO, String]] =
     KafkaSnapshotWriteDatabase.transactional[IO, String](
-      snapshotTopicPartition  = snapshotTopicPartition,
+      snapshotTopicPartition  = TopicPartition(snapshotTopic, Partition.min),
       producer                = producer,
       inputTopicPartition     = inputTopicPartition,
       groupMetadata           = IO.pure(groupMetadata),
@@ -53,16 +53,16 @@ class GroupCommitSpec extends FunSuite {
   private def sentPerTransaction(events: Vector[Event]): List[Int] =
     events
       .foldLeft(List.empty[Int]) {
-        case (acc, Event.Begin)            => 0 :: acc
-        case (head :: tail, Event.Sent(_)) => (head + 1) :: tail
-        case (acc, _)                      => acc
+        case (acc, Event.Begin)               => 0 :: acc
+        case (head :: tail, Event.Sent(_, _)) => (head + 1) :: tail
+        case (acc, _)                         => acc
       }
       .reverse
 
   private def offsetsCommitted(events: Vector[Event]): List[Offset] =
-    events.collect { case Event.Offsets(o, _) => o }.toList
+    events.collect { case Event.Offsets(_, o, _) => o }.toList
   private def sentKeys(events: Vector[Event]): List[String] =
-    events.collect { case Event.Sent(k) => k }.flatten.toList
+    events.collect { case Event.Sent(k, _) => k }.flatten.toList
 
   List(1, KafkaPersistenceModule.TransactionalConfig.DefaultMaxWritesPerTransaction).foreach { cap =>
     test(s"every queued write commits exactly once with its input offset, respecting the cap (cap=$cap)") {
@@ -207,7 +207,7 @@ class GroupCommitSpec extends FunSuite {
       events <- Ref.of[IO, Vector[Event]](Vector.empty)
       gmRef  <- Ref.of[IO, Option[ConsumerGroupMetadata]](generation(1).some)
       tx <- KafkaSnapshotWriteDatabase.transactional[IO, String](
-        snapshotTopicPartition  = snapshotTopicPartition,
+        snapshotTopicPartition  = TopicPartition(snapshotTopic, Partition.min),
         producer                = recordingProducer(events),
         inputTopicPartition     = inputTopicPartition,
         groupMetadata           = gmRef.get,
@@ -218,7 +218,30 @@ class GroupCommitSpec extends FunSuite {
       _   <- gmRef.set(generation(2).some) // a rebalance advances the generation
       _   <- tx.writeDatabase.persist(kafkaKey("key2"), "state-2") // must commit under generation 2, not a cached 1
       log <- events.get
-    } yield assertEquals(log.collect { case Event.Offsets(_, generation) => generation }.toList, List(1, 2))
+    } yield assertEquals(log.collect { case Event.Offsets(_, _, generation) => generation }.toList, List(1, 2))
+    test.unsafeRunSync()
+  }
+
+  test("the partition mapper routes writes to the state partition; the offset commit stays on the input partition") {
+    // the generation fence rides the offset commit, so that commit must keep naming the input partition
+    val inputTp = TopicPartition("input", Partition.unsafe(1)) // state partition 0 under the 2->1 modulo below
+    val test = for {
+      events <- Ref.of[IO, Vector[Event]](Vector.empty)
+      tx <- KafkaSnapshotWriteDatabase.transactional[IO, String](
+        snapshotTopicPartition  = TopicPartition(snapshotTopic, Partition.min),
+        producer                = recordingProducer(events),
+        inputTopicPartition     = inputTp,
+        groupMetadata           = IO.pure(ConsumerGroupMetadata.Empty.some),
+        assignedOffset          = Offset.min,
+        maxWritesPerTransaction = 256,
+        partitionMapper         = KafkaPersistencePartitionMapper.modulo(sourcePartitions = 2, statePartitions = 1),
+      )
+      _   <- tx.writeDatabase.persist(KafkaKey("app", "group", inputTp, "key1"), "state-1")
+      log <- events.get
+    } yield {
+      assertEquals(log.collect { case Event.Sent(_, partition) => partition }.toList, List(Partition.min.some))
+      assertEquals(log.collect { case Event.Offsets(tp, _, _) => tp }.toList, List(inputTp))
+    }
     test.unsafeRunSync()
   }
 
@@ -242,8 +265,8 @@ object GroupCommitSpec {
   sealed trait Event
   object Event {
     case object Begin extends Event
-    final case class Sent(key: Option[String]) extends Event
-    final case class Offsets(offset: Offset, generation: Int) extends Event
+    final case class Sent(key: Option[String], partition: Option[Partition]) extends Event
+    final case class Offsets(topicPartition: TopicPartition, offset: Offset, generation: Int) extends Event
     case object Commit extends Event
     case object Abort extends Event
   }
@@ -268,12 +291,14 @@ object GroupCommitSpec {
       def sendOffsetsToTransaction(
         offsets: NonEmptyMap[TopicPartition, OffsetAndMetadata],
         consumerGroupMetadata: ConsumerGroupMetadata,
-      ): IO[Unit] = events.update(_ :+ Event.Offsets(offsets.head._2.offset, consumerGroupMetadata.generationId))
+      ): IO[Unit] = events.update(
+        _ :+ Event.Offsets(offsets.head._1, offsets.head._2.offset, consumerGroupMetadata.generationId)
+      )
 
       def send[K, V](
         record: ProducerRecord[K, V]
       )(implicit toBytesK: ToBytes[IO, K], toBytesV: ToBytes[IO, V]): IO[IO[RecordMetadata]] =
-        events.update(_ :+ Event.Sent(record.key.map(_.toString))) *> base.send(record)
+        events.update(_ :+ Event.Sent(record.key.map(_.toString), record.partition)) *> base.send(record)
 
       def partitions(topic: Topic)                  = base.partitions(topic)
       def flush: IO[Unit]                           = base.flush

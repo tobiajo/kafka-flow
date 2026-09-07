@@ -26,7 +26,9 @@ object PartitionFlowOf {
     * @param remapKey
     *   allows to remap the key of a record before it is processed by the flow. Remapping is done before the record is
     *   processed by the flow. Thus, the next steps in the flow (such as `FilterRecord` and `FoldOption`) will see the
-    *   remapped key
+    *   remapped key. The remapped key is also the one a `KafkaPersistencePartitionMapper` checks ownership against, so
+    *   with a non-identity mapper read that trait's scaladoc first - a remap that breaks its ownership rule corrupts
+    *   state silently, and only at recovery.
     */
   def apply[F[_]: Async: LogOf](
     keyStateOf: KeyStateOf[F],
@@ -35,7 +37,7 @@ object PartitionFlowOf {
     remapKey: Option[RemapKey[F]]   = None,
   ): PartitionFlowOf[F] = { (assignment, scheduleCommit) =>
     // assignment.groupMetadata is ignored: only the transactional Kafka persistence fences by generation (see
-    // kafkapersistence.package)
+    // KafkaPersistenceModule.cachingTransactional, and docs/kafka-single-writer-design.md for the mechanism)
     PartitionFlow.resource(
       assignment.topicPartition,
       assignment.assignedAt,
