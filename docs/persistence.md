@@ -53,9 +53,25 @@ can implement its own protection — see [Custom snapshot storage](#custom-snaps
 
 You do not catch the rejection yourself; it is handled for you:
 
-- **Periodic flush** — the conflict fails the stale instance's flow. That is safe (it no longer owns
-  the partition), unless you set `persistPeriodically(ignorePersistErrors = true)`, in which case it
-  is logged and swallowed.
+- **Periodic flush** — the rejection is logged and the write is retried on the next tick: the key stays
+  dirty and keeps holding its offset, so nothing past it is committed. The broker's rejection is the
+  fence; the flow does not fail on it (the consumer's next completed rebalance either brings the member
+  to the current generation or tears the partition's flows down). This covers `persistPeriodically`,
+  `persistPeriodicallyAndUnloadOrphaned`, `unloadOrphaned` and the additional persist; the key an
+  `unloadOrphaned` tick would have unloaded stays loaded until its persist lands. Only the revoke-time
+  flush is unchanged. Every other persist error still fails the flow, unless you set
+  `persistPeriodically(ignorePersistErrors = true)`, in which case it is logged and swallowed.
+- **Periodic offset commit** — the same: the rejection is logged and the offset is scheduled again on
+  the next tick, or committed sooner by the next snapshot write. Any other commit error fails the flow.
+- **Tombstone** — the delete a tick or a fold triggers when a key's state goes empty is a transaction
+  like the others. The key is kept, with its held offset, and deleted again on the next tick; until the
+  tombstone lands it stays *pending*, so a flush of that key retries the delete rather than reporting
+  success on an emptied buffer. Without that a later unload or flush-on-revoke could drop the key and
+  let the partition commit past a snapshot that is still in the store. A key that is folded again
+  before its tombstone lands drops it: the state is back, and the next flush writes it over the
+  snapshot the delete did not remove. On the one path that does not tolerate the fence - the
+  revoke-time flush - a pending tombstone surfaces the way any fenced flush does there, as a swallowed
+  release error; the events replay, no state is lost.
 - **Flush-on-revoke** — the conflict surfaces as a cache-entry release error that scache prints to
   `System.err` — not via the logging framework — and swallows
   (`scache: failed to release cache entry: ...`), so the partition hands off cleanly.
@@ -157,6 +173,12 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   so alert on this mode's log signals, not on lag. Keep the value well below `max.poll.interval.ms` and above
   the legitimate wait for an unfinished transaction (`transaction.timeout.ms` plus the broker's
   abort scan).
+- **Monitoring the fence** - a fenced write or commit is tolerated and retried, so it no longer shows
+  up as a failure. `snapshot_write_fenced_total{topic,partition}` (from `kafka-flow-metrics`) counts
+  the fenced transactions; expect bursts around rebalances and nothing between them. The alert that
+  matters is not on that counter but on a partition whose **committed offset stops advancing** while
+  its input keeps moving - the one symptom shared by a fence that never clears, a key held by a
+  tombstone that never lands, and a stalled fold.
 - **Reducing truncation risk** — the deadline only *flags* lost records; it cannot recover them, and it
   catches truncation only while a recovery read is in flight. Reads run only at partition assignment,
   so a truncation usually lands between them and is adopted silently by the next recovery. So guard
@@ -187,8 +209,12 @@ Limitations:
   a non-identity mapper is not supported here.
 - The fence works under both the **classic** and the **consumer** group protocols
   (`group.protocol=classic|consumer`). With `consumer`, use **brokers 4.3.0+** — below that a still-valid
-  owner can be spuriously fenced during a rebalance and crash; the restart converges, but any later
-  rebalance can fence again (safe, never corruption, but not stable).
+  owner can be spuriously fenced during a rebalance; the fenced write is retried on the next tick (safe,
+  never corruption, but a retry on every rebalance). Under the **classic** protocol the same spurious
+  fence is routine with `CooperativeStickyAssignor`, which keeps retained partitions writing straight
+  through a rebalance, and absent with an eager assignor, which tears every flow down before the
+  generation bumps - at the price of re-recovering the whole assignment on each rebalance. No broker
+  version absorbs it for the classic protocol.
 
 ### Custom snapshot storage
 

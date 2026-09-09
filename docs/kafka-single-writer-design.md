@@ -106,8 +106,11 @@ Key points:
   partition is never committed through the consumer.
 - Both the write and the offset-only commit are **synchronous** — there is no background committer, so
   the call itself drives the transaction and blocks on its outcome. That blocking is what lets a fence
-  (`CommitFailedException`) propagate into the flow and crash a stale owner, rather than being lost on a
-  fire-and-forget commit thread.
+  (`CommitFailedException`, surfaced as `GenerationFencedError`) reach the caller, rather than being lost
+  on a fire-and-forget commit thread. The rejection itself is the fence: the transaction aborted and
+  nothing landed, so the caller does not fail the flow; it keeps the key dirty, or the offset
+  uncommitted, and retries on its next tick, under the generation the consumer refreshes once it
+  completes the rebalance. Every other error still fails the flow.
 - The fence is per **member + generation**, not per partition: the coordinator checks the committer's
   generation, not which partitions it still owns, so a member still on the current generation cannot be
   stopped from committing a partition it just lost. That is closed client-side: a revoked partition's
@@ -125,11 +128,46 @@ the flow.
 A generation captured once at assignment would miss a routine case: a rebalance can advance the
 generation while leaving this member's partitions unchanged. The capture would go stale, and the
 retained partition's next transactional commit would be spuriously fenced though the member still owns
-it, crashing a still-valid owner — safe (a fenced commit writes nothing), but not stable. Refreshing
-after every poll avoids it: a post-poll read follows the silent bump a rebalance callback does not.
+it. That is safe (a fenced commit writes nothing and is retried on the next tick), but a retry on
+every rebalance. Refreshing after every poll avoids it: a post-poll read follows the silent bump a
+rebalance callback does not.
 The unknown (negative) pre-join generation is never published — for a commit carrying it against an
 empty group (exactly the pre-join case) the coordinator *skips* generation validation, so it would
 land unfenced; a flush before the first join instead fails loudly rather than committing ungated.
+
+### Tolerating the fence
+
+A fenced transaction is not a failure to escalate: it aborted, nothing landed, the abort leaves the
+producer usable, and the dirty key or uncommitted offset is retried on the next tick. What bounds the
+retrying is the consumer itself. A member that is merely lagging the generation stops being fenced the
+moment it completes the in-flight round; an evicted member is rejected until its next rejoin, whose
+`onPartitionsLost` tears its flows down. Either way the fencing ends with a rebalance the consumer is
+already driving, not with a timer this library could set.
+
+The measurements say the same. Six rolling deploys of two services against one preprod cluster
+(classic protocol, `CooperativeStickyAssignor`) tolerated 14 945 fences with no flow failure and no
+partition left behind. Per member they arrive in short bursts — 42 of them across 28 members, counting
+a gap of more than 10 s as a new burst — with a median burst of 1.1 s, a p90 of 3.9 s and a maximum of
+20.6 s; none reached 30 s. A local two-member harness with a third member joining and leaving in a loop
+is tighter still: 793 of its 825 fences fell inside one 3.5 s window.
+
+So there is no tolerance duration to configure. A bound would have to sit well above 20 s not to fire
+on an ordinary rolling deploy, and by then it bounds nothing the consumer does not; set anywhere
+plausible-looking it fails the flow precisely during the longest rebalances — the ones where a peer is
+running eager recovery — and restarts the storm it was meant to prevent.
+
+What tolerating costs, against that: one aborted transaction per fence (a round trip that writes
+nothing), a WARN per fenced waiter - about 580 per rolling deploy of one preprod service, which is log
+volume, not an alerting signal, hence the counter - a key that stays loaded, holding its offset, until
+its tombstone lands, and a partition whose committed offset lags by the ticks it takes for the
+generation to become current again. Nothing is lost and nothing is written twice: the fenced
+transaction aborted.
+
+The residual shape a bound would notionally catch is a member whose polls keep succeeding while its
+generation never becomes valid. That is not fence-specific, and it has a better detector: a partition
+whose **committed offset stops advancing** while its input keeps moving. That alert is worth having in
+any case — it also covers a key pinned by an undeleted tombstone, a stalled fold and a wedged producer
+— and `snapshot_write_fenced_total` (per topic-partition) then says whether fencing is the reason.
 
 ### Recovery read: bounded by the high watermark
 
@@ -267,6 +305,16 @@ partition the member still owns, and a reassigned one stays fenced — hence `gr
 is recommended only with such brokers (below 4.3.0 its window is the wider one); no broker version
 absorbs the classic in-flight-round window.
 
+Which combination actually pays that window is worth being precise about. Classic **eager** does not:
+it revokes the whole assignment in `onJoinPrepare`, before the generation bumps, so every flow is torn
+down before a write could carry a stale token - at the price of recovering the entire assignment again
+on every rebalance, which for a large snapshot topic costs far more than a tolerated fence. Classic
+**cooperative** keeps its retained partitions folding, flushing and committing straight through the
+round, which is exactly why the spurious fence is routine there, and the classic protocol has no
+broker-side absorption of it - KIP-1251 covers the consumer protocol only. So the protocol-level exit
+is `group.protocol=consumer` on brokers that carry it; until then, tolerating the fence (above) is what
+makes cooperative-sticky stable.
+
 The revoke-time flush is the one place the combinations differ in outcome. Classic **eager** revokes
 before the member rejoins, and the consumer protocol keeps the member on its epoch until it
 acknowledges the revocation — under both, the flush commits. Classic **cooperative** has already moved
@@ -367,8 +415,10 @@ real broker:
   consumer generation* and asserts the newer snapshot survives.
 - **Generation fence, isolated** — under the stable id a stale flush dies at the epoch fence first
   (Stable transactional.id, above), so these tests drive a live, unfenced producer whose generation
-  alone is stale: the next periodic flush fails fast, the first flush is gated by the offset seeded
-  at assignment, and a transactional offset commit is rejected.
+  alone is stale: the next periodic flush is rejected without failing the flow and lands once the
+  generation is current again, the first flush is gated by the offset seeded at assignment, and a
+  transactional offset commit is rejected. A fenced **tombstone** is covered the same way: the key
+  keeps its snapshot through the fence and the next tick deletes it for real.
 - **Concurrent writes** — a partition's keys flush in parallel against the one shared producer
   (Write path, above); asserted safe for distinct keys.
 - **Unfinished transactions, both resolutions** — the takeover-abort at the handover: the
@@ -378,7 +428,27 @@ real broker:
   open through the read, its LSO pin asserted active, then waited out under a deadline set above
   the wait — the read completes, the deadline never fires.
 
-The suites drive flows with explicit consumer generations rather than live rebalances; the
+Two suites drive real rebalances instead of injected generations:
+
+- **`FenceStormSpec`** - two instances in one group under cooperative-sticky with transactional
+  snapshots and continuous input, and a third member joining and leaving in a loop to bump the
+  generation under them. It asserts what the tolerance has to buy: no flow failure, no restart, at
+  least one fence actually provoked, a tombstone written, and every partition's committed offset
+  still advancing after the churn and draining to the end offsets. It then replays the input from
+  the committed offsets on top of the `read_committed` snapshots and requires the fold of
+  everything, so the run is checked against the store rather than against the flows' own opinion.
+- **`EvictionFenceSpec`** - the other rejection, `UNKNOWN_MEMBER_ID`: a member stalled in its fold
+  past `max.poll.interval.ms` is dropped by the coordinator while a second one takes the partition
+  over for real. The evicted member tolerates the rejection instead of failing, nothing of its write
+  lands, and its next poll completes the rejoin that reports the partition lost and tears its flows
+  down - leaving it in the group owning nothing while the new owner keeps committing. The two
+  instances use separate transactional ids here, or the takeover's `initTransactions` would
+  epoch-fence the stale producer before its write ever reached the offset commit.
+
+Both are paced by real coordinator timeouts, so the suite runs its tests one at a time (each also
+brings up its own broker); running them beside each other starved the churn suite into 38 minutes.
+
+The remaining suites drive flows with explicit consumer generations rather than live rebalances; the
 protocol/assignor matrix (Consumer rebalance protocols, above) rests on broker semantics, not on
 tests here.
 
@@ -434,6 +504,10 @@ Unit suites pin the client-side pieces the mechanism depends on:
 - **Capturing the generation in a rebalance callback** (instead of the post-poll read): the bump that
   matters fires no callback under two of the three protocol/assignor combinations (see Consumer
   rebalance protocols).
+- **A tolerance bound on the fence** (fail the flow after an unbroken run of fences longer than some
+  duration): the consumer's own rejoin already bounds the run, the measured maxima are far below any
+  bound worth setting, and such a bound fires exactly during the longest rebalances (see Tolerating
+  the fence). The stalled-committed-offset alert covers the case it was for.
 
 ## Forward-looking
 

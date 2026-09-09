@@ -10,7 +10,7 @@ import com.evolutiongaming.kafka.flow.PartitionFlow.{FilterRecord, PartitionKey}
 import com.evolutiongaming.kafka.flow.PartitionFlowSpec.*
 import com.evolutiongaming.kafka.flow.effect.CatsEffectMtlInstances.*
 import com.evolutiongaming.kafka.flow.journal.JournalsOf
-import com.evolutiongaming.kafka.flow.kafka.{ScheduleCommit, ToOffset}
+import com.evolutiongaming.kafka.flow.kafka.{GenerationFencedError, ScheduleCommit, ToOffset}
 import com.evolutiongaming.kafka.flow.key.{KeyDatabase, KeysOf}
 import com.evolutiongaming.kafka.flow.persistence.PersistenceOf
 import com.evolutiongaming.kafka.flow.registry.EntityRegistry
@@ -431,6 +431,126 @@ class PartitionFlowSpec extends FunSuite {
     test.unsafeRunSync()
   }
 
+  test("PartitionFlow retries a fenced periodic offset commit with the same offset on the next tick") {
+    // a transactional ScheduleCommit rejected for a stale consumer generation must not fail the flow: the committed
+    // offset stays behind so the same offset is scheduled again, and it advances once a commit goes through
+    class LocalFixture extends ConstFixture(waitForN = 3) {
+      val fence: Ref[IO, Boolean]          = Ref.unsafe(true)
+      val scheduled: Ref[IO, List[Offset]] = Ref.unsafe(Nil)
+      override val scheduleCommit: ScheduleCommit[IO] = new ScheduleCommit[IO] {
+        def schedule(offset: Offset): IO[Unit] =
+          scheduled.update(_ :+ offset) *> fence.get.flatMap { fenced =>
+            if (fenced) IO.raiseError(GenerationFencedError(new RuntimeException("stale generation")))
+            else pendingOffset.set(offset.some)
+          }
+      }
+    }
+
+    val f = new LocalFixture
+
+    val flow = f.flow use { flow =>
+      for {
+        // step past the acquisition ms: poll gates are strict `isAfter`
+        _ <- IO.sleep(1.milli)
+        // the key finishes, so offset 103 becomes committable - and its commit is fenced
+        _ <- flow(f.records("key1", 100, List("event1", "event2", "event3")))
+        _ <- f.scheduled.get.map(assertEquals(_, List(Offset.unsafe(103))))
+        _ <- f.pendingOffset.get.map(assertEquals(_, None))
+        // the next tick schedules the same offset again, still fenced
+        _ <- IO.sleep(1.milli)
+        _ <- flow(Nil)
+        _ <- f.scheduled.get.map(assertEquals(_, List.fill(2)(Offset.unsafe(103))))
+        // the generation is current again: the retry commits and the committed offset advances
+        _ <- f.fence.set(false)
+        _ <- IO.sleep(1.milli)
+        _ <- flow(Nil)
+        _ <- f.scheduled.get.map(assertEquals(_, List.fill(3)(Offset.unsafe(103))))
+        _ <- f.pendingOffset.get.map(assertEquals(_, Some(Offset.unsafe(103))))
+        // nothing new to commit: no further schedule
+        _ <- IO.sleep(1.milli)
+        _ <- flow(Nil)
+        _ <- f.scheduled.get.map(assertEquals(_, List.fill(3)(Offset.unsafe(103))))
+      } yield ()
+    }
+    TestControl.executeEmbed(flow).unsafeRunSync()
+  }
+
+  test("PartitionFlow retries a fenced tombstone delete on a later tick and commits past it") {
+    // only the real chain shows the pin a tolerated fenced delete used to leave behind: `Timers.trigger` runs
+    // `KeyFlow.onTimer` only for a registered timer, and the timer flow is what registers the next one, so a key
+    // whose timers were cancelled on its empty state never got the tick that would have retried the tombstone - it
+    // held its offset and the partition stopped committing
+    class LocalFixture extends ConstFixture(waitForN = 100) {
+      val snapshots: Ref[IO, Map[String, State]] = Ref.unsafe(Map.empty)
+      val deletes: Ref[IO, Int]                  = Ref.unsafe(0)
+      val evict: Ref[IO, Boolean]                = Ref.unsafe(false)
+      val fenceDeletes: Ref[IO, Boolean]         = Ref.unsafe(false)
+      private val snapshotDatabase = new SnapshotDatabase[IO, String, State] {
+        def get(key: String): IO[Option[State]]             = snapshots.get.map(_.get(key))
+        def persist(key: String, snapshot: State): IO[Unit] = snapshots.update(_ + (key -> snapshot))
+        // while the member's generation is stale the broker rejects every tombstone
+        def delete(key: String): IO[Unit] = deletes.update(_ + 1) *> fenceDeletes
+          .get
+          .ifM(
+            IO.raiseError(GenerationFencedError(new RuntimeException("stale generation"))),
+            snapshots.update(_ - key),
+          )
+      }
+      override def flow: Resource[IO, PartitionFlow[IO]] = makeFlow(
+        timerFlowOf = TimerFlowOf.persistPeriodically(fireEvery = 0.minute, persistEvery = 0.minute),
+        persistenceOf =
+          PersistenceOf.snapshotsOnly(keysOf = keysOf, snapshotsOf = SnapshotsOf.backedBy(snapshotDatabase)),
+        tick = TickOption.of(state => evict.get.map(if (_) none[State] else state)),
+      )
+    }
+
+    val f = new LocalFixture
+
+    val flow = f.flow.use { flow =>
+      for {
+        _ <- IO.sleep(1.milli)
+        // key1 is folded and persisted, and the offset past it is committed
+        _ <- flow(f.records("key1", 100, List("event1", "event2")))
+        _ <- f.pendingOffset.get.map(assertEquals(_, Some(Offset.unsafe(102))))
+        _ <- f.snapshots.get.map(s => assert(s.contains("key1")))
+        // the tick evicts key1 while the generation is stale: the tombstone is fenced, nothing landed, the key is
+        // kept and it still holds its offset
+        _ <- f.evict.set(true)
+        _ <- f.fenceDeletes.set(true)
+        _ <- IO.sleep(1.milli)
+        _ <- flow(Nil)
+        _ <- f.deletes.get.map(n => assert(n >= 1, "the tick must have attempted the tombstone"))
+        _ <- f.snapshots.get.map(s => assert(s.contains("key1"), "a fenced tombstone must not have landed"))
+        _ <- f.pendingOffset.get.map(assertEquals(_, Some(Offset.unsafe(102))))
+        // the generation is current again: a later tick deletes key1 for real, and the partition commits past it as
+        // key2 arrives. With key1 pinned by its cancelled timers, the tombstone would never be retried
+        _ <- f.fenceDeletes.set(false)
+        _ <- IO.sleep(1.milli)
+        _ <- flow(f.records("key2", 102, List("event3", "event4")))
+        _ <- f.snapshots.get.map(s => assert(!s.contains("key1"), "the retried tombstone must have landed"))
+        _ <- f.pendingOffset.get.map(assertEquals(_, Some(Offset.unsafe(104))))
+      } yield ()
+    }
+
+    TestControl.executeEmbed(flow).unsafeRunSync()
+  }
+
+  test("PartitionFlow fails on a periodic offset commit error that is not a fence") {
+    class LocalFixture extends ConstFixture(waitForN = 3) {
+      override val scheduleCommit: ScheduleCommit[IO] = new ScheduleCommit[IO] {
+        def schedule(offset: Offset): IO[Unit] = IO.raiseError(new RuntimeException("broker unavailable"))
+      }
+    }
+
+    val f = new LocalFixture
+
+    val flow = f.flow use { flow =>
+      IO.sleep(1.milli) *> flow(f.records("key1", 100, List("event1", "event2", "event3"))).attempt
+    }
+    val result = TestControl.executeEmbed(flow).unsafeRunSync()
+    assert(clue(result).left.exists(_.getMessage == "broker unavailable"))
+  }
+
   def setupRemapKeyTest(remapKey: RemapKey[IO], initialData: Map[KafkaKey, String]) = {
     import com.evolutiongaming.kafka.flow.effect.CatsEffectMtlInstances.*
     implicit val logOf: LogOf[IO] = LogOf.empty[IO]
@@ -540,6 +660,7 @@ object PartitionFlowSpec {
       persistenceOf: PersistenceOf[IO, String, State, ConsumerRecord[String, ByteVector]],
       filter: Option[FilterRecord[IO]] = none,
       remapKey: Option[RemapKey[IO]]   = none,
+      tick: TickOption[IO, State]      = TickOption.id[IO, State],
     ): Resource[IO, PartitionFlow[IO]] = {
       val keyStateOf: KeyStateOf[IO] = new KeyStateOf[IO] {
         def apply(
@@ -558,7 +679,7 @@ object PartitionFlowSpec {
             keyFlow <- KeyFlow.of(
               kafkaKey,
               fold0,
-              TickOption.id[IO, State],
+              tick,
               persistence,
               timerFlow,
               EntityRegistry.empty[IO, KafkaKey, State]

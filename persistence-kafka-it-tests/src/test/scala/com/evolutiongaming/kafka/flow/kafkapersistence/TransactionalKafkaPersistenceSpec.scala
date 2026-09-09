@@ -31,6 +31,7 @@ import com.evolutiongaming.skafka.consumer.{
 }
 import com.evolutiongaming.skafka.producer.{Producer, ProducerConfig, ProducerOf, ProducerRecord}
 import com.evolutiongaming.skafka.{CommonConfig, Offset, Partition, TopicPartition}
+import com.evolutiongaming.kafka.flow.kafka.GenerationFencedError
 import org.apache.kafka.clients.consumer.CommitFailedException
 import scodec.bits.ByteVector
 
@@ -117,7 +118,8 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
   private def flowOf(
     moduleOf: KafkaPersistenceModuleOf[IO, String],
     timerFlowOf: TimerFlowOf[IO],
-    config: PartitionFlowConfig = PartitionFlowConfig(commitOnRevoke = true),
+    config: PartitionFlowConfig  = PartitionFlowConfig(commitOnRevoke = true),
+    tick: TickOption[IO, String] = TickOption.id[IO, String],
   ): IO[PartitionFlowOf[IO]] =
     TimersOf.memory[IO, KafkaKey].map { timersOf =>
       kafkaEagerRecovery[IO, String](
@@ -127,7 +129,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
         timersOf                 = timersOf,
         timerFlowOf              = timerFlowOf,
         fold                     = fold,
-        tick                     = TickOption.id[IO, String],
+        tick                     = tick,
         partitionFlowConfig      = config,
         registry                 = EntityRegistry.empty[IO, KafkaKey, String],
       )
@@ -208,11 +210,6 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     } yield (staleFlush, stored)
   }
 
-  private def causeChain(e: Throwable): List[Throwable] =
-    List.unfold(Option(e)) { current =>
-      current.map(c => (c, Option(c.getCause).filter(_ ne c)))
-    }
-
   test("issue #732 reproduction: stale flush-on-revoke overwrites the new owner's snapshot (shared producer)") {
     val stateTopic = "flow-732-lww-state-topic"
     val key        = "key1"
@@ -266,7 +263,7 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
           // has already epoch-fenced A, so the broker rejects A's flush for its stale producer epoch (raised
           // client-side as InvalidProducerEpochException or ProducerFencedException, depending on the
           // transaction protocol version) before the flush ever reaches the offset commit - so it is not the
-          // generation fence's CommitFailedException; that fence is pinned by the fail-fast and offset-commit tests
+          // generation fence's CommitFailedException; that fence is pinned by the fenced-flush and offset-commit tests
           assertEquals(clue(staleFlush), Right(()))
           // the protection: the stale (older-generation) write did not land, the new owner's snapshot survived
           assertEquals(clue(stored.get(key)), utf8((1 to 10).map(i => s"e$i").mkString(",")))
@@ -276,15 +273,17 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
     test.unsafeRunSync()
   }
 
-  test("issue #732 prevention: a fenced stale writer fails fast on its next periodic flush (transactional)") {
-    val stateTopic = "flow-732-tx-failfast-state-topic"
+  test("issue #732 prevention: a stale writer's periodic flush is fenced, kept dirty and lands once current again") {
+    val stateTopic = "flow-732-tx-fenced-flush-state-topic"
     val inputTopic = s"input-$stateTopic"
-    val group      = s"$groupId-failfast"
+    val group      = s"$groupId-fenced-flush"
     val tp         = TopicPartition(inputTopic, Partition.min)
     val key        = "key1"
 
     // the owner starts current and persists fine; a rebalance then leaves it on a stale generation (simulated by
-    // flipping the metadata it reads), so its next flush is generation-fenced and fails fast
+    // flipping the metadata it reads), so its next flush is generation-fenced: nothing lands and the flow does not
+    // fail. The rejection is the fence; the state stays dirty and the flush after the generation is current again
+    // lands everything folded so far
     val test = createTopic(stateTopic, 1) *> createTopic(inputTopic, 1) *> withJoinedConsumer(group, inputTopic) {
       current =>
         for {
@@ -312,20 +311,88 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
             ).allocated
           )
           (flow_, release) = flow
+          events           = List("e1", "e2", "e3", "e4", "e5")
           // persists fine while the generation is current
-          _ <- flow_(inputRecords(inputTopic, key, List("e1", "e2", "e3")))
+          _ <- flow_(inputRecords(inputTopic, key, events.take(3)))
           // the partition is reassigned: the owner's captured generation is now stale
           _ <- gmRef.set(staleGeneration(current))
-          // the next periodic flush must fail fast with the conflict
-          staleResult <- flow_(inputRecords(inputTopic, key, List("e1", "e2", "e3", "e4")).drop(3)).attempt
-          _           <- release.attempt // cleanup only: nothing flushes on revoke in this flow's configuration
-        } yield staleResult match {
-          case Left(e) =>
-            assert(
-              clue(causeChain(e)).exists(_.isInstanceOf[CommitFailedException]),
-              s"expected CommitFailedException in the cause chain of $e",
-            )
-          case Right(()) => fail("expected the fenced writer's periodic flush to fail fast, but it succeeded")
+          // the next periodic flush is fenced by the broker; the flow must survive it
+          fenced     <- flow_(inputRecords(inputTopic, key, events.take(4)).drop(3)).attempt
+          afterFence <- readSnapshots(stateTopic)
+          // the generation is current again: the next flush retries the dirty state
+          _          <- gmRef.set(current)
+          _          <- flow_(inputRecords(inputTopic, key, events).drop(4))
+          afterRetry <- readSnapshots(stateTopic)
+          _          <- release.attempt // cleanup only: nothing flushes on revoke in this flow's configuration
+        } yield {
+          assertEquals(clue(fenced), Right(()))
+          // the fenced write did not land: the store still holds the last write of the current generation
+          assertEquals(clue(afterFence.get(key)), utf8("e1,e2,e3"))
+          // the retry landed the state the fence held back, on the same producer
+          assertEquals(clue(afterRetry.get(key)), utf8(events.mkString(",")))
+        }
+    }
+
+    test.unsafeRunSync()
+  }
+
+  test("issue #732 prevention: a stale writer's tombstone is fenced, the key kept, and it lands once current again") {
+    val stateTopic = "flow-732-tx-fenced-delete-state-topic"
+    val inputTopic = s"input-$stateTopic"
+    val group      = s"$groupId-fenced-delete"
+    val tp         = TopicPartition(inputTopic, Partition.min)
+    val key        = "key1"
+
+    // the delete a tick triggers when it empties a key's state is a transaction like a write, and is fenced the same
+    // way. Nothing may land, the key must stay - with its held offset - and the next tick must delete it again
+    val test = createTopic(stateTopic, 1) *> createTopic(inputTopic, 1) *> withJoinedConsumer(group, inputTopic) {
+      current =>
+        for {
+          gmRef <- Ref.of[IO, ConsumerGroupMetadata](current)
+          evict <- Ref.of[IO, Boolean](false)
+          moduleOf = KafkaPersistenceModuleOf.cachingTransactional[IO, String](
+            consumerOf = consumerOf,
+            producerOf = producerOf,
+            config = KafkaPersistenceModule.TransactionalConfig(
+              consumerConfig        = consumerConfig,
+              producerConfig        = producerConfig,
+              transactionalIdPrefix = appId,
+              snapshotTopic         = stateTopic,
+            ),
+          )
+          flow <- flowOf(
+            moduleOf,
+            TimerFlowOf.persistPeriodically[IO](fireEvery = 0.seconds, persistEvery = 0.seconds),
+            PartitionFlowConfig(triggerTimersInterval     = 0.seconds),
+            // a tick that tombstones the key on demand
+            TickOption.of(state => evict.get.map(if (_) none[String] else state)),
+          ).flatMap(
+            _.apply(
+              PartitionAssignment(tp, Offset.min, gmRef.get.map(_.some)),
+              ScheduleCommit.empty[IO]
+            ).allocated
+          )
+          (flow_, release) = flow
+          // persists fine while the generation is current
+          _           <- flow_(inputRecords(inputTopic, key, List("e1", "e2", "e3")))
+          beforeFence <- readSnapshots(stateTopic)
+          // the partition is reassigned and the tick asks for the key to go: the tombstone is fenced
+          _          <- gmRef.set(staleGeneration(current))
+          _          <- evict.set(true)
+          fenced     <- flow_(Nil).attempt
+          afterFence <- readSnapshots(stateTopic)
+          // the generation is current again: the next tick deletes the key for real
+          _          <- gmRef.set(current)
+          _          <- flow_(Nil)
+          afterRetry <- readSnapshots(stateTopic)
+          _          <- release.attempt // cleanup only: nothing flushes on revoke in this flow's configuration
+        } yield {
+          assertEquals(clue(beforeFence.get(key)), utf8("e1,e2,e3"))
+          assertEquals(clue(fenced), Right(()))
+          // the fenced tombstone did not land: the snapshot is still there
+          assertEquals(clue(afterFence.get(key)), utf8("e1,e2,e3"))
+          // and the retry deleted it
+          assertEquals(clue(afterRetry.get(key)), none[ByteVector])
         }
     }
 
@@ -363,14 +430,10 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       stored <- readSnapshots(stateTopic)
     } yield {
       result match {
-        case Left(e) =>
+        case Left(GenerationFencedError(cause)) =>
           // the stale generation is rejected on sendOffsetsToTransaction with CommitFailedException
-          val chain = causeChain(e)
-          assert(
-            chain.exists(_.isInstanceOf[CommitFailedException]),
-            s"expected CommitFailedException in the cause chain, " +
-              s"got ${chain.map(_.getClass.getName)}: ${chain.map(_.getMessage)}",
-          )
+          assert(clue(cause).isInstanceOf[CommitFailedException])
+        case Left(e) => fail(s"expected the stale-generation offset commit to surface as GenerationFencedError, got $e")
         case Right(()) => fail("expected the stale-generation offset commit to be rejected, but it succeeded")
       }
       // the rejected commit aborted: nothing landed in the snapshot store
@@ -414,14 +477,10 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
       stored <- readSnapshots(stateTopic)
     } yield {
       result match {
-        case Left(e) =>
+        case Left(GenerationFencedError(cause)) =>
           // even the first write carries the seeded offset, so the stale generation is rejected (CommitFailedException)
-          val chain = causeChain(e)
-          assert(
-            chain.exists(_.isInstanceOf[CommitFailedException]),
-            s"expected the stale first flush to be generation-fenced (CommitFailedException), " +
-              s"got ${chain.map(_.getClass.getName)}: ${chain.map(_.getMessage)}",
-          )
+          assert(clue(cause).isInstanceOf[CommitFailedException])
+        case Left(e) => fail(s"expected the stale first flush to surface as GenerationFencedError, got $e")
         case Right(()) =>
           fail("expected the stale writer's first (seeded) flush to be generation-fenced, but it landed")
       }
