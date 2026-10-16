@@ -8,11 +8,12 @@ import cats.effect.{Concurrent, Deferred, Outcome, Poll, Ref}
 import cats.syntax.all.*
 import com.evolutiongaming.catshelper.FromTry
 import com.evolutiongaming.kafka.flow.KafkaKey
-import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
-import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
+import com.evolutiongaming.kafka.flow.kafka.{GenerationFencedError, ScheduleCommit}
+import com.evolutiongaming.kafka.flow.snapshot.{SnapshotWriteDatabase, SnapshotWriteMetrics}
 import com.evolutiongaming.skafka.consumer.ConsumerGroupMetadata
 import com.evolutiongaming.skafka.producer.{Producer, ProducerRecord}
 import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, ToBytes, TopicPartition}
+import org.apache.kafka.clients.consumer.CommitFailedException
 
 object KafkaSnapshotWriteDatabase {
 
@@ -33,8 +34,8 @@ object KafkaSnapshotWriteDatabase {
 
   /** Variant of [[of]] performing writes as group-committed Kafka transactions that also commit the input offset. The
     * producer must be transactional with `initTransactions` already called. A stale consumer generation is rejected by
-    * the broker (KIP-447), aborting the transaction so neither the writes nor the offset land. See
-    * `docs/kafka-single-writer-design.md`.
+    * the broker (KIP-447), aborting the transaction so neither the writes nor the offset land; that rejection surfaces
+    * as `GenerationFencedError`, which callers retry on their next tick. See `docs/kafka-single-writer-design.md`.
     *
     * @param groupMetadata
     *   current consumer group metadata (generation); see `Consumer.groupMetadata`. `None` (consumer not yet joined) is
@@ -53,6 +54,25 @@ object KafkaSnapshotWriteDatabase {
     groupMetadata: F[Option[ConsumerGroupMetadata]],
     assignedOffset: Offset,
     maxWritesPerTransaction: Int,
+  ): F[Transactional[F, S]] = transactional(
+    snapshotTopicPartition,
+    producer,
+    inputTopicPartition,
+    groupMetadata,
+    assignedOffset,
+    maxWritesPerTransaction,
+    SnapshotWriteMetrics.empty[F],
+  )
+
+  /** As above, counting every fenced transaction in `metrics`. */
+  def transactional[F[_]: FromTry: Concurrent, S: ToBytes[F, *]](
+    snapshotTopicPartition: TopicPartition,
+    producer: Producer[F],
+    inputTopicPartition: TopicPartition,
+    groupMetadata: F[Option[ConsumerGroupMetadata]],
+    assignedOffset: Offset,
+    maxWritesPerTransaction: Int,
+    metrics: SnapshotWriteMetrics[F],
   ): F[Transactional[F, S]] =
     for {
       _ <- new IllegalArgumentException(s"maxWritesPerTransaction must be positive, got $maxWritesPerTransaction")
@@ -74,6 +94,7 @@ object KafkaSnapshotWriteDatabase {
         offsetToCommit,
         inputTopicPartition,
         groupMetadata,
+        metrics,
       )
     } yield Transactional(
       // identity only: the single-writer/offset-binding guarantee assumes one input partition maps to one snapshot
@@ -98,6 +119,7 @@ object KafkaSnapshotWriteDatabase {
     offsetToCommit: Ref[F, Offset],
     inputTopicPartition: TopicPartition,
     groupMetadata: F[Option[ConsumerGroupMetadata]],
+    metrics: SnapshotWriteMetrics[F],
   ) {
 
     val sendWrite: ProducerRecord[String, S] => F[Unit] =
@@ -154,9 +176,29 @@ object KafkaSnapshotWriteDatabase {
 
       transaction
         .attempt
+        .flatMap(classifyFence)
         .flatMap(complete)
         .onCancel(complete(new InterruptedException("snapshot write batch canceled").asLeft))
     }
+
+    // every fence surfaces here, as the one outcome shared by the batch, so it is classified - and counted - once:
+    // callers match on GenerationFencedError, and the counter measures transactions rather than waiters
+    private def classifyFence(result: Either[Throwable, Unit]): F[Either[Throwable, Unit]] =
+      result match {
+        case Left(e) if isGenerationFence(e) =>
+          metrics.fenced(inputTopicPartition).as(GenerationFencedError(e).asLeft[Unit])
+        case other => other.pure[F]
+      }
+
+    // only the bare exception is the fence. kafka-clients raises it, unwrapped, from `sendOffsetsToTransaction`,
+    // out of the single place that maps ILLEGAL_GENERATION and UNKNOWN_MEMBER_ID, and as an *abortable* error: the
+    // abort above clears it and the next transaction opens on the same producer. A `KafkaException` carrying it as a
+    // cause ("Cannot execute transactional method because we are in an error state") is a different state - an
+    // earlier fence still recorded because nothing aborted it - and one shape of it, a `commitTransaction` that timed
+    // out leaving an unacked pending transition, can no longer be aborted at all, so every later transaction fails
+    // identically. Tolerating that would stall the flow silently; failing it re-creates the producer, the only way
+    // out. All 47 fences traced in preprod arrived bare.
+    private def isGenerationFence(e: Throwable): Boolean = e.isInstanceOf[CommitFailedException]
 
     // every transaction commits an offset, so the broker's generation check (KIP-447) gates every write. Committing
     // the *latest* offset is safe across capped batches: each persist blocks until durable before its offset is

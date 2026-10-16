@@ -1,8 +1,11 @@
 import Dependencies.*
+import com.typesafe.tools.mima.core.*
 
 ThisBuild / versionScheme := Some("early-semver")
 ThisBuild / evictionErrorLevel := Level.Warn
-ThisBuild / versionPolicyIntention := Compatibility.BinaryCompatible
+// this release is a major: `KeyFlow.of` and `KeyFlowOf.apply` gained constraints. Back to `BinaryCompatible` once
+// it is out, as in 8081ea0 / ea43339
+ThisBuild / versionPolicyIntention := Compatibility.None
 
 // covers the test-only dependency paths, the published modules declare `Pinned` explicitly
 ThisBuild / dependencyOverrides ++= Pinned.all
@@ -67,6 +70,10 @@ lazy val core = (project in file("core"))
   .settings(commonSettings)
   .settings(
     name := "kafka-flow",
+    // `Snapshots.apply` is private to the `snapshot` package; Scala 3 still emits it as a static method
+    mimaBinaryIssueFilters += ProblemFilters.exclude[DirectMissingMethodProblem](
+      "com.evolutiongaming.kafka.flow.snapshot.Snapshots.apply"
+    ),
     libraryDependencies ++= Seq(
       Cats.core,
       Cats.mtl,
@@ -151,6 +158,11 @@ lazy val `persistence-kafka` = (project in file("persistence-kafka"))
   .settings(commonSettings)
   .settings(
     name := "kafka-flow-persistence-kafka",
+    // `GroupCommit` is private to `KafkaSnapshotWriteDatabase`, but a nested class' constructor is public in bytecode,
+    // so MiMa sees a parameter added to something no caller can reach
+    mimaBinaryIssueFilters += ProblemFilters.exclude[DirectMissingMethodProblem](
+      "com.evolutiongaming.kafka.flow.kafkapersistence.KafkaSnapshotWriteDatabase#GroupCommit.this"
+    ),
     libraryDependencies ++= Seq(
       Cats.effectTestkit % Test,
       Testing.munit      % Test,
@@ -162,6 +174,9 @@ lazy val `persistence-kafka-it-tests` = (project in file("persistence-kafka-it-t
   .settings(commonSettings)
   .settings(
     name := "kafka-flow-persistence-kafka-it-tests",
+    // one broker container per suite, and the rebalance suites are paced by real coordinator timeouts: run in
+    // parallel they starve each other (the churn suite took 38 minutes next to four peers, 2 alone)
+    Test / parallelExecution := false,
     libraryDependencies ++= Seq(
       catsHelperLogback            % Test,
       playJsonJsoniter             % Test,

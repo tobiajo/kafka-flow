@@ -5,6 +5,7 @@ import cats.effect.Resource
 import cats.effect.kernel.Resource.ExitCase
 import cats.syntax.all.*
 import com.evolutiongaming.kafka.flow.KeyContext
+import com.evolutiongaming.kafka.flow.kafka.GenerationFencedError
 import com.evolutiongaming.kafka.flow.persistence.FlushBuffers
 import com.evolutiongaming.skafka.Offset
 
@@ -24,7 +25,9 @@ object TimerFlowOf {
   /** Performs persist based on the difference between the state offset and current offset and idle time since the state
     * was last touched.
     *
-    * Removes the state from memory after it is persisted.
+    * Removes the state from memory after it is persisted. A persist rejected by the broker for a stale consumer
+    * generation (transactional Kafka snapshots, `GenerationFencedError`) leaves the key loaded and holding its offset,
+    * and another tick is scheduled to retry it.
     *
     * @param fireEvery
     *   How often the check should be performed.
@@ -58,14 +61,19 @@ object TimerFlowOf {
           expired          = current.clock isAfter expiredAt
           offsetDifference = current.offset.value - touchedAt.offset.value
           canUnload        = expired || offsetDifference > maxOffsetDifference
+          persisted <-
+            if (canUnload)
+              persistence.attemptToPersist(
+                ignorePersistErrors = false,
+                context             = context,
+                currentOffset       = current.offset
+              )
+            else false.pure[F]
+          // a fenced persist keeps the key loaded and holding its offset, so it needs a next tick to retry
           _ <-
-            if (canUnload) {
-              context.log.info(s"flush, offset difference: $offsetDifference") *>
-                persistence.flush *>
-                context.remove
-            } else {
-              register(touchedAt)
-            }
+            if (canUnload && persisted)
+              context.log.info(s"flush, offset difference: $offsetDifference") *> context.remove
+            else register(touchedAt)
         } yield ()
       }
     }
@@ -85,6 +93,10 @@ object TimerFlowOf {
     * offset will be committed. Therefore, in case of an application crash or offset rebalance, the state will be
     * restored from these snapshots and some messages will be reprocessed again, so it's important to have an idempotent
     * processing logic
+    *
+    * A persist rejected by the broker for a stale consumer generation (transactional Kafka snapshots,
+    * `GenerationFencedError`) is handled the same way regardless of `ignorePersistErrors`: the key stays dirty, keeps
+    * holding its offset and is retried on the next tick.
     *
     * @param fireEvery
     *   the interval at which `onTimer` triggers
@@ -138,7 +150,8 @@ object TimerFlowOf {
 
   }
 
-  /** Combines [[unloadOrphaned]] with [[persistPeriodically]] in a single TimerFlow
+  /** Combines [[unloadOrphaned]] with [[persistPeriodically]] in a single TimerFlow. A key is unloaded only once its
+    * state is persisted: an ignored or fenced persist keeps it loaded, holding its offset.
     *
     * @param fireEvery
     *   the interval at which `onTimer` triggers
@@ -151,9 +164,10 @@ object TimerFlowOf {
     * @param flushOnRevoke
     *   controls whether persistence flushing should happen on partition revocation
     * @param ignorePersistErrors
-    *   if true, a failure to persist the state will not fail the computation. Instead, an error message will be logged
-    *   and a new offset for the key will not be `held`, so as a result no new offset will be committed for the
-    *   partition.
+    *   if true, a failure to persist the state will not fail the computation. Instead, an error message will be logged,
+    *   a new offset for the key will not be `held`, so no new offset will be committed for the partition, and the key
+    *   is not unloaded: it stays in memory until a later tick persists it, so keys accumulate while the store keeps
+    *   failing.
     */
   def persistPeriodicallyAndUnloadOrphaned[F[_]: MonadThrow](
     fireEvery: FiniteDuration    = 1.minute,
@@ -186,14 +200,16 @@ object TimerFlowOf {
           expired          = current.clock isAfter expiredAt
           canUnload        = expired || offsetDifference > maxOffsetDifference
           canPersist       = (current.clock compareTo triggerFlushAt) >= 0
-          _ <- Applicative[F].whenA(canPersist || canUnload)(
-            persistence.attemptToPersist(
-              ignorePersistErrors = ignorePersistErrors,
-              context             = context,
-              currentOffset       = current.offset
-            )
-          )
-          _ <- Applicative[F].whenA(canUnload)(
+          persisted <-
+            if (canPersist || canUnload)
+              persistence.attemptToPersist(
+                ignorePersistErrors = ignorePersistErrors,
+                context             = context,
+                currentOffset       = current.offset
+              )
+            else false.pure[F]
+          // `remove` drops the held offset too: unloading an unpersisted key lets the partition commit past it
+          _ <- Applicative[F].whenA(canUnload && persisted)(
             context.log.info(s"flush, offset difference: $offsetDifference") *> context.remove
           )
           _ <- register(current)
@@ -230,8 +246,13 @@ object TimerFlowOf {
   }
 
   private implicit class AttemptToPersist[F[_]: MonadThrow](persistence: FlushBuffers[F]) {
-    def attemptToPersist(ignorePersistErrors: Boolean, context: KeyContext[F], currentOffset: Offset): F[Unit] =
+
+    /** Flushes and, on success, holds `currentOffset`; returns whether the state was persisted. */
+    def attemptToPersist(ignorePersistErrors: Boolean, context: KeyContext[F], currentOffset: Offset): F[Boolean] =
       persistence.flush.attempt.flatMap {
+        case Left(err: GenerationFencedError) =>
+          // the rejection is the fence: keep the key dirty and its held offset, retry on the next tick
+          context.log.warn(s"persist fenced by a stale consumer generation, retrying on the next tick: $err").as(false)
         case Left(err) if ignorePersistErrors =>
           // 'context' will continue holding the previous offset from the last time the state was persisted
           // and offsets committed (or just the last committed offset if no state has ever been persisted before).
@@ -240,8 +261,9 @@ object TimerFlowOf {
           context
             .log
             .info(s"Failed to persist state, the error is ignored and offsets won't be committed, error: $err")
-        case Left(err) => err.raiseError[F, Unit]
-        case Right(_)  => context.hold(currentOffset)
+            .as(false)
+        case Left(err) => err.raiseError[F, Boolean]
+        case Right(_)  => context.hold(currentOffset).as(true)
       }
   }
 }
