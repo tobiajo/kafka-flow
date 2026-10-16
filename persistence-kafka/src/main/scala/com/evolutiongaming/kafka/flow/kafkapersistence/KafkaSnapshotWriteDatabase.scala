@@ -12,18 +12,25 @@ import com.evolutiongaming.kafka.flow.kafka.ScheduleCommit
 import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
 import com.evolutiongaming.skafka.consumer.ConsumerGroupMetadata
 import com.evolutiongaming.skafka.producer.{Producer, ProducerRecord}
-import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, ToBytes, TopicPartition}
+import com.evolutiongaming.skafka.{Offset, OffsetAndMetadata, ToBytes, Topic, TopicPartition}
 
 object KafkaSnapshotWriteDatabase {
 
+  /** Writes each snapshot to the state partition `partitionMapper` derives from the key's input partition (under the
+    * identity default, the input partition number).
+    *
+    * Only `snapshotTopicPartition.topic` is used: the partition component is ignored, since the target partition comes
+    * from `partitionMapper`. The pairing is kept for source compatibility - this is not part of the EXPERIMENTAL
+    * transactional mode, so its signature stands.
+    */
   def of[F[_]: FromTry: Monad, S: ToBytes[F, *]](
     snapshotTopicPartition: TopicPartition,
     producer: Producer[F],
     partitionMapper: KafkaPersistencePartitionMapper = KafkaPersistencePartitionMapper.identity,
   ): SnapshotWriteDatabase[F, KafkaKey, S] =
-    apply(snapshotTopicPartition, partitionMapper, record => producer.send(record).flatten.void)
+    apply(snapshotTopicPartition.topic, partitionMapper, record => producer.send(record).flatten.void)
 
-  /** Result of [[transactional]]: the snapshot write database plus a `ScheduleCommit` that routes input offset commits
+  /** Result of `transactional`: the snapshot write database plus a `ScheduleCommit` that routes input offset commits
     * through the same per-partition transactions as the snapshot writes.
     */
   final case class Transactional[F[_], S](
@@ -45,6 +52,11 @@ object KafkaSnapshotWriteDatabase {
     * @param maxWritesPerTransaction
     *   bounds the per-partition, serialized transaction's duration below `transaction.timeout.ms`; bytes scale with
     *   this times the snapshot size.
+    * @param snapshotTopicPartition
+    *   only `.topic` is used - the target partition comes from `partitionMapper`, exactly as in [[of]]
+    * @param partitionMapper
+    *   maps the input partition to the state partition records are written to; the offset commit and its fence stay
+    *   keyed to `inputTopicPartition` - see [[KafkaPersistenceModule.cachingTransactional]].
     */
   def transactional[F[_]: FromTry: Concurrent, S: ToBytes[F, *]](
     snapshotTopicPartition: TopicPartition,
@@ -53,6 +65,7 @@ object KafkaSnapshotWriteDatabase {
     groupMetadata: F[Option[ConsumerGroupMetadata]],
     assignedOffset: Offset,
     maxWritesPerTransaction: Int,
+    partitionMapper: KafkaPersistencePartitionMapper,
   ): F[Transactional[F, S]] =
     for {
       _ <- new IllegalArgumentException(s"maxWritesPerTransaction must be positive, got $maxWritesPerTransaction")
@@ -76,13 +89,32 @@ object KafkaSnapshotWriteDatabase {
         groupMetadata,
       )
     } yield Transactional(
-      // identity only: the single-writer/offset-binding guarantee assumes one input partition maps to one snapshot
-      // partition owned by one writer; a non-identity mapper breaks that, so it is not configurable here
-      writeDatabase  = apply(snapshotTopicPartition, KafkaPersistencePartitionMapper.identity, groupCommit.sendWrite),
+      writeDatabase  = apply(snapshotTopicPartition.topic, partitionMapper, groupCommit.sendWrite),
       scheduleCommit = groupCommit.scheduleCommit,
     )
 
-  /** Group-commit machinery backing [[transactional]]. The producer allows one open transaction at a time, so
+  /** The identity-mapping form of `transactional`: writes go to the input partition's own state partition. This is the
+    * signature released in v10.0.2, kept so adding mapper support does not break it.
+    */
+  def transactional[F[_]: FromTry: Concurrent, S: ToBytes[F, *]](
+    snapshotTopicPartition: TopicPartition,
+    producer: Producer[F],
+    inputTopicPartition: TopicPartition,
+    groupMetadata: F[Option[ConsumerGroupMetadata]],
+    assignedOffset: Offset,
+    maxWritesPerTransaction: Int,
+  ): F[Transactional[F, S]] =
+    transactional(
+      snapshotTopicPartition,
+      producer,
+      inputTopicPartition,
+      groupMetadata,
+      assignedOffset,
+      maxWritesPerTransaction,
+      KafkaPersistencePartitionMapper.identity,
+    )
+
+  /** Group-commit machinery backing `transactional`. The producer allows one open transaction at a time, so
     * `transactionLock` serializes them and each holder group-commits up to `maxWritesPerTransaction` writes plus all
     * queued offset-only markers in one transaction, binding the latest offset to gate it. Markers ride a separate lane
     * so they never consume a write slot. The over-cap backlog, empty batches and cancellation are handled at the
@@ -186,7 +218,7 @@ object KafkaSnapshotWriteDatabase {
   )
 
   private def apply[F[_], S](
-    snapshotTopicPartition: TopicPartition,
+    snapshotTopic: Topic,
     partitionMapper: KafkaPersistencePartitionMapper,
     send: ProducerRecord[String, S] => F[Unit],
   ): SnapshotWriteDatabase[F, KafkaKey, S] = new SnapshotWriteDatabase[F, KafkaKey, S] {
@@ -197,7 +229,7 @@ object KafkaSnapshotWriteDatabase {
     private def produce(key: KafkaKey, snapshot: Option[S]): F[Unit] = {
       val targetPartition = partitionMapper.getStatePartition(key.topicPartition.partition)
       val record = new ProducerRecord(
-        topic     = snapshotTopicPartition.topic,
+        topic     = snapshotTopic,
         partition = targetPartition.some,
         key       = key.key.some,
         value     = snapshot

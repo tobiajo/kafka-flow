@@ -11,6 +11,7 @@ import com.evolutiongaming.kafka.flow.registry.EntityRegistry
 import com.evolutiongaming.kafka.flow.snapshot.SnapshotWriteDatabase
 import com.evolutiongaming.kafka.flow.timer.{TimerFlowOf, TimersOf}
 import com.evolutiongaming.kafka.flow.{
+  FlowMetrics,
   FoldOption,
   ForAllKafkaSuite,
   KafkaKey,
@@ -81,13 +82,13 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
   private def readSnapshots(
     stateTopic: String,
     stallTimeout: Option[FiniteDuration] = KafkaPersistenceModule.TransactionalConfig.DefaultRecoveryStallTimeout.some,
+    statePartition: Partition            = Partition.min,
   ): IO[BytesByKey] =
     KafkaPartitionPersistence.readSnapshots[IO](
       consumerOf     = consumerOf,
       consumerConfig = consumerConfig.copy(isolationLevel = IsolationLevel.ReadCommitted),
-      snapshotTopic  = stateTopic,
-      partition      = Partition.min,
-      stall          = stallTimeout.map(KafkaPartitionPersistence.Stall(_, IO.monotonic)),
+      reader = KafkaPartitionPersistence.SnapshotReader(TopicPartition(stateTopic, statePartition), Partition.min),
+      stall  = stallTimeout.map(KafkaPartitionPersistence.Stall(_, IO.monotonic)),
     )
 
   private def endOffset(stateTopic: String, isolation: IsolationLevel): IO[Offset] = {
@@ -142,12 +143,13 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
   private def inputRecords(
     inputTopic: String,
     key: String,
-    events: List[String]
+    events: List[String],
+    partition: Partition = Partition.min,
   ): List[ConsumerRecord[String, ByteVector]] =
     events.zipWithIndex.map {
       case (event, offset) =>
         ConsumerRecord[String, ByteVector](
-          topicPartition   = TopicPartition(inputTopic, Partition.min),
+          topicPartition   = TopicPartition(inputTopic, partition),
           offset           = Offset.unsafe(offset.toLong),
           timestampAndType = None,
           key              = Some(WithSize(key)),
@@ -482,6 +484,140 @@ class TransactionalKafkaPersistenceSpec extends ForAllKafkaSuite {
 
         test.unsafeRunSync()
       }
+  }
+
+  test("partition mapper N:1: co-owners of a shared state partition write disjointly and recover only owned keys") {
+    // two input partitions map onto a single-partition state topic (modulo 2->1): both owners run the full flow
+    // machinery concurrently, their snapshots land on the shared state partition, each recovery lists only the
+    // keys its input partition owns, and neither owner's writes disturb the other's
+    val stateTopic = "tx-mapper-n1-state-topic"
+    val inputTopic = s"input-$stateTopic"
+    val group      = s"$groupId-mapper-n1"
+    val mapper     = KafkaPersistencePartitionMapper.modulo(sourcePartitions = 2, statePartitions = 1)
+
+    val p0 = Partition.min
+    val p1 = Partition.unsafe(1)
+    // one key per owning input partition, per the mapper's own ownership function; both live in state partition 0
+    val candidates = (1 to 100).map(i => s"key$i")
+    val key0       = candidates.find(k => mapper.isStateKeyOwned(k, p0)).getOrElse(fail("no p0-owned key"))
+    val key1       = candidates.find(k => mapper.isStateKeyOwned(k, p1)).getOrElse(fail("no p1-owned key"))
+
+    val moduleOf: KafkaPersistenceModuleOf[IO, String] =
+      KafkaPersistenceModuleOf.cachingTransactional[IO, String](
+        consumerOf = consumerOf,
+        producerOf = producerOf,
+        config = KafkaPersistenceModule.TransactionalConfig(
+          consumerConfig        = consumerConfig,
+          producerConfig        = producerConfig,
+          transactionalIdPrefix = appId,
+          snapshotTopic         = stateTopic,
+        ),
+        partitionMapper = mapper,
+      )
+
+    def assignment(partition: Partition, gm: ConsumerGroupMetadata): PartitionAssignment[IO] =
+      PartitionAssignment(TopicPartition(inputTopic, partition), Offset.min, IO.pure(gm.some))
+
+    def flow(partition: Partition, gm: ConsumerGroupMetadata): Resource[IO, PartitionFlow[IO]] =
+      Resource
+        .eval(flowOf(moduleOf, flushOnRevokeOnly))
+        .flatMap(_.apply(assignment(partition, gm), ScheduleCommit.empty[IO]))
+
+    // what a fresh owner of the input partition recovers: the module's key listing after ownership filtering
+    def recoveredKeys(partition: Partition, gm: ConsumerGroupMetadata): IO[List[String]] =
+      moduleOf
+        .make(assignment(partition, gm))
+        .use(_.keysOf.all(appId, group, TopicPartition(inputTopic, partition)).toList)
+        .map(_.map(_.key))
+
+    val test = createTopic(stateTopic, 1) *> createTopic(inputTopic, 2) *>
+      withJoinedConsumer(group, inputTopic) { current =>
+        for {
+          // two live co-owners of the single state partition, one per input partition. flushOnRevokeOnly defers the
+          // writes to release, and `both` releases in parallel: they flush concurrently into state partition 0. Only
+          // p1's is moved there by the mapping - on this 1-partition topic an unmapped write could not even land
+          _ <- flow(p0, current).both(flow(p1, current)).use {
+            case (flow0, flow1) =>
+              flow0(inputRecords(inputTopic, key0, List("e1", "e2"))) &>
+                flow1(inputRecords(inputTopic, key1, List("x1", "x2"), partition = p1))
+          }
+          stored <- readSnapshots(stateTopic)
+          // recovery filters by ownership: each input partition's owner sees only its own keys
+          listed            <- (recoveredKeys(p0, current), recoveredKeys(p1, current)).parTupled
+          (listed0, listed1) = listed
+          // a fresh owner of p0 recovers its state and appends; the co-owner's snapshot survives untouched
+          _     <- flow(p0, current).use(_(inputRecords(inputTopic, key0, List("e1", "e2", "e3")).drop(2)))
+          after <- readSnapshots(stateTopic)
+        } yield {
+          assertEquals(clue(stored.get(key0)), utf8("e1,e2"))
+          assertEquals(clue(stored.get(key1)), utf8("x1,x2"))
+          assertEquals(clue(listed0), List(key0))
+          assertEquals(clue(listed1), List(key1))
+          assertEquals(clue(after.get(key0)), utf8("e1,e2,e3"))
+          assertEquals(clue(after.get(key1)), utf8("x1,x2"))
+        }
+      }
+
+    test.unsafeRunSync()
+  }
+
+  test("partition mapper 4->2: snapshots land on the mapped state partition, not always the first") {
+    // the only test with statePartitions > 1, and the only one covering `caching`'s mapper write path. Under 2->1
+    // every write targets partition 0, so a mapper that ignored its input - or one applied to the wrong number -
+    // would be invisible; here input partitions 1 and 3 must both land in state partition 1, and partition 0 must
+    // stay empty of their keys. Non-transactional on purpose: this is the module whose write path nothing else drives
+    val stateTopic = "mapper-4-2-state-topic"
+    val inputTopic = s"input-$stateTopic"
+    val group      = s"$groupId-mapper-4-2"
+    val mapper     = KafkaPersistencePartitionMapper.modulo(sourcePartitions = 4, statePartitions = 2)
+
+    val p1         = Partition.unsafe(1)
+    val p3         = Partition.unsafe(3) // 3 % 2 = 1, so p1's co-owner in state partition 1
+    val candidates = (1 to 200).map(i => s"key$i")
+    val key1       = candidates.find(k => mapper.isStateKeyOwned(k, p1)).getOrElse(fail("no p1-owned key"))
+    val key3       = candidates.find(k => mapper.isStateKeyOwned(k, p3)).getOrElse(fail("no p3-owned key"))
+
+    def assignment(partition: Partition): PartitionAssignment[IO] =
+      PartitionAssignment(TopicPartition(inputTopic, partition), Offset.min, IO.pure(none[ConsumerGroupMetadata]))
+
+    val test = createTopic(stateTopic, 2) *> createTopic(inputTopic, 4) *>
+      producerOf(producerConfig).use { producer =>
+        val moduleOf = KafkaPersistenceModuleOf.caching[IO, String](
+          consumerOf      = consumerOf,
+          producer        = producer,
+          consumerConfig  = consumerConfig,
+          snapshotTopic   = stateTopic,
+          metrics         = FlowMetrics.empty[IO],
+          partitionMapper = mapper,
+        )
+
+        def flow(partition: Partition): Resource[IO, PartitionFlow[IO]] =
+          Resource
+            .eval(flowOf(moduleOf, flushOnRevokeOnly))
+            .flatMap(_.apply(assignment(partition), ScheduleCommit.empty[IO]))
+
+        for {
+          _ <- flow(p1).both(flow(p3)).use {
+            case (flow1, flow3) =>
+              flow1(inputRecords(inputTopic, key1, List("a1", "a2"), partition = p1)) &>
+                flow3(inputRecords(inputTopic, key3, List("b1"), partition = p3))
+          }
+          mapped   <- readSnapshots(stateTopic, statePartition = p1)
+          unmapped <- readSnapshots(stateTopic, statePartition = Partition.min)
+          // a fresh owner of p1 recovers from the mapped partition, keeping only what it owns
+          listed <- moduleOf
+            .make(assignment(p1))
+            .use(_.keysOf.all(appId, group, TopicPartition(inputTopic, p1)).toList)
+            .map(_.map(_.key))
+        } yield {
+          assertEquals(clue(mapped.get(key1)), utf8("a1,a2"))
+          assertEquals(clue(mapped.get(key3)), utf8("b1"))
+          assertEquals(clue(unmapped.keySet), Set.empty[String], "nothing may land in the unmapped state partition")
+          assertEquals(clue(listed), List(key1))
+        }
+      }
+
+    test.unsafeRunSync()
   }
 
   test("a takeover aborts the crashed owner's unfinished transaction (stable transactional.id)") {

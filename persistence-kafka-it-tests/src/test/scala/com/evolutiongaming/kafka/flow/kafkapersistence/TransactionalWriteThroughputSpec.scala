@@ -61,8 +61,7 @@ class TransactionalWriteThroughputSpec extends ForAllKafkaSuite {
         autoOffsetReset = AutoOffsetReset.Earliest,
         isolationLevel  = IsolationLevel.ReadCommitted,
       ),
-      snapshotTopic = stateTopic,
-      partition     = Partition.min,
+      reader = KafkaPartitionPersistence.SnapshotReader(TopicPartition(stateTopic, Partition.min), Partition.min),
       stall = KafkaPartitionPersistence
         .Stall(KafkaPersistenceModule.TransactionalConfig.DefaultRecoveryStallTimeout, IO.monotonic)
         .some,

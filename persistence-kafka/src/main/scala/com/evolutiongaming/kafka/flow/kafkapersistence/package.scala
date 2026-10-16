@@ -25,9 +25,9 @@ package object kafkapersistence {
     * [[https://kafka.apache.org/documentation/#compaction compacted topic]]. State is restored eagerly on partition
     * assignment by reading the content of a snapshot topic to the end without committing offsets.
     *
-    * Note that the snapshot topic should have the same number of partitions as the input topic since state recovery
-    * will be performed based on a number of the assigned partition of the input topic (state for partition N of input
-    * topic will be restored from the Nth partition of a snapshot topic).
+    * By default the snapshot topic needs at least as many partitions as the input topic: state for partition N of the
+    * input topic is restored from the Nth partition of the snapshot topic. A non-identity
+    * `KafkaPersistencePartitionMapper` on the module changes that mapping.
     *
     * For a complete example of usage you can refer to the integration test `StatefulProcessingWithKafkaSpec`.
     *
@@ -53,7 +53,8 @@ package object kafkapersistence {
     * @param filter
     *   optional function to pre-filter incoming events before they are processed by `fold`
     * @param remapKey
-    *   optional function to remap keys before they are processed by `fold`
+    *   optional function to remap keys before they are processed by `fold`. A remap changes the snapshot key a
+    *   non-identity `KafkaPersistencePartitionMapper` checks ownership against.
     */
   def kafkaEagerRecovery[F[_]: Async: LogOf, S](
     kafkaPersistenceModuleOf: KafkaPersistenceModuleOf[F, S],
@@ -89,9 +90,9 @@ package object kafkapersistence {
     * [[https://kafka.apache.org/documentation/#compaction compacted topic]]. State is restored eagerly on partition
     * assignment by reading the content of a snapshot topic to the end without committing offsets.
     *
-    * Note that the snapshot topic should have the same number of partitions as the input topic since state recovery
-    * will be performed based on a number of the assigned partition of the input topic (state for partition N of input
-    * topic will be restored from the Nth partition of a snapshot topic).
+    * By default the snapshot topic needs at least as many partitions as the input topic: state for partition N of the
+    * input topic is restored from the Nth partition of the snapshot topic. A non-identity
+    * `KafkaPersistencePartitionMapper` on the module changes that mapping.
     *
     * For a complete example of usage you can refer to the integration test `StatefulProcessingWithKafkaSpec`.
     *
@@ -119,6 +120,8 @@ package object kafkapersistence {
     *   enhances framework with metrics
     * @param filter
     *   optional function to pre-filter incoming events before they are processed by `fold`
+    * @param remapKey
+    *   optional function to remap keys before they are processed by `fold`; see the overload above
     * @param additionalPersistOf
     *   a factory of `AdditionalStatePersist` that can either enable or disable additional state persisting. That part
     *   of functionality in `KeyFlowExtras` will work only if you pass a functional (non-empty) implementation here

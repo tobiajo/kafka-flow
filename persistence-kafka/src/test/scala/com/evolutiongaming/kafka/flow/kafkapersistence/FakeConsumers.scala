@@ -13,6 +13,7 @@ import com.evolutiongaming.skafka.consumer.{
   IsolationLevel,
   RebalanceListener1
 }
+import org.apache.kafka.common.Node
 import scodec.bits.ByteVector
 
 import java.util.regex.Pattern
@@ -38,7 +39,10 @@ private[kafkapersistence] final class FakeConsumers(tp: TopicPartition) {
   // serves `records` one per poll from `position`, advancing it; on an empty poll it sleeps the poll timeout, as a
   // real blocking poll would - under TestControl each sleep advances virtual time exactly. endOffsets is fixed per
   // consumer (the isolation-dependent bound) unless an effect is passed (to move it between captures);
-  // `emptyPollsBeforeServe` returns that many empty polls before each record (a slow but progressing read)
+  // `emptyPollsBeforeServe` returns that many empty polls before each record (a slow but progressing read);
+  // `partitionsByTopic` (on the IO-typed overload - only one overload may declare defaults) serves the
+  // partition-count fetch of the acquisition-time source-partitions check, keyed by topic so a check against the
+  // wrong topic misses it (an unlisted topic falls back to the empty delegate)
   def consumer(
     endOffset: Long,
     positionRef: Ref[IO, Long],
@@ -50,7 +54,8 @@ private[kafkapersistence] final class FakeConsumers(tp: TopicPartition) {
     endOffset: IO[Long],
     positionRef: Ref[IO, Long],
     records: List[ConsumerRecord[String, ByteVector]],
-    emptyPollsBeforeServe: Int = 0,
+    emptyPollsBeforeServe: Int             = 0,
+    partitionsByTopic: Map[Topic, IO[Int]] = Map.empty,
   ): SkafkaConsumer[IO, String, ByteVector] =
     new SkafkaConsumer[IO, String, ByteVector] {
       private val delegate   = SkafkaConsumer.empty[IO, String, ByteVector]
@@ -99,10 +104,17 @@ private[kafkapersistence] final class FakeConsumers(tp: TopicPartition) {
       def committed(partitions: NonEmptySet[TopicPartition])           = delegate.committed(partitions)
       def committed(partitions: NonEmptySet[TopicPartition], timeout: FiniteDuration) =
         delegate.committed(partitions, timeout)
-      def clientInstanceId(timeout: FiniteDuration)         = delegate.clientInstanceId(timeout)
-      def clientMetrics                                     = delegate.clientMetrics
-      def partitions(topic: Topic)                          = delegate.partitions(topic)
-      def partitions(topic: Topic, timeout: FiniteDuration) = delegate.partitions(topic, timeout)
+      def clientInstanceId(timeout: FiniteDuration) = delegate.clientInstanceId(timeout)
+      def clientMetrics                             = delegate.clientMetrics
+      def partitions(topic: Topic) =
+        partitionsByTopic.get(topic) match {
+          case Some(count) =>
+            count.map(n =>
+              List.tabulate(n)(i => PartitionInfo(TopicPartition(topic, Partition.unsafe(i)), leader = Node.noNode()))
+            )
+          case None => delegate.partitions(topic)
+        }
+      def partitions(topic: Topic, timeout: FiniteDuration) = partitions(topic)
       def topics                                            = delegate.topics
       def topics(timeout: FiniteDuration)                   = delegate.topics(timeout)
       def paused                                            = delegate.paused

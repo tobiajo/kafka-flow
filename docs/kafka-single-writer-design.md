@@ -51,7 +51,7 @@ In the default (non-transactional) mode the input offsets are committed through 
 transaction** via
 `sendOffsetsToTransaction(offsets, consumerGroupMetadata)`
 ([KIP-447](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics),
-brokers 2.5+):
+brokers 2.5+ — the API shipped in 2.5.0 as [KAFKA-9418](https://issues.apache.org/jira/browse/KAFKA-9418)):
 the group coordinator validates the consumer **generation** and rejects a commit from a stale one
 (`ILLEGAL_GENERATION`, surfaced to the client as `CommitFailedException`).
 Since that commit and the snapshot writes share a transaction, the rejection aborts the writes too.
@@ -116,6 +116,13 @@ Key points:
   still alive. The one way out is eviction (teardown stalling past the rebalance timeout), which only
   swaps the net: an evicted member's commits fail member validation (`UNKNOWN_MEMBER_ID`, the same
   abortable `CommitFailedException`).
+- What a fence stops is a **stale** owner of one input partition. Under a many-to-one
+  `KafkaPersistencePartitionMapper` several *live* owners write one state partition; none of them is
+  stale, so nothing fences them against each other. Their writes stay disjoint only because each owner
+  holds the keys its own input partition delivers — and `isStateKeyOwned` is not consulted on the write
+  path at all, so what keeps that true across a recovery is the ownership rule *mirroring* the input
+  topic's own key→partition assignment: the keys a flow recovers are the keys it later writes. A
+  property of the mapper, then, not of this design.
 
 The mechanism needs the input topic-partition and a reader of the driving consumer's group metadata
 (`Consumer.groupMetadata`, refreshed after every poll on the poll thread). Both are supplied by the flow
@@ -148,9 +155,10 @@ LSO-derived end offset was found to under-read ([KAFKA-10167](https://issues.apa
 
 On the ordinary path the bound is free: the partition's own unfinished transactions are aborted at
 takeover by the shared `transactional.id`, before recovery reads (next section), so the captured
-target equals the LSO and the read never waits. It waits only for a transaction no takeover aborts —
-a previous `transactional.id` prefix's unfinished transactions while a prefix change rolls out, or
-a producer misdirected at the snapshot topic — and there, waiting is the only correct behavior,
+target equals the LSO and the read never waits. It waits only for a transaction this takeover does
+not abort — a previous `transactional.id` prefix's unfinished transactions while a prefix change
+rolls out, a producer misdirected at the snapshot topic, or a co-owner's transaction under a
+many-to-one `KafkaPersistencePartitionMapper` — and there, waiting is the only correct behavior,
 bounded by the *pinning* producer's `transaction.timeout.ms` plus the broker's abort scan
 (`transaction.abort.timed.out.transaction.cleanup.interval.ms`, default 10 s): ~70 s at Kafka's
 default timeout.
@@ -165,7 +173,7 @@ left open, before the new owner may write.
 
 Sharing the id serializes the partition's own writes: a committed snapshot never sits above an open
 transaction of the same id, so the recovery read's wait (previous section) never engages for the
-module's own transactions. Takeover after a hard crash is immediate — nothing waits for
+input partition's own transactions. Takeover after a hard crash is immediate — nothing waits for
 `transaction.timeout.ms`.
 
 The shared id is deliberately **not** the fence. Fencing of stale writers stays with the consumer
@@ -205,8 +213,12 @@ The second is a **hanging transaction**: an LSO pin that no timeout ever clears
 ([KIP-664](https://cwiki.apache.org/confluence/display/KAFKA/KIP-664%3A+Provide+tooling+to+detect+and+abort+hanging+transactions)
 added the `kafka-transactions.sh` tool to detect and abort it);
 [KIP-890](https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense)
-broker-side verification, on by default since Kafka 3.6, prevents the class, confining this cause to
-older or opted-out brokers.
+broker-side verification
+([`transaction.partition.verification.enable`](https://kafka.apache.org/36/generated/kafka_config.html#brokerconfigs_transaction.partition.verification.enable),
+default `true` since Kafka 3.6) prevents the class, confining this cause to older or opted-out
+brokers — and to 3.6.0, whose verification broke compressed produce
+([KAFKA-15653](https://issues.apache.org/jira/browse/KAFKA-15653), fixed in 3.6.1; Apache's 3.6.0
+upgrade note said upgrade or disable the feature), so the effective floor is 3.6.1.
 
 Both are rare, and silent when they hit: the unbounded read hangs the poll thread inside the
 rebalance callback, nothing crashes, and `max.poll.interval.ms` evicts the member while
@@ -242,7 +254,8 @@ inherits the same bounded target and its wait, without the deadline.
 The per-member fencing token is the **generation** under the classic protocol and the **member epoch**
 under the consumer protocol
 ([KIP-848](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol),
-GA in Kafka 4.0, selected by `group.protocol=consumer`); they play the same role, and *generation* below
+GA in Kafka 4.0 — shipped as [KAFKA-14048](https://issues.apache.org/jira/browse/KAFKA-14048) —
+selected by `group.protocol=consumer`); they play the same role, and *generation* below
 stands for both. The fence holds under both protocols and surfaces identically — a stale transactional
 commit is rejected as `ILLEGAL_GENERATION` under each (the coordinator maps the consumer protocol's
 internal stale-epoch error to the same wire error). The post-poll read (above) is what makes the
@@ -262,7 +275,8 @@ between the broker-side bump and this member completing the round still carries 
 generation. Under the consumer protocol the epoch also advances *between* polls, so even a fresh
 post-poll read can be stale by the time the commit reaches the broker.
 [KIP-1251](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1251%3A+Assignment+epochs+for+consumer+groups)
-(brokers 4.3.0+) absorbs the consumer-protocol window — the coordinator accepts a lagging commit for a
+(brokers 4.3.0+, shipped as [KAFKA-20066](https://issues.apache.org/jira/browse/KAFKA-20066)) absorbs
+the consumer-protocol window — the coordinator accepts a lagging commit for a
 partition the member still owns, and a reassigned one stays fenced — hence `group.protocol=consumer`
 is recommended only with such brokers (below 4.3.0 its window is the wider one); no broker version
 absorbs the classic in-flight-round window.
@@ -371,6 +385,9 @@ real broker:
   at assignment, and a transactional offset commit is rejected.
 - **Concurrent writes** — a partition's keys flush in parallel against the one shared producer
   (Write path, above); asserted safe for distinct keys.
+- **Partition mapper, N:1** — two live co-owners of one state partition through the full flow:
+  disjoint writes, ownership-filtered recovery, and an append after recovery that leaves the
+  co-owner's snapshot intact.
 - **Unfinished transactions, both resolutions** — the takeover-abort at the handover: the
   last-stable-offset is back at the high watermark immediately after module acquisition, a state
   only the abort produces, never the broker's timeout; the same test pins the id shape. And the
@@ -391,11 +408,14 @@ Unit suites pin the client-side pieces the mechanism depends on:
 - **`GroupCommitSpec`** (persistence-kafka) — the group commit against a recording producer,
   broker-free (the fence itself is the integration suite's job): the committed offset never leads
   the writes it covers; offset-only commits ride free of the cap; a missing generation fails loudly
-  instead of committing ungated; and the generation is read live per transaction, never cached.
+  instead of committing ungated; the generation is read live per transaction, never cached; and a
+  mapper moves the write to the state partition while the offset commit stays on the input partition.
 - **`KafkaPersistenceModuleSpec`** (persistence-kafka) — the module's wiring: the producer settings,
   the `read_committed`-from-earliest read with the deadline enabled and the offset side cleared
   (group-less, no auto-commit — a committed offset would override the earliest reset on the next
-  recovery and silently shorten it).
+  recovery and silently shorten it), and under a non-identity mapper: the recovery read redirected to
+  the state partition and filtered to owned keys, while the `transactional.id` and the client ids stay
+  keyed to the input partition.
 - **`ReadSnapshotsSpec`** (persistence-kafka) — the read itself: the high-watermark target (a read
   bounded at the reader's own `endOffsets`, the LSO, would silently under-read), the deadline with
   its diagnosis (a failing re-read never masks the stall), a progressing read outliving the
