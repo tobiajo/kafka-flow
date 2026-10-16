@@ -169,9 +169,7 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
 Limitations:
 - A batch shares its transaction's outcome: if the transaction fails, every write in it fails.
 - An old owner can be fenced while flushing on revoke; its last state delta is then neither persisted
-  nor committed, so the new owner replays those events — noise, not loss. Under the classic
-  **cooperative** assignor this is every revocation: the revoke-time flush is always fenced, so
-  `flushOnRevoke` does not shrink the replay window there.
+  nor committed, so the new owner replays those events — noise, not loss.
 - A stale owner's late `initTransactions` can fence the current owner's producer: the current owner's flow
   fails once and recovers (rebalance and replay); no wrong write can land. Rare, and a different
   fence — the producer epoch (its errors above), not the group generation (`CommitFailedException`).

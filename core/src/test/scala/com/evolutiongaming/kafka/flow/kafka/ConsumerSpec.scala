@@ -5,12 +5,20 @@ import cats.effect.unsafe.implicits.global
 import cats.effect.{IO, Ref}
 import cats.syntax.all.*
 import com.evolutiongaming.skafka.*
-import com.evolutiongaming.skafka.consumer.{Consumer as SkafkaConsumer, ConsumerGroupMetadata, RebalanceListener1}
+import com.evolutiongaming.kafka.flow.ExplodingRebalanceConsumer
+import com.evolutiongaming.skafka.consumer.{
+  Consumer as SkafkaConsumer,
+  ConsumerGroupMetadata,
+  RebalanceCallback,
+  RebalanceConsumer,
+  RebalanceListener1
+}
 import munit.FunSuite
 import scodec.bits.ByteVector
 
 import java.util.regex.Pattern
 import scala.concurrent.duration.*
+import scala.util.{Success, Try}
 
 class ConsumerSpec extends FunSuite {
 
@@ -90,21 +98,98 @@ class ConsumerSpec extends FunSuite {
     test.unsafeRunSync()
   }
 
-  // only poll and groupMetadata matter to Consumer.of; everything else delegates to the empty consumer.
+  test("the revoke callback publishes the generation the client has already moved to") {
+    // `onJoinComplete` bumps the client's group metadata BEFORE invoking the revoke callback; without the read the
+    // revoke-time commit would bind generation 1 while the coordinator is already on 2, and be fenced every time
+    val test = for {
+      underlying <- Ref.of[IO, ConsumerGroupMetadata](joined(1))
+      captured   <- Ref.of[IO, Option[RebalanceListener1[IO]]](none)
+      seenByFlow <- Ref.of[IO, Option[ConsumerGroupMetadata]](none)
+      consumer   <- Consumer.of[IO](kafkaConsumer(underlying, onSubscribe = l => captured.set(l.some)))
+      // stands in for the flow's revoke path: whatever it reads is what the transaction binds (KIP-447)
+      _        <- consumer.subscribe(topics, onRevoked(consumer.groupMetadata.flatMap(seenByFlow.set)))
+      _        <- consumer.poll(1.millis)
+      listener <- captured.get
+      _        <- listener.traverse_(_.onPartitionsRevoked(partitions).toF(rebalanceConsumer(joined(2))))
+      seen     <- seenByFlow.get
+      after    <- consumer.groupMetadata
+    } yield {
+      assertEquals(seen, joined(2).some, "the revoke path must see the generation the client already holds")
+      assertEquals(after, joined(2).some, "and it must stay published for the rest of the poll")
+    }
+    test.unsafeRunSync()
+  }
+
+  test("a failing read in the revoke callback leaves the previous generation and does not fail the revocation") {
+    val test = for {
+      underlying <- Ref.of[IO, ConsumerGroupMetadata](joined(1))
+      captured   <- Ref.of[IO, Option[RebalanceListener1[IO]]](none)
+      revoked    <- Ref.of[IO, Boolean](false)
+      consumer   <- Consumer.of[IO](kafkaConsumer(underlying, onSubscribe = l => captured.set(l.some)))
+      _          <- consumer.subscribe(topics, onRevoked(revoked.set(true)))
+      _          <- consumer.poll(1.millis)
+      listener   <- captured.get
+      _          <- listener.traverse_(_.onPartitionsRevoked(partitions).toF(new ExplodingRebalanceConsumer))
+      delegated  <- revoked.get
+      after      <- consumer.groupMetadata
+    } yield {
+      assert(delegated, "the wrapped listener must still run")
+      assertEquals(after, joined(1).some, "a failed read must not disturb what was published")
+    }
+    test.unsafeRunSync()
+  }
+
+  test("the lost callback publishes nothing") {
+    // the client never rewrites its group metadata on the lost path; the stub's newer generation is one this
+    // member does not hold, so it must not leak into the snapshot
+    val test = for {
+      underlying <- Ref.of[IO, ConsumerGroupMetadata](joined(1))
+      captured   <- Ref.of[IO, Option[RebalanceListener1[IO]]](none)
+      consumer   <- Consumer.of[IO](kafkaConsumer(underlying, onSubscribe = l => captured.set(l.some)))
+      _          <- consumer.subscribe(topics, RebalanceListener1.empty[IO])
+      _          <- consumer.poll(1.millis)
+      listener   <- captured.get
+      _          <- listener.traverse_(_.onPartitionsLost(partitions).toF(rebalanceConsumer(joined(2))))
+      after      <- consumer.groupMetadata
+    } yield assertEquals(after, joined(1).some)
+    test.unsafeRunSync()
+  }
+
+  private val topics     = NonEmptySet.of("topic")
+  private val partitions = NonEmptySet.of(TopicPartition("topic", Partition.min))
+
+  private def onRevoked(f: IO[Unit]): RebalanceListener1[IO] =
+    new RebalanceListener1[IO] {
+      def onPartitionsAssigned(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[IO, Unit] =
+        RebalanceCallback.api[IO].empty
+      def onPartitionsRevoked(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[IO, Unit] =
+        RebalanceCallback.lift(f)
+      def onPartitionsLost(partitions: NonEmptySet[TopicPartition]): RebalanceCallback[IO, Unit] =
+        RebalanceCallback.api[IO].empty
+    }
+
+  private def rebalanceConsumer(meta: ConsumerGroupMetadata): RebalanceConsumer =
+    new Consumer.NoopRebalanceConsumer {
+      override def groupMetadata(): Try[ConsumerGroupMetadata] = Success(meta)
+    }
+
+  // only poll, subscribe and groupMetadata matter to Consumer.of; everything else delegates to the empty consumer.
   // `onPoll` runs inside poll, to simulate state (a join) advancing on the poll itself
   private def kafkaConsumer(
     meta: Ref[IO, ConsumerGroupMetadata],
-    onPoll: IO[Unit] = IO.unit,
+    onPoll: IO[Unit]                                = IO.unit,
+    onSubscribe: RebalanceListener1[IO] => IO[Unit] = _ => IO.unit,
   ): SkafkaConsumer[IO, String, ByteVector] =
     new SkafkaConsumer[IO, String, ByteVector] {
       private val delegate = SkafkaConsumer.empty[IO, String, ByteVector]
 
       def groupMetadata = meta.get
 
-      def assign(partitions: NonEmptySet[TopicPartition])                         = delegate.assign(partitions)
-      def assignment                                                              = delegate.assignment
-      def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[IO]) = delegate.subscribe(topics, listener)
-      def subscribe(topics: NonEmptySet[Topic])                                   = delegate.subscribe(topics)
+      def assign(partitions: NonEmptySet[TopicPartition]) = delegate.assign(partitions)
+      def assignment                                      = delegate.assignment
+      def subscribe(topics: NonEmptySet[Topic], listener: RebalanceListener1[IO]) =
+        onSubscribe(listener) *> delegate.subscribe(topics, listener)
+      def subscribe(topics: NonEmptySet[Topic])                           = delegate.subscribe(topics)
       def subscribe(pattern: Pattern, listener: RebalanceListener1[IO])   = delegate.subscribe(pattern, listener)
       def subscribe(pattern: Pattern)                                     = delegate.subscribe(pattern)
       def subscription                                                    = delegate.subscription
