@@ -138,6 +138,18 @@ recovery waits until the broker aborts it instead — slower, but nothing commit
   records). A rolling deploy is safe; while the two modes coexist a non-transactional instance is not
   fenced — the same exposure you already have without this mode, gone once every instance is
   transactional.
+- **An unanswered commit is not a rejection** — if `commitTransaction` times out client-side it surfaces
+  as the client's `TimeoutException`, not the `CommitFailedException` of a fenced write, and the broker
+  may have committed anyway. Nothing is lost either way: the input offset rides the same transaction, so
+  snapshot and offset commit together or not at all. The flush does not retry it — legal per the client
+  contract, but each attempt would block up to `max.block.ms` inside the poll cycle, risking a silent
+  eviction at `max.poll.interval.ms` — and `abortTransaction` throws rather than aborting while a commit
+  is unresolved, so the producer is unusable until it is rebuilt. Under the default
+  `ignorePersistErrors = false` the failure tears the flow down and the new producer's `initTransactions`
+  settles the transaction. Under `ignorePersistErrors = true` it is swallowed instead, so the partition
+  stops persisting *and* stops advancing offsets until the flow restarts — at the next rebalance, or
+  sooner if a later offset commit through the spent producer crashes it. Frozen and self-consistent, not
+  corrupted.
 - **Recovery fails loudly rather than hangs** — a recovery read that makes no progress for
   `recoveryStallTimeout` (default 3 min) fails with `RecoveryReadStalledError` instead of hanging the
   rebalance until the member is silently evicted at `max.poll.interval.ms`. The error names its
